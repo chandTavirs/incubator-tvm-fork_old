@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Unit test VTA's instructions """
 import tvm
 from tvm import te
@@ -92,26 +95,14 @@ def test_padded_load():
             x = te.placeholder((n, m, env.BATCH, env.BLOCK_OUT), name="x", dtype=env.acc_dtype)
             x_buf = topi.nn.pad(x, pad_before, pad_after, name="y")
             # insert no-op that won't be optimized away
-            y_buf = te.compute(
-                (
-                    n + pad_before[0] + pad_after[0],
-                    m + pad_before[1] + pad_after[1],
-                    env.BATCH,
-                    env.BLOCK_OUT,
-                ),
-                lambda *i: x_buf(*i) >> 0,
-                "y_buf",
-            )
-            y = te.compute(
-                (
-                    n + pad_before[0] + pad_after[0],
-                    m + pad_before[1] + pad_after[1],
-                    env.BATCH,
-                    env.BLOCK_OUT,
-                ),
-                lambda *i: y_buf(*i).astype(env.inp_dtype),
-                "y",
-            )
+            y_buf = te.compute((n + pad_before[0] + pad_after[0],
+                                 m + pad_before[1] + pad_after[1],
+                                 env.BATCH,
+                                 env.BLOCK_OUT), lambda *i: x_buf(*i)>>0, "y_buf")
+            y = te.compute((n + pad_before[0] + pad_after[0],
+                             m + pad_before[1] + pad_after[1],
+                             env.BATCH,
+                             env.BLOCK_OUT), lambda *i: y_buf(*i).astype(env.inp_dtype), "y")
             # schedule
             s = te.create_schedule(y.op)
             s[x_buf].set_scope(env.acc_scope)
@@ -131,16 +122,15 @@ def test_padded_load():
             f = remote.load_module("padded_load.o")
             # verify
             ctx = remote.ext_dev(0)
-            x_np = np.random.randint(0, 10, size=(n, m, env.BATCH, env.BLOCK_OUT)).astype(x.dtype)
-            y_np = np.zeros(
-                (
-                    n + pad_before[0] + pad_after[0],
-                    m + pad_before[1] + pad_after[1],
-                    env.BATCH,
-                    env.BLOCK_OUT,
-                )
-            ).astype(y.dtype)
-            y_np[pad_before[0] : pad_before[0] + n, pad_before[1] : pad_before[1] + m, :] = x_np
+            x_np = np.random.randint(0, 10, size=(
+                n, m, env.BATCH, env.BLOCK_OUT)).astype(x.dtype)
+            y_np = np.zeros((n + pad_before[0] + pad_after[0],
+                             m + pad_before[1] + pad_after[1],
+                             env.BATCH,
+                             env.BLOCK_OUT)).astype(y.dtype)
+            y_np[pad_before[0]:pad_before[0] + n,
+                 pad_before[1]:pad_before[1] + m,
+                 :] = x_np
             x_nd = tvm.nd.array(x_np, ctx)
             y_nd = tvm.nd.empty(y_np.shape, ctx=ctx, dtype=y_np.dtype)
 
@@ -274,8 +264,7 @@ def test_gemm():
                 s[y_gem].op.axis[1],
                 s[y_gem].op.axis[2],
                 s[y_gem].op.axis[3],
-                ki,
-            )
+                ki)
             s[y_gem].tensorize(s[y_gem].op.axis[2], env.gemm)
             verify(s, name="default")
 
@@ -353,14 +342,14 @@ def test_alu():
             )  # SRAM->DRAM
             # schedule
             s = te.create_schedule(res.op)
-            s[a_buf].set_scope(env.acc_scope)  # SRAM
-            s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy)  # DRAM->SRAM
-            s[res_buf].set_scope(env.acc_scope)  # SRAM
-            s[res_buf].pragma(res_buf.op.axis[0], env.alu)  # compute
-            s[res].pragma(res.op.axis[0], env.dma_copy)  # SRAM->DRAM
+            s[a_buf].set_scope(env.acc_scope) # SRAM
+            s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy) # DRAM->SRAM
+            s[res_buf].set_scope(env.acc_scope) # SRAM
+            s[res_buf].pragma(res_buf.op.axis[0], env.alu) # compute
+            s[res].pragma(res.op.axis[0], env.dma_copy) # SRAM->DRAM
             if not use_imm:
-                s[b_buf].set_scope(env.acc_scope)  # SRAM
-                s[b_buf].pragma(b_buf.op.axis[0], env.dma_copy)  # DRAM->SRAM
+                s[b_buf].set_scope(env.acc_scope) # SRAM
+                s[b_buf].pragma(b_buf.op.axis[0], env.dma_copy) # DRAM->SRAM
 
             if not remote:
                 return
@@ -442,13 +431,13 @@ def test_relu():
         )  # SRAM->DRAM
         # schedule
         s = te.create_schedule(res.op)
-        s[a_buf].set_scope(env.acc_scope)  # SRAM
-        s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy)  # DRAM->SRAM
-        s[max_buf].set_scope(env.acc_scope)  # SRAM
-        s[min_buf].set_scope(env.acc_scope)  # SRAM
-        s[max_buf].pragma(max_buf.op.axis[0], env.alu)  # compute
-        s[min_buf].pragma(min_buf.op.axis[0], env.alu)  # compute
-        s[res].pragma(res.op.axis[0], env.dma_copy)  # SRAM->DRAM
+        s[a_buf].set_scope(env.acc_scope) # SRAM
+        s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy) # DRAM->SRAM
+        s[max_buf].set_scope(env.acc_scope) # SRAM
+        s[min_buf].set_scope(env.acc_scope) # SRAM
+        s[max_buf].pragma(max_buf.op.axis[0], env.alu) # compute
+        s[min_buf].pragma(min_buf.op.axis[0], env.alu) # compute
+        s[res].pragma(res.op.axis[0], env.dma_copy) # SRAM->DRAM
         # build
         with vta.build_config():
             mod = vta.build(s, [a, res], "ext_dev", env.target_host)
@@ -460,10 +449,12 @@ def test_relu():
         f = remote.load_module("load_act.o")
         # verify
         ctx = remote.ext_dev(0)
-        a_np = np.random.randint(-256, 256, size=(m, n, env.BATCH, env.BLOCK_OUT)).astype(a.dtype)
-        res_np = np.clip(a_np, 0, (1 << (env.INP_WIDTH - 1)) - 1).astype(res.dtype)
+        a_np = np.random.randint(
+            -256, 256, size=(m, n, env.BATCH, env.BLOCK_OUT)).astype(a.dtype)
+        res_np = np.clip(a_np, 0, (1<<(env.INP_WIDTH-1))-1).astype(res.dtype)
         a_nd = tvm.nd.array(a_np, ctx)
-        res_nd = tvm.nd.array(np.zeros((m, n, env.BATCH, env.BLOCK_OUT)).astype(res.dtype), ctx)
+        res_nd = tvm.nd.array(
+            np.zeros((m, n, env.BATCH, env.BLOCK_OUT)).astype(res.dtype), ctx)
 
         if env.TARGET in ["sim", "tsim"]:
             simulator.clear_stats()
@@ -505,13 +496,13 @@ def test_shift_and_scale():
         )  # SRAM->DRAM
         # schedule
         s = te.create_schedule(res.op)
-        s[a_buf].set_scope(env.acc_scope)  # SRAM
-        s[res_shift].set_scope(env.acc_scope)  # SRAM
-        s[res_scale].set_scope(env.acc_scope)  # SRAM
-        s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy)  # DRAM->SRAM
-        s[res_shift].pragma(res_shift.op.axis[0], env.alu)  # compute
-        s[res_scale].pragma(res_scale.op.axis[0], env.alu)  # compute
-        s[res].pragma(res.op.axis[0], env.dma_copy)  # SRAM->DRAM
+        s[a_buf].set_scope(env.acc_scope) # SRAM
+        s[res_shift].set_scope(env.acc_scope) # SRAM
+        s[res_scale].set_scope(env.acc_scope) # SRAM
+        s[a_buf].pragma(a_buf.op.axis[0], env.dma_copy) # DRAM->SRAM
+        s[res_shift].pragma(res_shift.op.axis[0], env.alu) # compute
+        s[res_scale].pragma(res_scale.op.axis[0], env.alu) # compute
+        s[res].pragma(res.op.axis[0], env.dma_copy) # SRAM->DRAM
         # build
         mod = vta.build(s, [a, res], "ext_dev", env.target_host)
         if not remote:

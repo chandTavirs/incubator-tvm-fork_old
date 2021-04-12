@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 #--------------------------------------------------------------------
 #  Template custom cmake configuration for compiling
 #
@@ -250,6 +252,9 @@ set(USE_VTA_FSIM OFF)
 
 # Whether to build cycle-accurate VTA simulator driver
 set(USE_VTA_TSIM OFF)
+
+# Whether to build behavioral VTA simulator driver
+set(USE_VTA_BSIM OFF)
 
 # Whether to build VTA FPGA driver (device side only)
 set(USE_VTA_FPGA OFF)

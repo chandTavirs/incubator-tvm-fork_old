@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 # pylint: disable=invalid-name
 """The build utils in python.
 """
@@ -173,6 +175,7 @@ def lower(sch, args, name="main", binds=None, simple_mode=False):
         tvm.tir.transform.BF16Legalize(),
         tvm.tir.transform.NarrowDataType(32),
         tvm.tir.transform.Simplify(),
+        tvm.tir.transform.UnrollLoop(),
     ]
     pass_list += lower_phase1
 
@@ -185,7 +188,6 @@ def lower(sch, args, name="main", binds=None, simple_mode=False):
         tvm.tir.transform.InjectVirtualThread(),
         tvm.tir.transform.InjectDoubleBuffer(),
         tvm.tir.transform.StorageRewrite(),
-        tvm.tir.transform.UnrollLoop(),
     ]
     pass_list += lower_phase2
 

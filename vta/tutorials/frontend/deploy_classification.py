@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """
 Deploy Pretrained Vision Model from MxNet on VTA
 ================================================
@@ -84,13 +87,14 @@ pack_dict = {
     "resnet34_v2": ["nn.max_pool2d", "nn.global_avg_pool2d"],
     "resnet50_v2": ["nn.max_pool2d", "nn.global_avg_pool2d"],
     "resnet101_v2": ["nn.max_pool2d", "nn.global_avg_pool2d"],
+    "mobilenet1.0" : ["nn.conv2d", "nn.global_avg_pool2d"],
 }
 
 # Name of Gluon model to compile
 # The ``start_pack`` and ``stop_pack`` labels indicate where
 # to start and end the graph packing relay pass: in other words
 # where to start and finish offloading to VTA.
-model = "resnet18_v1"
+model = "resnet18_v2"
 assert model in pack_dict
 
 ######################################################################
@@ -99,7 +103,7 @@ assert model in pack_dict
 # When target is 'pynq', reconfigure FPGA and runtime.
 # Otherwise, if target is 'sim', execute locally.
 
-if env.TARGET not in ["sim", "tsim"]:
+if env.TARGET not in ["sim", "tsim", "bsim"]:
 
     # Get remote from tracker node if environment variable is set.
     # To set up the tracker, you'll need to follow the "Auto-tuning
@@ -177,10 +181,11 @@ with autotvm.tophub.context(target):
             with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0]):
                 mod = relay.quantize.quantize(mod, params=params)
             # Perform graph packing and constant folding for VTA target
-            assert env.BLOCK_IN == env.BLOCK_OUT
+            # assert env.BLOCK_IN == env.BLOCK_OUT
             relay_prog = graph_pack(
                 mod["main"],
                 env.BATCH,
+                env.BLOCK_IN,
                 env.BLOCK_OUT,
                 env.WGT_WIDTH,
                 start_name=pack_dict[model][0],
@@ -190,14 +195,17 @@ with autotvm.tophub.context(target):
         relay_prog = mod["main"]
 
     # Compile Relay program with AlterOpLayout disabled
+with relay.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
     if target.device_name != "vta":
-        with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
             graph, lib, params = relay.build(
-                relay_prog, target=target, params=params, target_host=env.target_host
+                relay_prog, target=target,
+                params=params, target_host=env.target_host
             )
     else:
         with vta.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
-            lib = relay.build(relay_prog, target=target, params=params, target_host=env.target_host)
+                graph, lib, params = relay.build(
+                    relay_prog, target=target,
+                    params=params, target_host=env.target_host)
 
     # Measure Relay build time
     build_time = time.time() - build_start
@@ -210,7 +218,7 @@ with autotvm.tophub.context(target):
     lib = remote.load_module("graphlib.tar")
 
     # Graph runtime
-    m = graph_runtime.GraphModule(lib["default"](ctx))
+    m = graph_runtime.create(graph, lib, ctx)
 
 ######################################################################
 # Perform image classification inference
@@ -241,6 +249,7 @@ image = image[np.newaxis, :]
 image = np.repeat(image, env.BATCH, axis=0)
 
 # Set the network parameters and inputs
+m.set_input(**params)
 m.set_input("data", image)
 
 # Perform inference and gather execution statistics
@@ -249,7 +258,7 @@ num = 4  # number of times we run module for a single measurement
 rep = 3  # number of measurements (we derive std dev from this)
 timer = m.module.time_evaluator("run", ctx, number=num, repeat=rep)
 
-if env.TARGET in ["sim", "tsim"]:
+if env.TARGET in ["sim", "tsim", "bsim"]:
     simulator.clear_stats()
     timer()
     sim_stats = simulator.stats()

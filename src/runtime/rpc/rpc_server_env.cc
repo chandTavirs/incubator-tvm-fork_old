@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file rpc_server_env.cc
  * \brief Server environment of the RPC.
@@ -34,6 +36,12 @@ std::string RPCGetPath(const std::string& name) {
   ICHECK(f != nullptr) << "require tvm.rpc.server.workpath";
   return (*f)(name);
 }
+
+TVM_REGISTER_GLOBAL("tvm.rpc.server.exists").
+set_body([](TVMArgs args, TVMRetValue *rv) {
+    std::string file_name = RPCGetPath(args[0]);
+    *rv = FileExists(file_name);
+  });
 
 TVM_REGISTER_GLOBAL("tvm.rpc.server.upload").set_body([](TVMArgs args, TVMRetValue* rv) {
   std::string file_name = RPCGetPath(args[0]);

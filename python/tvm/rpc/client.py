@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """RPC client tools"""
 import os
 import stat
@@ -116,6 +119,24 @@ class RPCSession(object):
             self._remote_funcs["upload"] = self.get_function("tvm.rpc.server.upload")
         self._remote_funcs["upload"](target, blob)
 
+    def exists(self, path):
+        """Check the file path exists.
+
+        Parameters
+        ----------
+        path : str
+            The path to the file to check.
+
+        Returns
+        -------
+        bool : bool
+            True if th efile exists, false otherwise.
+        """
+        if "exists" not in self._remote_funcs:
+            self._remote_funcs["exists"] = self.get_function(
+                "tvm.rpc.server.exists")
+        return self._remote_funcs["exists"](path)
+
     def download(self, path):
         """Download file from remote temp folder.
 
@@ -132,6 +153,24 @@ class RPCSession(object):
         if "download" not in self._remote_funcs:
             self._remote_funcs["download"] = self.get_function("tvm.rpc.server.download")
         return self._remote_funcs["download"](path)
+
+    def exists(self, path):
+        """Check the file path exists.
+
+        Parameters
+        ----------
+        path : str
+            The path to the file to check.
+
+        Returns
+        -------
+        bool : bool
+            True if th efile exists, false otherwise.
+        """
+        if "exists" not in self._remote_funcs:
+            self._remote_funcs["exists"] = self.get_function(
+                "tvm.rpc.server.exists")
+        return self._remote_funcs["exists"](path)
 
     def remove(self, path):
         """Remove file from remote temp folder.

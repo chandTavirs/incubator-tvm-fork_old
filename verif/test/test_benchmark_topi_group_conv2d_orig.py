@@ -1,0 +1,1 @@
+../../vta/tests/python/integration/test_benchmark_topi_group_conv2d.py

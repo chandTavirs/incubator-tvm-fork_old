@@ -15,8 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=unused-argument
+
+# Modified by contributors from Intel Labs
+
 """A Relay implementation of graph packing."""
 
+import numpy as np
 import tvm
 from tvm import relay
 from tvm.relay import op, transform
@@ -37,58 +41,128 @@ def _to_shape(shape):
     return tuple(int(sh) for sh in shape)
 
 
-def _pack_batch_channel(data, dshape, bfactor, cfactor):
+def _pack_batch_channel(data, dshape, bfactor, block, typetrack):
     """Pack the data channel dimension."""
     assert int(dshape[0]) % bfactor == 0
-    assert int(dshape[1]) % cfactor == 0
-    data = op.reshape(
-        data,
-        newshape=(
-            int(dshape[0]) // bfactor,
-            bfactor,
-            int(dshape[1]) // cfactor,
-            cfactor,
-            int(dshape[2]),
-            int(dshape[3]),
-        ),
-    )
-    data = op.transpose(data, axes=(0, 2, 4, 5, 1, 3))
+    if int(dshape[1]) % block == 0:
+        newshape = (int(dshape[0]) // bfactor, bfactor,
+                    int(dshape[1]) // block, block,
+                    int(dshape[2]), int(dshape[3]))
+        data = op.reshape(data, newshape=newshape)
+    else:
+        channel_pad = block - int(dshape[1]) % block
+        data = op.nn.pad(data, [[0, 0], [0, channel_pad], [0, 0], [0, 0]])
+        newshape = (int(dshape[0]) // bfactor, bfactor,
+                    int(dshape[1]) // block + 1, block,
+                    int(dshape[2]), int(dshape[3]))
+        data = op.reshape(data, newshape=newshape)
+    data = op.transpose(
+        data, axes=(0, 2, 4, 5, 1, 3))
+    if typetrack:
+        newaxes = [newshape[0], newshape[2],
+                   newshape[4], newshape[5],
+                   newshape[1], newshape[3]]
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(newaxes)
+    return data
+
+def _pack_batch_channel_dense(data, dshape, bfactor, block):
+    """Pack the data channel dimension for dense operator.
+    """
+    assert int(dshape[0]) % bfactor == 0
+    if int(dshape[1]) % block == 0:
+        newshape = (int(dshape[0]) // bfactor, bfactor,
+                    int(dshape[1]) // block, block)
+        data = op.reshape(data, newshape=newshape)
+    else:
+        channel_pad = block - int(dshape[1]) % block
+        data = op.nn.pad(data, [[0, 0], [0, channel_pad]])
+        newshape = (int(dshape[0]) // bfactor, bfactor,
+                    int(dshape[1]) // block + 1, block)
+        data = op.reshape(data, newshape=newshape)
+    data = op.transpose(
+        data, axes=(0, 2, 1, 3))
+    return data
+
+def _unpack_batch_channel(data, old_shape, block, typetrack):
+    """Unpack the data channel dimension.
+    """
+    if len(old_shape) == 4:
+        data = op.transpose(data, axes=(0, 4, 1, 5, 2, 3))
+        data = op.reshape(data, newshape=old_shape)
+    else:
+        data = op.transpose(data, axes=(0, 2, 1, 3))
+        if int(old_shape[1]) % block == 0:
+            padding = 0
+        else:
+            padding = block - int(old_shape[1]) % block
+        new_shape = (old_shape[0], old_shape[1] + padding)
+        data = op.reshape(data, newshape=new_shape)
+        data = op.strided_slice(data, begin=[0, 0], end=old_shape)
+    if typetrack:
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(old_shape)
     return data
 
 
-def _unpack_batch_channel(data, old_shape):
-    """Unpack the data channel dimension."""
-    data = op.transpose(data, axes=(0, 4, 1, 5, 2, 3))
-    data = op.reshape(data, newshape=old_shape)
-    return data
-
-
-def _const_shape_match(data, dshape, cfactor_out):
-    """Pad the constant if the shape[0] not divisible by cfactor_out."""
-    assert len(dshape) == 3
-    pad_width = int(dshape[0]) % cfactor_out
+def _const_shape_match(data, dshape, block, typetrack):
+    """ Pad the constant if the shape[0] not divisible by blockout.
+    """
+    assert len(dshape) == 3 or len(dshape) == 1
+    pad_width = int(dshape[0]) % block
     if pad_width != 0:
-        pad_width = cfactor_out - pad_width
-        data = op.nn.pad(data, [[0, pad_width], [0, 0], [0, 0]])
-        dshape = tuple([dshape[0] + pad_width, dshape[1], dshape[2]])
+        pad_width = block - pad_width
+        if len(dshape) == 3:
+            data = op.nn.pad(data, [[0, pad_width], [0, 0], [0, 0]])
+            dshape = tuple([dshape[0] + pad_width, dshape[1], dshape[2]])
+        else:
+            data = op.nn.pad(data, [[0, pad_width]])
+            dshape = tuple([dshape[0] + pad_width])
+    if typetrack:
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(dshape)
     return data, dshape
 
-
-def _weight_shape_match(data, dshape, channels, cfactor_out, transpose=False):
-    """Pad the weight if the shape[0] not divisible by cfactor_out."""
+def _weight_shape_match(data, dshape, channels, blockout, blockin, typetrack):
+    """ Pad the weight if the shape[0] not divisible by blockout.
+        Pad the weight if the shape[1] not divisible by blockin
+    """
     assert len(dshape) == 4
-    pad_width = int(dshape[0]) % cfactor_out
-    channels_pad = int(channels) % cfactor_out
+    pad_width = int(dshape[0]) % blockout
+    channels_pad = int(channels) % blockout
+    in_channel_width = int(dshape[1]) % blockin
     if pad_width != 0:
-        pad_width = cfactor_out - pad_width
+        pad_width = blockout - pad_width
         data = op.nn.pad(data, [[0, pad_width], [0, 0], [0, 0], [0, 0]])
         dshape = tuple([dshape[0] + pad_width, dshape[1], dshape[2], dshape[3]])
-
+    if in_channel_width != 0:
+        in_channel_width = blockin - in_channel_width
+        data = op.nn.pad(data, [[0, 0], [0, in_channel_width], [0, 0], [0, 0]])
+        dshape = tuple([dshape[0], dshape[1] + in_channel_width, dshape[2], dshape[3]])
     if channels_pad != 0:
-        channels = channels + (cfactor_out - channels_pad)
+        channels = channels + (blockout - channels_pad)
+    if typetrack:
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(dshape)
 
     return data, dshape, channels
 
+def _weight_shape_match_dense(data, dshape, units, blockout, blockin):
+    """ Pad the weight if the shape[0] not divisible by blockout.
+        Pad the weight if the shape[1] not divisible by blockin
+    """
+    assert len(dshape) == 2
+    pad_width = int(dshape[0]) % blockout
+    units_pad = int(units) % blockout
+    in_feat_width = int(dshape[1]) % blockin
+    if pad_width != 0:
+        pad_width = blockout - pad_width
+        data = op.nn.pad(data, [[0, pad_width], [0, 0]])
+        dshape = tuple([dshape[0] + pad_width, dshape[1]])
+    if in_feat_width != 0:
+        in_feat_width = blockin - in_feat_width
+        data = op.nn.pad(data, [[0, 0], [0, in_feat_width]])
+        dshape = tuple([dshape[0], dshape[1] + in_feat_width])
+    if units_pad != 0:
+        units = units + (blockout - units_pad)
+
+    return data, dshape, units
 
 def _weight_shape_match_transpose(data, dshape, channels, cfactor_out):
     """Pad the weight if the shape[1] not divisible by cfactor_out."""
@@ -105,26 +179,38 @@ def _weight_shape_match_transpose(data, dshape, channels, cfactor_out):
 
     return data, dshape, channels
 
-
-def _pack_weight(data, dshape, cfactor):
+def _pack_weight(data, dshape, blockout, blockin, typetrack):
     """Pack the weight into packed format."""
     assert len(dshape) == 4
-    assert int(dshape[0]) % cfactor == 0
-    assert int(dshape[1]) % cfactor == 0
-    data = op.reshape(
-        data,
-        newshape=(
-            int(dshape[0]) // cfactor,
-            cfactor,
-            int(dshape[1]) // cfactor,
-            cfactor,
-            int(dshape[2]),
-            int(dshape[3]),
-        ),
-    )
-    data = op.transpose(data, axes=(0, 2, 4, 5, 1, 3))
+    assert int(dshape[0]) % blockout == 0
+    assert int(dshape[1]) % blockin == 0
+    newshape = (int(dshape[0]) // blockout, blockout,
+                int(dshape[1]) // blockin, blockin,
+                int(dshape[2]), int(dshape[3]))
+    data = op.reshape(data, newshape=newshape)
+    data = op.transpose(
+        data, axes=(0, 2, 4, 5, 1, 3))
+    if typetrack:
+        newaxes = [newshape[0], newshape[2],
+                   newshape[4], newshape[5],
+                   newshape[1], newshape[3]]
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(newaxes)
+
     return data
 
+def _pack_weight_dense(data, dshape, blockout, blockin):
+    """Pack the dense weight into packed format.
+    """
+    assert len(dshape) == 2
+    assert int(dshape[0]) % blockout == 0
+    assert int(dshape[1]) % blockin == 0
+    newshape = (int(dshape[0]) // blockout, blockout,
+                int(dshape[1]) // blockin, blockin)
+    data = op.reshape(data, newshape=newshape)
+    data = op.transpose(
+        data, axes=(0, 2, 1, 3))
+
+    return data
 
 def _pack_weight_conv2d_transpose(data, dshape, cfactor):
     """Pack the weight into packed format."""
@@ -147,20 +233,43 @@ def _pack_weight_conv2d_transpose(data, dshape, cfactor):
     return data
 
 
-def _pack_const(data, dshape, dtype, bfactor, cfactor):
+def _pack_const(data, dshape, dtype, bfactor, block, typetrack):
     """Pack a constant parameter."""
     dshape = _to_shape(dshape)
     assert len(dshape) == 3
-    assert dshape[0] % cfactor == 0
-    data = op.reshape(data, newshape=(dshape[0] // cfactor, cfactor, dshape[1], dshape[2], 1))
-    data = op.transpose(data, axes=(0, 2, 3, 4, 1))
+    # assert dshape[0] % cfactor == 0
+    if dshape[0] % block != 0:
+        pad_width = block - dshape[0]
+        data = op.nn.pad(data, [[0, pad_width], [0, 0], [0, 0]])
+        dshape = tuple([dshape[0] + pad_width, dshape[1], dshape[2]])
+    data = op.reshape(data,
+                      newshape=(dshape[0] // block,
+                                block, dshape[1],
+                                dshape[2], 1))
+    data = op.transpose(
+        data, axes=(0, 2, 3, 4, 1))
 
     # broadcast batch dimension to bfactor
-    data = op.broadcast_to(
-        data, shape=(dshape[0] // cfactor, dshape[1], dshape[2], bfactor, cfactor)
-    )
+    newshape = (dshape[0]//block, dshape[1], dshape[2], bfactor, block)
+    data = op.broadcast_to(data, shape=newshape)
+    if typetrack:
+        data._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
     return data
 
+def _pack_const_dense(data, dshape, dtype, bfactor, block):
+    """Pack a constant parameter.
+    """
+    dshape = _to_shape(dshape)
+    assert len(dshape) == 1
+    data = op.reshape(data,
+                      newshape=(dshape[0] // block,
+                                block, 1))
+    data = op.transpose(data, axes=(0, 2, 1))
+
+    # broadcast batch dimension to bfactor
+    newshape = (dshape[0]//block, bfactor, block)
+    data = op.broadcast_to(data, shape=newshape)
+    return data
 
 def _get_tensor_shape(node):
     """Get node shape."""
@@ -282,9 +391,14 @@ class ExprLocator(ExprMutator):
 class ExprPack(ExprMutator):
     """Visitor to perform graph packing on an AST."""
 
-    def __init__(self, bfactor, cfactor, weight_bits):
+    def __init__(self, bfactor, blockin, blockout, weight_bits):
         self.bfactor = bfactor
-        self.cfactor = cfactor
+        self.blockin = blockin
+        self.blockout = blockout
+        self.typetrack = False
+        self.is_packed = False
+        if self.blockin != self.blockout:
+            self.typetrack = True
         self.weight_bits = weight_bits
         self.start_pack = False
         # Cache Operator the algorithm matches against.
@@ -298,6 +412,9 @@ class ExprPack(ExprMutator):
         self.pad = op.op.get("nn.pad")
         self.upsampling = op.op.get("nn.upsampling")
         self.reshape = op.op.get("reshape")
+        self.global_avg_pool2d = op.op.get("nn.global_avg_pool2d")
+        self.max_pool2d = op.op.get("nn.max_pool2d")
+        self.dense = op.op.get("nn.dense")
         self.number_of_conv2d = 0
         super().__init__()
 
@@ -313,29 +430,67 @@ class ExprPack(ExprMutator):
         if call.op == self.bitpack_start:
             assert not self.start_pack
             self.start_pack = True
-            return _pack_batch_channel(args[0], oshape, self.bfactor, self.cfactor)
+            self.is_packed = True
+            return _pack_batch_channel(args[0], oshape, self.bfactor, self.blockin, self.typetrack)
         if call.op == self.bitpack_end:
             if self.start_pack:
                 self.start_pack = False
                 data = args[0]
                 data_shape = _get_tensor_shape(call.args[0])
-                return _unpack_batch_channel(data, data_shape)
+                if self.is_packed:
+                    self.is_packed = False
+                    return _unpack_batch_channel(data, data_shape, self.blockout, self.typetrack)
+                return data
         if self.start_pack:
             # Operator cases
             if call.op == self.conv2d and odtype == "int32":
                 self.number_of_conv2d += 1
                 assert 8 % self.weight_bits == 0
                 w_lanes = 8 // self.weight_bits
-                data_layout = "NCHW%dn%dc" % (self.bfactor, self.cfactor)
-                kernel_layout = "OIHW%do%di" % (self.cfactor, self.cfactor)
+                if call.attrs.groups == 1:
+                    data_layout = "NCHW%dn%dc" % (self.bfactor, self.blockin)
+                    kernel_layout = "OIHW%do%di" % (self.blockout, self.blockin)
+                else:
+                    data_layout = "NCHW%dn%dc" % (self.bfactor, self.blockout)
+                    kernel_layout = "OIHW%do%di" % (self.blockout, self.bfactor)
+                out_layout = "NCHW%dn%dc" % (self.bfactor, self.blockout)
                 data, weight = args
                 data_shape = _to_shape(input_types[0].shape)
                 kernel_shape = _to_shape(input_types[1].shape)
                 channels = call.attrs.channels
-                weight, kernel_shape, channels = _weight_shape_match(
-                    weight, kernel_shape, channels, self.cfactor
-                )
-                kernel = _pack_weight(weight, kernel_shape, self.cfactor)
+                if call.attrs.groups != 1:
+                    data_cast = relay.op.transform.cast(data, "int32")
+                    data = relay.Call(op.op.get('copy'), [data_cast])
+                    weight_cast = relay.op.transform.cast(weight, "int32")
+                    weight = relay.Call(op.op.get('copy'), [weight_cast])
+                if self.typetrack:
+                    data = _unpack_batch_channel(data, data_shape, self.blockout, self.typetrack)
+                    if call.attrs.groups == 1:
+                        data = _pack_batch_channel(data, data_shape, self.bfactor,
+                                                   self.blockin, self.typetrack)
+                    else:
+                        data = _pack_batch_channel(data, data_shape, self.bfactor,
+                                                   self.blockout, self.typetrack)
+                if call.attrs.groups == 1:
+                    weight, kernel_shape, channels = _weight_shape_match(weight,
+                                                                         kernel_shape,
+                                                                         channels,
+                                                                         self.blockout,
+                                                                         self.blockin,
+                                                                         self.typetrack)
+                    kernel = _pack_weight(weight, kernel_shape, self.blockout,
+                                          self.blockin, self.typetrack)
+                    groups = call.attrs.groups
+                else:
+                    weight, kernel_shape, channels = _weight_shape_match(weight,
+                                                                         kernel_shape,
+                                                                         channels,
+                                                                         self.blockout,
+                                                                         self.bfactor,
+                                                                         self.typetrack)
+                    kernel = _pack_weight(weight, kernel_shape, self.blockout,
+                                          self.bfactor, self.typetrack)
+                    groups = channels.value
                 # insert bit packing when necessary
                 if w_lanes != 1:
                     assert 8 % w_lanes == 0
@@ -347,13 +502,19 @@ class ExprPack(ExprMutator):
                     strides=call.attrs.strides,
                     padding=call.attrs.padding,
                     dilation=call.attrs.dilation,
-                    groups=call.attrs.groups,
+                    groups=groups,
                     channels=channels,
                     kernel_size=call.attrs.kernel_size,
                     data_layout=data_layout,
                     kernel_layout=kernel_layout,
+                    out_layout=out_layout,
                     out_dtype=call.attrs.out_dtype,
                 )
+                if self.typetrack:
+                    newshape = [oshape[0]//self.bfactor, oshape[1]//self.blockout,
+                                oshape[2], oshape[3],
+                                self.bfactor, self.blockout]
+                    conv2d._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
                 return conv2d
 
             if call.op == self.conv2d_transpose and odtype == "int32":
@@ -386,44 +547,158 @@ class ExprPack(ExprMutator):
                         out_dtype=call.attrs.out_dtype,
                     )
                 return conv2d
-            if call.op == self.add and tuple(input_types[0].shape) == tuple(input_types[1].shape):
-                pass
+            if call.op == self.add and \
+                    tuple(input_types[0].shape) == tuple(input_types[1].shape):
+                if not self.typetrack:
+                    pass
+                else:
+                    arg1, arg2 = args
+                    arg1_shape = _get_tensor_shape(args[0])
+                    arg2_shape = _get_tensor_shape(args[1])
+                    if arg1_shape[-1] != self.blockout:
+                        arg1 = _unpack_batch_channel(arg1, input_types[0].shape,
+                                                     self.blockout, self.typetrack)
+                        arg1 = _pack_batch_channel(arg1, input_types[0].shape,
+                                                   self.bfactor, self.blockout,
+                                                   self.typetrack)
+                    if arg2_shape[-1] != self.blockout:
+                        arg2 = _unpack_batch_channel(arg2, input_types[1].shape,
+                                                     self.blockout, self.typetrack)
+                        arg2 = _pack_batch_channel(arg2, input_types[1].shape,
+                                                   self.bfactor, self.blockout,
+                                                   self.typetrack)
+                    addnode = relay.Call(self.add, [arg1, arg2])
+                    newshape = [oshape[0]//self.bfactor, oshape[1]//self.blockout,
+                                oshape[2], oshape[3],
+                                self.bfactor, self.blockout]
+                    addnode._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
+                    return addnode
             elif call.op == self.add and len(input_types[1].shape) == 3:
                 data, const = args
-                const, input_shape = _const_shape_match(const, input_types[1].shape, self.cfactor)
-                const = _pack_const(
-                    const, _to_shape(input_shape), input_types[1].dtype, self.bfactor, self.cfactor
-                )
-                return relay.Call(self.add, [data, const])
-            elif call.op == self.multiply and tuple(input_types[0].shape) == tuple(
-                input_types[1].shape
-            ):
+                if self.typetrack:
+                    data_shape = _get_tensor_shape(data)
+                    if data_shape[-1] != self.blockout:
+                        data = _unpack_batch_channel(data, input_types[0].shape,
+                                                     self.blockout, self.typetrack)
+                        data = _pack_batch_channel(data, input_types[0].shape,
+                                                   self.bfactor, self.blockout, self.typetrack)
+                const, input_shape = _const_shape_match(const,
+                                                        input_types[1].shape,
+                                                        self.blockout, self.typetrack)
+                const = _pack_const(const,
+                                    _to_shape(input_shape),
+                                    input_types[1].dtype,
+                                    self.bfactor,
+                                    self.blockout,
+                                    self.typetrack)
+                addnode = relay.Call(self.add, [data, const])
+                newshape = [oshape[0]//self.bfactor, oshape[1]//self.blockout,
+                            oshape[2], oshape[3],
+                            self.bfactor, self.blockout]
+                addnode._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
+                return addnode
+            elif call.op == self.add and len(input_types[1].shape) == 1:
+                data, const = args
+                assert data.op.name == "nn.dense" # check if bias addition for dense
+                if self.typetrack:
+                    data_shape = _get_tensor_shape(data)
+                    if data_shape[-1] != self.blockout:
+                        data = _unpack_batch_channel(data, input_types[0].shape,
+                                                     self.blockout, self.typetrack)
+                        data = _pack_batch_channel(data, input_types[0].shape,
+                                                   self.bfactor, self.blockout, self.typetrack)
+                const, input_shape = _const_shape_match(const,
+                                                        input_types[1].shape,
+                                                        self.blockout, self.typetrack)
+                const = _pack_const_dense(const,
+                                          _to_shape(input_shape),
+                                          input_types[1].dtype,
+                                          self.bfactor,
+                                          self.blockout)
+                addnode = relay.Call(self.add, [data, const])
+                # Pull in shift and clip changes inside VTA dense schedule
+                # This ensures that values are scaled to int8 range before store
+                dshift = relay.op.tensor.right_shift(
+                    addnode, relay.expr.Constant(tvm.nd.array(np.array(8, dtype="int32"))))
+                dclip = relay.op.tensor.clip(dshift, -127., 127.)
+                dcast = relay.op.transform.cast(dclip, "int8")
+                dcopy = relay.Call(op.op.get('copy'), [dcast])
+                dfuse = relay.annotation.stop_fusion(dcopy)
+                return dfuse
+            elif call.op == self.multiply and \
+                    tuple(input_types[0].shape) == tuple(input_types[1].shape):
                 pass
             elif call.op == self.multiply and len(input_types[1].shape) == 3:
                 data, const = args
-                const = _pack_const(
-                    const,
-                    _to_shape(input_types[1].shape),
-                    input_types[1].dtype,
-                    self.bfactor,
-                    self.cfactor,
-                )
-                return relay.Call(self.multiply, [data, const])
-            elif self.start_pack and call.op == self.bias_add:
+                if self.typetrack:
+                    data = _unpack_batch_channel(data, input_types[0].shape,
+                                                 self.blockout, self.typetrack)
+                    data = _pack_batch_channel(data, input_types[0].shape,
+                                               self.bfactor, self.blockout, self.typetrack)
+                const = _pack_const(const,
+                                    _to_shape(input_types[1].shape),
+                                    input_types[1].dtype,
+                                    self.bfactor,
+                                    self.blockout,
+                                    self.typetrack)
+                productnode = relay.Call(self.multiply, [data, const])
+                newshape = [oshape[0]//self.bfactor, oshape[1]//self.blockout,
+                            oshape[2], oshape[3],
+                            self.bfactor, self.blockout]
+                productnode._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
+                return productnode
+            elif call.op == self.bias_add:
                 data, bias = args
-                bias = _pack_const(
-                    bias,
-                    _to_shape(input_types[1].shape),
-                    input_types[1].dtype,
-                    self.bfactor,
-                    self.cfactor,
-                )
+                bias = _pack_const(bias,
+                                   _to_shape(input_types[1].shape),
+                                   input_types[1].dtype,
+                                   self.bfactor,
+                                   self.blockout,
+                                   self.typetrack)
                 return relay.Call(self.add, [data, bias])
-            elif (
-                self.start_pack and call.op == op.op.get("cast") and input_types[0].dtype == "int32"
-            ):
+            elif call.op == op.op.get("cast") and input_types[0].dtype == "int32":
                 cast = relay.Call(op.op.get("cast"), [args[0]], call.attrs)
                 return relay.Call(op.op.get("copy"), [cast])
+            elif call.op == self.global_avg_pool2d:
+                davgpool = relay.Call(self.global_avg_pool2d, [args[0]], call.attrs) # 0-2048 range
+                dcast = relay.op.transform.cast(davgpool, "int8") # fuse cast for VTA transfer out
+                dfuse = relay.annotation.stop_fusion(dcast) # do not fuse any subsequent ops
+                dbig = relay.op.transform.cast(dfuse, "int32") # still -128,127 range
+                x = relay.op.tensor.add(
+                    dbig, relay.Constant(tvm.nd.array(np.array([128], dtype="int32")))) # 0,256
+                y = relay.op.tensor.left_shift(
+                    x, relay.Constant(tvm.nd.array(np.array([3], dtype="int32")))) # 0, 2047
+                # Unpack to avoid batch_flatten smash the inner batch dimension
+                if self.is_packed:
+                    y_unpacked = _unpack_batch_channel(y, oshape, self.blockout, self.typetrack)
+                    self.is_packed = False
+                return y_unpacked
+            elif call.op == self.max_pool2d:
+                dcast = relay.op.transform.cast(args[0], "int32")
+                dmp = relay.Call(self.max_pool2d, [dcast], call.attrs)
+                dcast2 = relay.op.transform.cast(dmp, "int8") # fuse an int8 cast
+                return relay.annotation.stop_fusion(dcast2) # not fuse any subsequent ops
+            elif call.op == self.dense and odtype == "int32":
+                data, weight = args
+                data_shape = _to_shape(input_types[0].shape)
+                kernel_shape = _to_shape(input_types[1].shape)
+                units = call.attrs.units
+                data = _pack_batch_channel_dense(data, data_shape, self.bfactor,
+                                                 self.blockin)
+                self.is_packed = True
+                weight, kernel_shape, units = _weight_shape_match_dense(weight,
+                                                                        kernel_shape,
+                                                                        units,
+                                                                        self.blockout,
+                                                                        self.blockin)
+                kernel = _pack_weight_dense(weight, kernel_shape, self.blockout,
+                                            self.blockin)
+                dense = op.nn.dense(data, kernel, out_dtype=call.attrs.out_dtype)
+                if self.typetrack:
+                    newshape = [oshape[0]//self.bfactor, units//self.blockout,
+                                self.bfactor, self.blockout]
+                    dense._checked_type_ = tvm.ir.tensor_type.TensorType(newshape)
+                return dense
             elif call.op == self.pad:
                 pad_width = call.attrs.pad_width
                 if len(pad_width) == 6:
@@ -439,7 +714,7 @@ class ExprPack(ExprMutator):
                 (data,) = args
                 scale_h = call.attrs.scale_h
                 scale_w = call.attrs.scale_w
-                data_layout = "NCHW%dn%dc" % (self.bfactor, self.cfactor)
+                data_layout = "NCHW%dn%dc" % (self.bfactor, self.blockin)
                 method = call.attrs.method
                 align_corners = call.attrs.align_corners
                 return op.nn.upsampling(data, scale_h, scale_w, data_layout, method, align_corners)
@@ -447,14 +722,13 @@ class ExprPack(ExprMutator):
                 (data,) = args
                 data = op.transpose(data, axes=(0, 4, 1, 5, 2, 3))
                 return op.reshape(data, [int(x) for x in input_types[0].shape])
-
-        return relay.Call(self.visit(call.op), args, call.attrs)
-
+        callnode = relay.Call(self.visit(call.op), args, call.attrs)
+        if self.typetrack:
+            callnode._checked_type_ = tvm.ir.tensor_type.TensorType(oshape)
+        return callnode
 
 class BT(Exception):
     pass
-
-
 def get_subgraph(expr, start_name, stop_name, start_name_idx, stop_name_idx, count_meta):
     """We assume stop_name only appears once for simplicity.
     This constraint will be lifted in the future.
@@ -510,11 +784,11 @@ def get_subgraph(expr, start_name, stop_name, start_name_idx, stop_name_idx, cou
     annotated = _recursion(anf, False, False, operator_current_idx)
     return run_opt_pass(annotated, transform.ToGraphNormalForm())
 
-
 def graph_pack(
     expr,
     bfactor,
-    cfactor,
+    blockin,
+    blockout,
     weight_bits,
     start_name="nn.max_pool2d",
     stop_name="nn.global_avg_pool2d",
@@ -535,8 +809,11 @@ def graph_pack(
     bfactor : int
        The packing factor in batch
 
-    cfactor : int
-       The packing factor in channel
+    blockin : int
+       The packing factor in channel_in
+
+    blockout : int
+        The packing factor in channel_out
 
     weight_bits: int
         The bit-width of the weights.
@@ -584,7 +861,9 @@ def graph_pack(
     )
     expr = get_subgraph(expr, start_name, stop_name, start_name_idx, stop_name_idx, count_meta)
     expr = run_opt_pass(expr, transform.InferType())
-    packer = ExprPack(bfactor, cfactor, weight_bits)
+    packer = ExprPack(
+        bfactor, blockin,
+        blockout, weight_bits)
     expr = packer.visit(expr)
     assert not packer.start_pack
     expr = run_opt_pass(expr, transform.InferType())

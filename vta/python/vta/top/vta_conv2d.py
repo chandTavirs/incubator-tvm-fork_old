@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Conv2D operator declaration and schedule registration for VTA."""
 
 import numpy as np
@@ -25,7 +28,6 @@ from tvm import topi
 
 from .utils import is_packed_layout
 from ..environment import get_env
-
 
 @autotvm.register_topi_compute("conv2d_packed.vta")
 def conv2d_packed(cfg, data, kernel, strides, padding, dilation, layout, out_dtype):
@@ -155,7 +157,8 @@ def schedule_conv2d_packed(cfg, outs):
     x_co0, x_co1 = cfg["tile_co"].apply(s, output, x_co)
     x_i0, x_i1 = cfg["tile_h"].apply(s, output, x_i)
     x_j0, x_j1 = cfg["tile_w"].apply(s, output, x_j)
-    s[output].reorder(x_bo, x_i0, x_co0, x_j0, x_co1, x_i1, x_j1, x_bi, x_ci)
+    x_bo0, x_bo1 = cfg['tile_b'].apply(s, output, x_bo)
+    s[output].reorder(x_bo0, x_i0, x_co0, x_j0, x_bo1, x_co1, x_i1, x_j1, x_bi, x_ci)
     store_pt = x_j0
 
     # set all compute scopes
@@ -170,14 +173,14 @@ def schedule_conv2d_packed(cfg, outs):
     # virtual threading along output channel axes
     if cfg["oc_nthread"].val > 1:
         _, v_t = s[output].split(x_co0, factor=cfg["oc_nthread"].val)
-        s[output].reorder(v_t, x_bo)
-        s[output].bind(v_t, te.thread_axis("cthread"))
+        s[output].reorder(v_t, x_bo0)
+        s[output].bind(v_t, te.thread_axis(env.VTHREAD_NAME))
 
     # virtual threading along spatial rows
     if cfg["h_nthread"].val > 1:
         _, v_t = s[output].split(x_i0, factor=cfg["h_nthread"].val)
-        s[output].reorder(v_t, x_bo)
-        s[output].bind(v_t, te.thread_axis("cthread"))
+        s[output].reorder(v_t, x_bo0)
+        s[output].bind(v_t, te.thread_axis(env.VTHREAD_NAME))
 
     x_bo, x_co, x_i, x_j, x_bi, x_ci = s[conv2d_stage].op.axis
     k_o, d_i, d_j, k_i = s[conv2d_stage].op.reduce_axis
@@ -187,8 +190,16 @@ def schedule_conv2d_packed(cfg, outs):
     s[cdata].compute_at(s[conv2d_stage], k_o)
     s[ckernel].compute_at(s[conv2d_stage], k_o)
 
+    # Batch Tiling
+    batch_idx = 0
+    tile_b = cfg['tile_b'].size
+    if tile_b[1] != 1:
+        d_bo, _, _, _, _, _ = s[cdata].op.axis
+        s[cdata].unroll(d_bo)
+        batch_idx = 1
+
     # Use VTA instructions
-    s[cdata].pragma(s[cdata].op.axis[0], env.dma_copy)
+    s[cdata].pragma(s[cdata].op.axis[batch_idx], env.dma_copy)
     s[ckernel].pragma(s[ckernel].op.axis[0], env.dma_copy)
     s[conv2d_stage].tensorize(x_bi, env.gemm)
     s[output].pragma(x_co1, env.dma_copy)

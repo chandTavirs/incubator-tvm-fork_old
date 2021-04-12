@@ -14,8 +14,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """VTA RPC client function"""
 import os
+import logging
 
 from .environment import get_env
 from .bitstream import download_bitstream, get_bitstream_path
@@ -50,11 +54,41 @@ def program_fpga(remote, bitstream=None):
     else:
         bitstream = get_bitstream_path()
         if not os.path.isfile(bitstream):
-            env = get_env()
-            if env.TARGET == "de10nano":
-                return
             download_bitstream()
 
     fprogram = remote.get_function("tvm.contrib.vta.init")
     remote.upload(bitstream)
     fprogram(os.path.basename(bitstream))
+
+
+def trace_init(remote):
+    # pylint: disable=broad-except
+    """Initialize the remote trace engine
+
+    Parameters
+    ----------
+    remote : RPCSession
+        The TVM RPC session
+    """
+    try:
+        trace_mgr.init_remote_trace(remote)
+    except Exception as exception:
+        logging.warning("Trace manager: %s", str(exception))
+
+
+def trace_done(remote):
+    # pylint: disable=import-outside-toplevel
+    # pylint: disable=broad-except
+    """Destruct the remote trace engine
+
+    Parameters
+    ----------
+    remote : RPCSession
+        The TVM RPC session
+    """
+    import builtins
+    try:
+        builtins.trace_mgr.done_remote_trace(remote)
+        del builtins.trace_mgr
+    except Exception as exception:
+        logging.warning("Trace manager: %s", str(exception))

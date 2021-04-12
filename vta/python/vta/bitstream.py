@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """VTA specific bitstream management library."""
 from __future__ import absolute_import as _abs
 
@@ -50,8 +53,8 @@ def get_bitstream_path():
     # Create the directory if it didn't exist
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
-    bit_path = os.path.join(cache_dir, env.BITSTREAM) + ".bit"
-
+    bit_ext = '.rbf' if env.TARGET == 'de10nano' else '.bit'
+    bit_path = os.path.join(cache_dir, env.BITSTREAM) + bit_ext
     return bit_path
 
 
@@ -62,9 +65,10 @@ def download_bitstream():
 
     success = False
     bit = get_bitstream_path()
+    ext = '.rbf' if env.TARGET == 'de10nano' else '.bit'
     url = os.path.join(BITSTREAM_URL, env.TARGET)
     url = os.path.join(url, env.HW_VER)
-    url = os.path.join(url, env.BITSTREAM + ".bit")
+    url = os.path.join(url, env.BITSTREAM + ext)
 
     try:
         download(url, bit)
@@ -80,13 +84,13 @@ $VTA_CACHE_PATH. Alternatively edit your config.json back to its default \
 settings. You can see the list of available bitstreams under {}".format(
                     url, BITSTREAM_URL
                 )
-            )
+            ) from err
         raise RuntimeError(
             # This could happen when trying to access the URL behind a proxy
             "Something went wrong when trying to access {}. Check your \
 internet connection or proxy settings.".format(
                 url
             )
-        )
+        ) from err
 
     return success

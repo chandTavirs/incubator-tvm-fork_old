@@ -1,0 +1,251 @@
+{
+  "quiet": {
+    "prof": false,
+    "trace": false
+  },
+  "log": {
+    "prof": false,
+    "trace": false
+  },
+  "prof": {
+    "prof": true,
+    "trace": false
+  },
+  "equiv": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "ISSUE": false,
+      "FETCH": false,
+      "EXE" : false,
+      "RET" : false,
+      "ALU_LOOP" : true,
+      "ALU_ITR" : true,
+      "GEM_LOOP" : true,
+      "GEM_ITR" : true
+    }
+  },
+  "sram": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "EXE" : false,
+      "RET" : false,
+      "LD_SRAM" : true,
+      "ST_SRAM" : true
+    }
+  },
+  "evt": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "FETCH": true,
+      "EXE" : true,
+      "INSN_IDX" : false,
+      "ACC_BWR" : false,
+      "ALU_LOOP" : true,
+      "GEM_LOOP" : true,
+      "LD_SRAM" : false,
+      "ST_SRAM" : false,
+      "header" : false
+    },
+    "dump": {
+      "host": false,
+      "alloc": false,
+      "load": false,
+      "store": false,
+      "insn": true
+    }
+  },
+  "serial": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "FINISH": true,
+      "SERIAL" : true
+    }
+  },
+  "parallel": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "FINISH": true,
+      "SERIAL" : false
+    }
+  },
+  "cycle": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": true,
+      "EXE" : true,
+      "RET" : true,
+      "CYCLE": true,
+      "ALU_LOOP": true,
+      "ALU_ITR": false,
+      "GEM_LOOP": true,
+      "GEM_ITR": false,
+      "PULSE": true,
+      "STALL": true,
+      "SERIAL" : false,
+      "header" : false
+    }
+  },
+  "fe": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": true,
+      "EXE" : false,
+      "RET" : false,
+      "CYCLE": true,
+      "header" : false
+    }
+  },
+  "short": {
+    "prof": false,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": true,
+      "EXE" : true,
+      "RET" : true,
+      "ALU_LOOP": false,
+      "ALU_ITR": false,
+      "GEM_LOOP": false,
+      "GEM_ITR": false
+    },
+    "dump": {
+      "host": false,
+      "alloc": false,
+      "load": false,
+      "store": true,
+      "insn": true
+    }
+  },
+  "long": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": true,
+      "EXE" : true,
+      "RET" : true,
+      "ALU_LOOP": true,
+      "ALU_ITR": false,
+      "GEM_LOOP": true,
+      "GEM_ITR": false
+    },
+    "dump": {
+      "host": false,
+      "alloc": true,
+      "load": false,
+      "store": true,
+      "insn": true,
+      "virt": false,
+      "xy": true
+    }
+  },
+  "full": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": true,
+      "EXE" : true,
+      "RET" : true,
+      "ALU_LOOP": true,
+      "ALU_ITR": true,
+      "GEM_LOOP": true,
+      "GEM_ITR": true,
+      "MEMDPI_EVENT": true
+    },
+    "dump": {
+      "host": true,
+      "alloc": true,
+      "load": true,
+      "store": true,
+      "insn": true,
+      "virt": true,
+      "xy": true
+    }
+  },
+  "fpga": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "ISSUE" : true,
+      "FETCH": false,
+      "EXE" : false,
+      "RET" : false,
+      "ALU_LOOP": false,
+      "ALU_ITR": false,
+      "GEM_LOOP": false,
+      "GEM_ITR": false
+    },
+    "dump": {
+      "host": false,
+      "alloc": false,
+      "load": false,
+      "store": true,
+      "insn": true,
+      "virt": false,
+      "xy": false
+    }
+  },
+  "store": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "ISSUE" : false,
+      "FETCH": false,
+      "EXE" : false,
+      "RET" : false,
+      "ALU_LOOP": false,
+      "ALU_ITR": false,
+      "GEM_LOOP": false,
+      "GEM_ITR": false
+    },
+    "dump": {
+      "host": false,
+      "alloc": false,
+      "load": false,
+      "store": true,
+      "insn": false,
+      "virt": false,
+      "xy": false
+    }
+  },
+  "load": {
+    "prof": true,
+    "trace": true,
+    "event": {
+      "ISSUE" : false,
+      "FETCH": false,
+      "EXE" : false,
+      "RET" : false,
+      "ALU_LOOP": false,
+      "ALU_ITR": false,
+      "GEM_LOOP": false,
+      "GEM_ITR": false
+    },
+    "dump": {
+      "host": false,
+      "alloc": false,
+      "load": true,
+      "store": false,
+      "insn": false,
+      "virt": false,
+      "xy": false
+    }
+  },
+  "alloc": {
+    "prof": false,
+    "trace": true,
+    "dump": {
+      "alloc": true
+    }
+  }
+}

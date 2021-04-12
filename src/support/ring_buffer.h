@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file ring_buffer.h
  * \brief this file aims to provide a wrapper of sockets
@@ -61,7 +63,12 @@ class RingBuffer {
       if (head_ptr_ + bytes_available_ > old_size) {
         // copy the ring overflow part into the tail.
         size_t ncopy = head_ptr_ + bytes_available_ - old_size;
+	size_t delta = new_size - old_size;
         memcpy(&ring_[0] + old_size, &ring_[0], ncopy);
+	// manage partial overflow if new size not large enough.
+	if (ncopy > delta) {
+          memcpy(&ring_[0], &ring_[0] + ncopy, delta - ncopy);
+	}
       }
     } else if (ring_.size() > n * 8 && ring_.size() > kInitCapacity) {
       // shrink too large temporary buffer to
@@ -87,7 +94,7 @@ class RingBuffer {
   }
 
   /*!
-   * \brief Peform a non-blocking read from buffer
+   * \brief Perform a non-blocking read from buffer
    *  size must be smaller than this->bytes_available()
    * \param data the data pointer.
    * \param size The number of bytes to read.
@@ -143,7 +150,7 @@ class RingBuffer {
     bytes_available_ += size;
   }
   /*!
-   * \brief Written data into the buffer by give it a non-blocking callback function.
+   * \brief Write data into the buffer by giving it a non-blocking callback function.
    *
    * \param frecv A receive function handle
    * \param max_nbytes Maximum number of bytes can write.

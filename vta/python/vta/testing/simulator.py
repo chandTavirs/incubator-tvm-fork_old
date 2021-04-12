@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Utilities to start simulator."""
 import ctypes
 import json
@@ -26,7 +29,15 @@ def _load_sw():
     """Load hardware library for simulator."""
 
     env = get_env()
-    lib_driver_name = "libvta_tsim" if env.TARGET == "tsim" else "libvta_fsim"
+    lib_driver_map = {
+        'sim':  'libvta_fsim',
+        'tsim': 'libvta_tsim',
+        'bsim': 'libvta_bsim'
+        }
+    if env.TARGET not in lib_driver_map:
+        return []
+
+    lib_driver_name = lib_driver_map[env.TARGET]
 
     # Load driver library
     lib_driver = find_libvta(lib_driver_name, optional=True)
@@ -46,6 +57,12 @@ def _load_sw():
             return lib_hw
         except OSError:
             return []
+    elif env.TARGET == 'bsim':
+        # pylint: disable=import-outside-toplevel
+        from .. import beh
+        f = tvm.runtime.convert(beh.beh_model)
+        set_behavioral_model = tvm.get_global_func("vta.bsim.set_behavioral_model", False)
+        set_behavioral_model(f, beh.DRAM_ARRAY)
 
     return libs
 
@@ -61,6 +78,8 @@ def clear_stats():
     env = get_env()
     if env.TARGET == "sim":
         f = tvm.get_global_func("vta.simulator.profiler_clear", True)
+    elif env.TARGET == 'bsim':
+        f = None
     else:
         f = tvm.get_global_func("vta.tsim.profiler_clear", True)
     if f:
@@ -78,6 +97,9 @@ def stats():
     env = get_env()
     if env.TARGET == "sim":
         x = tvm.get_global_func("vta.simulator.profiler_status")()
+    elif env.TARGET == 'bsim':
+        x = "{}"
+        #raise Exception('stats on bsim not implemented')
     else:
         x = tvm.get_global_func("vta.tsim.profiler_status")()
     return json.loads(x)

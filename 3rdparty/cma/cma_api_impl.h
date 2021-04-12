@@ -24,6 +24,8 @@
  *
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  *  Copyright (c) 2018 by Contributors
  * \file cma_api.cc
@@ -83,6 +85,8 @@ int cma_init(void) {
     __DEBUG("Failed to initialize api - \"%s\"\n", strerror(errno));
     return -1;
   }
+  if (setuid(getuid()) != 0)
+    return -1;
 
   return 0;
 }

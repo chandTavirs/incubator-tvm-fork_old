@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file rpc_session.cc
  * \brief RPC session for remote function call.

@@ -15,8 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 # CMake Build rules for VTA
-find_program(PYTHON NAMES python python3 python3.6)
+find_program(PYTHON NAMES python3 python3.6)
 
 # Throw error if VTA_HW_PATH is not set
 if(NOT DEFINED ENV{VTA_HW_PATH})
@@ -27,27 +29,28 @@ endif()
 
 if(MSVC)
   message(STATUS "VTA build is skipped in Windows..")
+# Throw error if VTA_HW_PATH is not set
 elseif(NOT EXISTS ${VTA_HW_PATH})
   if (USE_VTA_TSIM OR USE_VTA_FSIM OR USE_UFPGA)
     message(FATAL_ERROR "VTA path " ${VTA_HW_PATH} " does not exist")
   endif()
 elseif(PYTHON)
   message(STATUS "VTA build with VTA_HW_PATH=" ${VTA_HW_PATH})
-  set(VTA_CONFIG ${PYTHON} ${VTA_HW_PATH}/config/vta_config.py)
+  set(VTA_CONFIG_PY ${PYTHON} ${VTA_HW_PATH}/config/vta_config.py)
 
   if(EXISTS ${CMAKE_CURRENT_BINARY_DIR}/vta_config.json)
     message(STATUS "Use VTA config " ${CMAKE_CURRENT_BINARY_DIR}/vta_config.json)
-    set(VTA_CONFIG ${PYTHON} ${VTA_HW_PATH}/config/vta_config.py
+    set(VTA_CONFIG_PY ${PYTHON} ${VTA_HW_PATH}/config/vta_config.py
       --use-cfg=${CMAKE_CURRENT_BINARY_DIR}/vta_config.json)
   endif()
 
-  execute_process(COMMAND ${VTA_CONFIG} --target OUTPUT_VARIABLE VTA_TARGET OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(COMMAND ${VTA_CONFIG_PY} --target OUTPUT_VARIABLE VTA_TARGET OUTPUT_STRIP_TRAILING_WHITESPACE)
 
   message(STATUS "Build VTA runtime with target: " ${VTA_TARGET})
 
-  execute_process(COMMAND ${VTA_CONFIG} --defs OUTPUT_VARIABLE __vta_defs)
+  execute_process(COMMAND ${VTA_CONFIG_PY} --defs OUTPUT_VARIABLE __vta_defs)
 
-  string(REGEX MATCHALL "(^| )-D[A-Za-z0-9_=.]*" VTA_DEFINITIONS "${__vta_defs}")
+  string(REGEX MATCHALL "(^| )-D[A-Za-z0-9_=.]*" VTA_DEFINITIONS " ${__vta_defs}")
 
   # Fast simulator driver build
   if(USE_VTA_FSIM)
@@ -59,34 +62,66 @@ elseif(PYTHON)
     list(APPEND FSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/vmem/virtual_memory.cc)
     # Target lib: vta_fsim
     add_library(vta_fsim SHARED ${FSIM_RUNTIME_SRCS})
-    target_include_directories(vta_fsim SYSTEM PUBLIC ${VTA_HW_PATH}/include)
+    target_include_directories(vta_fsim PUBLIC ${VTA_HW_PATH}/include)
     foreach(__def ${VTA_DEFINITIONS})
       string(SUBSTRING ${__def} 3 -1 __strip_def)
       target_compile_definitions(vta_fsim PUBLIC ${__strip_def})
     endforeach()
     if(APPLE)
-      set_property(TARGET vta_fsim APPEND PROPERTY LINK_FLAGS "-undefined dynamic_lookup")
+      set_target_properties(vta_fsim PROPERTIES LINK_FLAGS "-undefined dynamic_lookup")
     endif(APPLE)
     target_compile_definitions(vta_fsim PUBLIC USE_FSIM_TLPP)
   endif()
 
   # Cycle accurate simulator driver build
   if(USE_VTA_TSIM)
+    if(NOT DEFINED ENV{VERILATOR_INC_DIR})
+      if (EXISTS /usr/local/share/verilator/include)
+        set(VERILATOR_INC_DIR /usr/local/share/verilator/include)
+      elseif (EXISTS /usr/share/verilator/include)
+        set(VERILATOR_INC_DIR /usr/share/verilator/include)
+        else()
+        message(STATUS "Verilator not found in /usr/local/share/verilator/include")
+        message(STATUS "Verilator not found in /usr/share/verilator/include")
+        message(FATAL_ERROR "Cannot find Verilator, VERILATOR_INC_DIR is not defined")
+      endif()
+    else()
+      set(VERILATOR_INC_DIR $ENV{VERILATOR_INC_DIR})
+    endif()
     # Add tsim driver sources
     file(GLOB TSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/*.cc)
     file(GLOB TSIM_RUNTIME_SRCS vta/runtime/*.cc)
+    list(APPEND TSIM_RUNTIME_SRCS ${VERILATOR_INC_DIR}/verilated.cpp)
+    list(APPEND TSIM_RUNTIME_SRCS ${VERILATOR_INC_DIR}/verilated_dpi.cpp)
     list(APPEND TSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/tsim/tsim_driver.cc)
     list(APPEND TSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/dpi/module.cc)
     list(APPEND TSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/vmem/virtual_memory.cc)
     # Target lib: vta_tsim
     add_library(vta_tsim SHARED ${TSIM_RUNTIME_SRCS})
-    target_include_directories(vta_tsim SYSTEM PUBLIC ${VTA_HW_PATH}/include)
+    target_include_directories(vta_tsim SYSTEM PUBLIC ${VTA_HW_PATH}/include ${VERILATOR_INC_DIR} ${VERILATOR_INC_DIR}/vltstd)
     foreach(__def ${VTA_DEFINITIONS})
       string(SUBSTRING ${__def} 3 -1 __strip_def)
       target_compile_definitions(vta_tsim PUBLIC ${__strip_def})
     endforeach()
     if(APPLE)
       set_property(TARGET vta_fsim APPEND PROPERTY LINK_FLAGS "-undefined dynamic_lookup")
+    endif(APPLE)
+  endif()
+
+  # Behavioral simulator driver build
+  if(USE_VTA_BSIM)
+    # Add tsim driver sources
+    file(GLOB BSIM_RUNTIME_SRCS vta/runtime/*.cc)
+    list(APPEND BSIM_RUNTIME_SRCS ${VTA_HW_PATH}/src/bsim/bsim_driver.cc)
+    # Target lib: vta_bsim
+    add_library(vta_bsim SHARED ${BSIM_RUNTIME_SRCS})
+    target_include_directories(vta_bsim PUBLIC ${VTA_HW_PATH}/include)
+    foreach(__def ${VTA_DEFINITIONS})
+      string(SUBSTRING ${__def} 3 -1 __strip_def)
+      target_compile_definitions(vta_bsim PUBLIC ${__strip_def})
+    endforeach()
+    if(APPLE)
+      set_property(TARGET vta_bsim APPEND PROPERTY LINK_FLAGS "-undefined dynamic_lookup")
     endif(APPLE)
   endif()
 
@@ -101,7 +136,8 @@ elseif(PYTHON)
       # Rules for Pynq v2.4
       find_library(__cma_lib NAMES cma PATH /usr/lib)
     elseif(${VTA_TARGET} STREQUAL "de10nano")  # DE10-Nano rules
-      file(GLOB FPGA_RUNTIME_SRCS ${VTA_HW_PATH}/src/de10nano/*.cc ${VTA_HW_PATH}/src/*.cc)
+      list(APPEND FPGA_RUNTIME_SRCS ${VTA_HW_PATH}/src/de10nano/de10nano_driver.cc)
+      list(APPEND FPGA_RUNTIME_SRCS ${VTA_HW_PATH}/src/de10nano/cma_api.cc)
     endif()
     # Target lib: vta
     add_library(vta SHARED ${FPGA_RUNTIME_SRCS})
@@ -113,9 +149,10 @@ elseif(PYTHON)
     endforeach()
     if(${VTA_TARGET} STREQUAL "pynq" OR
        ${VTA_TARGET} STREQUAL "ultra96")
+      target_include_directories(vta PUBLIC ${VTA_HW_PATH}/include)
       target_link_libraries(vta ${__cma_lib})
     elseif(${VTA_TARGET} STREQUAL "de10nano")  # DE10-Nano rules
-     #target_compile_definitions(vta PUBLIC VTA_MAX_XFER=2097152) # (1<<21)
+      target_include_directories(vta SYSTEM PUBLIC ${VTA_HW_PATH}/include)
       target_include_directories(vta SYSTEM PUBLIC ${VTA_HW_PATH}/src/de10nano)
       target_include_directories(vta SYSTEM PUBLIC 3rdparty)
       target_include_directories(vta SYSTEM PUBLIC

@@ -15,10 +15,28 @@
 <!--- specific language governing permissions and limitations -->
 <!--- under the License. -->
 
+<!--- Modified by contributors from Intel Labs -->
+
 TVM Change Log
 ==============
 
 This file records the changes in TVM library in reverse chronological order.
+
+## Intel Labs contributions
+
+Several enhancements have been added to the TVM's support for the VTA 
+hardware accelerator. Changes include the following:
+
+* Expansion in the size of the parameterized design space for VTA to include BLOCK_IN, 
+BLOCK_OUT, and BATCH on all supported targets. Instruction encoding was parameterized to 
+enable support for larger scratchpads.
+* Dense, depthwise conv2d, max pooling, global average pooling support for VTA enabling 
+ResNet and MobileNet execution.
+* Double buffering and batch tiling support for VTA workloads.
+* Addition of parameterized unit tests for the VTA CHISEL (tsim) target.
+* Pipelining the GEMM and ALU units within the tsim target.
+* Support for out-of-order requests and wider memory interfaces for the VTA tsim model.
+* Ability to run end-to-end VTA tests on both Xilinx Pynq and Intel DE10 nano platforms.
 
 ## On-going version
 

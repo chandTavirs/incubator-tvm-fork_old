@@ -15,8 +15,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-PROJROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../../" && pwd )"
 
+# Modified by contributors from Intel Labs
+
+PROJROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../../" && pwd )"
+export IS_RPC_SERVER=1
 export PYTHONPATH=${PYTHONPATH}:${PROJROOT}/python:${PROJROOT}/vta/python
 export PYTHONPATH=${PYTHONPATH}:/home/xilinx/pynq
-python3 -m vta.exec.rpc_server
+export PYTHONPATH=${PYTHONPATH}:${PROJROOT}/verif
+exec python3 -m vta.exec.rpc_server
