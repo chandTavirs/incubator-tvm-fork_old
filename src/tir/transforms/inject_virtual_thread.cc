@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file inject_virtual_thread.cc
  */
@@ -131,7 +133,8 @@ class VarTouchedAnalysis : public StmtVisitor {
     Record(op->buffer_var.get(), tc);
     this->VisitStmt(op->body);
   }
-  void Record(const VarNode* var, const ExprTouched& tc) {
+  void Record(const VarNode* var,
+              const ExprTouched& tc) {
     if (touched_var_.count(var)) return;
     if (tc.expr_touched_) {
       touched_var_.insert(var);
@@ -169,6 +172,37 @@ class VarTouchedAnalysis : public StmtVisitor {
   std::unordered_map<const VarNode*, std::vector<const VarNode*> > affect_;
 };
 
+// Class as a expression visitor for VTA pass
+// Helps in identifying the EvaluateNode to be deleted
+class DetectDthread : public ExprVisitor {
+  public:
+    void VisitExpr(const PrimExpr &e) final {
+      if (has_dthread_) return;
+      ExprVisitor::VisitExpr(e);
+    }
+
+    void VisitExpr_(const CallNode* op) final {
+      if (has_dthread_) return;
+      if (!check_load_ && op->op.same_as(builtin::call_extern()) && op->args[0].as<StringImmNode>()->value == "VTALoadBuffer2D") {
+        check_load_ = true;
+      }
+      ExprVisitor::VisitExpr_(op);  
+    }
+
+    void VisitExpr_(const VarNode* op) final {
+      if (check_load_ && op->name_hint == "dthread") {
+        has_dthread_ = true; 
+        return;
+      }
+    }
+
+    // Flag to check the presence of dthread
+    bool has_dthread_{false};
+    // Flag to check VTALoadBuffer2D call
+    bool check_load_{false};
+};
+
+
 // Inject virtual thread loop
 // rewrite the buffer access pattern when necessary.
 class VTInjector : public StmtExprMutator {
@@ -176,12 +210,19 @@ class VTInjector : public StmtExprMutator {
   // constructor
   VTInjector(Var var, int num_threads, const std::unordered_set<const VarNode*>& touched_var,
              bool allow_share)
-      : var_(var),
-        num_threads_(num_threads),
-        touched_var_(touched_var),
-        allow_share_(allow_share) {}
+      : var_(var), num_threads_(num_threads),
+        touched_var_(touched_var), allow_share_(allow_share) {
+    // In VTA IR, touched_var_ will only have dthread
+    if (touched_var_.size() == 1) {
+      is_vta_pass_ = true;
+    }
+  }
   // Inject VTLoop when needed.
   Stmt VisitStmt(const Stmt& s) final {
+    // Stmt parser run
+    if (stmt_parser_) {
+      return StmtExprMutator::VisitStmt(s);
+    }
     ICHECK(!visit_touched_var_);
     auto stmt = StmtExprMutator::VisitStmt(s);
     if (visit_touched_var_ || trigger_base_inject_) {
@@ -195,31 +236,69 @@ class VTInjector : public StmtExprMutator {
   }
   // Variable
   PrimExpr VisitExpr_(const VarNode* op) final {
+    if (stmt_parser_) {
+      return GetRef<PrimExpr>(op);
+    }
+    // Get mutator variable for tvm IR pass
+    if (track_loadnode_ && !has_index_mutator_) {
+      index_mutator_ = GetRef<Var>(op);
+      has_index_mutator_ = true;
+    }
     ICHECK(!alloc_remap_.count(op)) << "Buffer address may get rewritten in virtual thread";
     if (touched_var_.count(op)) {
       visit_touched_var_ = true;
     }
     return GetRef<PrimExpr>(op);
   }
+
+  PrimExpr RewriteIndexDoubleBuff(PrimExpr index, PrimExpr alloc_extent) const {
+    return index + indexmod(index_mutator_, num_threads_) * alloc_extent;
+  }
+
   PrimExpr RewriteIndex(PrimExpr index, PrimExpr alloc_extent) const {
     return index + var_ * alloc_extent;
   }
   // Load
   PrimExpr VisitExpr_(const LoadNode* op) final {
+    if (stmt_parser_) {
+      return StmtExprMutator::VisitExpr_(op);
+    }
+    if (track_untouched_ && !is_vta_pass_) {
+      track_loadnode_ = true;
+    }
     PrimExpr expr = StmtExprMutator::VisitExpr_(op);
     op = expr.as<LoadNode>();
-    if (touched_var_.count(op->buffer_var.get())) {
+    if (touched_var_.count(op->buffer_var.get()) && is_vta_pass_) {
       visit_touched_var_ = true;
     }
     auto it = alloc_remap_.find(op->buffer_var.get());
     if (it != alloc_remap_.end()) {
-      return Load(op->dtype, op->buffer_var, RewriteIndex(op->index, it->second), op->predicate);
+      // For tvm IR pass, modified access for LoadNode
+      if (var_->name_hint == "dthread" && 
+          untouched_buffer_var_->name_hint == op->buffer_var->name_hint) {
+        return Load(op->dtype, op->buffer_var, RewriteIndexDoubleBuff(op->index, it->second), op->predicate);
+      }
+      else {
+        return Load(op->dtype, op->buffer_var, RewriteIndex(op->index, it->second), op->predicate);
+      }
     } else {
       return expr;
     }
   }
   // Expression.
   PrimExpr VisitExpr_(const CallNode* op) final {
+    if (stmt_parser_) {
+      return StmtExprMutator::VisitExpr_(op);
+    }
+    // For VTA IR pass, track loadbuffer calls
+    if (op->op.same_as(builtin::call_extern()) && op->args[0].as<StringImmNode>()->value == "VTALoadBuffer2D") {
+      loadbuffer_tracked_ = true;
+      PrimExpr dest = op->args.operator[](op->args.size()-1);
+      // Don't track for acc buffer load (type 3)
+      if (dest.as<IntImmNode>()->value == 3) {
+        loadbuffer_tracked_ = false;
+      }
+    }
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       ICHECK_EQ(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
@@ -230,7 +309,22 @@ class VTInjector : public StmtExprMutator {
       PrimExpr offset = this->VisitExpr(op->args[2]);
       PrimExpr extent = this->VisitExpr(op->args[3]);
       PrimExpr stride = it->second / make_const(offset.dtype(), dtype.lanes());
-      offset = stride * var_ + offset;
+      // For VTA IR pass modify access of CallNode
+      if (var_->name_hint == "dthread" && !visit_touched_var_ &&
+          loadbuffer_tracked_) {
+        offset = stride * indexmod(fornode_var_, 2) + offset;
+        skip_buffer_name_ = buffer->name_hint;
+        loadbuffer_tracked_ = false;
+        found_fornode_var_ = true;
+        skip_vta_dthread_ = true;
+      }
+      else if (var_->name_hint == "dthread" && 
+               buffer->name_hint == skip_buffer_name_) {
+        offset = stride * indexmod(fornode_var_, 2) + offset;
+      }
+      else {
+        offset = stride * var_ + offset;
+      }
       return Call(op->dtype, op->op, {op->args[0], op->args[1], offset, extent, op->args[4]});
     } else if (op->op.same_as(builtin::tvm_context_id())) {
       return allow_share_ ? GetRef<PrimExpr>(op) : var_;
@@ -239,18 +333,43 @@ class VTInjector : public StmtExprMutator {
     }
   }
   Stmt VisitStmt_(const EvaluateNode* op) final {
+    // Detect if dthread present in EvaluateNode
+    // Then create a NoOp node to avoid redundant loads
+    if (stmt_parser_) {
+      DetectDthread det;
+      det(op->value);
+      if (det.check_load_ && !det.has_dthread_){
+        return Evaluate(0);
+      }
+      else {
+        return StmtExprMutator::VisitStmt_(op);
+      }
+    }
+    
+    if (loadbuffer_tracked_) {
+      loadbuffer_tracked_ = false;
+    }
     trigger_base_inject_ = !allow_share_;
     return StmtExprMutator::VisitStmt_(op);
   }
   // Store
   Stmt VisitStmt_(const StoreNode* op) final {
+    if (stmt_parser_) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+    if (!touched_var_.count(op->buffer_var.get()) && !is_vta_pass_) {
+      track_untouched_ = true;
+    }
     Stmt stmt = StmtExprMutator::VisitStmt_(op);
     op = stmt.as<StoreNode>();
-    if (touched_var_.count(op->buffer_var.get())) {
+    if (touched_var_.count(op->buffer_var.get()) && !is_vta_pass_) {
       visit_touched_var_ = true;
     }
     trigger_base_inject_ = !allow_share_;
     auto it = alloc_remap_.find(op->buffer_var.get());
+    if (var_->name_hint == "dthread" && has_index_mutator_ && !is_vta_pass_) {
+      untouched_buffer_var_ = op->buffer_var;
+    }
     if (it != alloc_remap_.end()) {
       return Store(op->buffer_var, op->value, RewriteIndex(op->index, it->second), op->predicate);
     } else {
@@ -282,7 +401,8 @@ class VTInjector : public StmtExprMutator {
     }
     visit_touched_var_ = false;
     Stmt body = this->VisitStmt(op->body);
-    if (value.same_as(op->value) && body.same_as(op->body)) {
+    if (value.same_as(op->value) &&
+        body.same_as(op->body)) {
       return GetRef<Stmt>(op);
     } else {
       return LetStmt(op->var, value, body);
@@ -290,6 +410,12 @@ class VTInjector : public StmtExprMutator {
   }
   // For
   Stmt VisitStmt_(const ForNode* op) final {
+    // Track ForNode var for mutator during VTA pass
+    if (!found_fornode_var_) {
+      if (((std::string)(op->loop_var->name_hint)).find("init") == std::string::npos) {
+        fornode_var_ = op->loop_var;
+      }
+    }
     ICHECK(is_zero(op->min));
     PrimExpr extent = this->VisitExpr(op->extent);
     if (visit_touched_var_ && !vt_loop_injected_) {
@@ -335,7 +461,12 @@ class VTInjector : public StmtExprMutator {
 
   // Seq
   Stmt VisitStmt_(const SeqStmtNode* op) final {
-    ICHECK_EQ(max_loop_depth_, 0);
+
+    // To avoid nbytes=8 in VTA runtime's UopKernelMap
+    // Flattened the dthread loop
+    // max_loop_depth > 0 as a result
+    // Disabled this check
+    // ICHECK_EQ(max_loop_depth_, 0);
     auto fmutate = [this](const Stmt& s) {
       int temp = max_loop_depth_;
       max_loop_depth_ = 0;
@@ -407,13 +538,39 @@ class VTInjector : public StmtExprMutator {
     vt_loop_injected_ = false;
     visit_touched_var_ = false;
     // only unroll if number of vthreads are small
-    if (max_loop_depth_ == 0 && num_threads_ < 16) {
+    // Disabled the first condition to avoid nbytes=8
+    // in VTA runtime for dthread
+    // if (max_loop_depth_ == 0 && num_threads_ < 16) {
+    if (num_threads_ < 16) {
       // do unrolling if it is inside innermost content.
       Array<Stmt> seq;
-      for (int i = 0; i < num_threads_; ++i) {
-        seq.push_back(Substitute(stmt, {{var_, make_const(var_.dtype(), i)}}));
+      if (var_->name_hint == "dthread" && !inject_virtual_thread_) {
+        inject_virtual_thread_ = true;
+        track_untouched_ = false;
+        track_loadnode_ = false;
+        return stmt;
       }
-      return SeqStmt::Flatten(seq);
+      else {
+        for (int i = 0; i < num_threads_; ++i) {
+          if (skip_vta_dthread_) {
+            if (!stmt_parser_) {
+              seq.push_back(Substitute(stmt, {{var_, make_const(var_.dtype(), i)}}));
+              stmt_parser_ = true;
+            } 
+            else {
+              // Mutate the AST, by zeroing out EvaluateNode in VTA pass
+              // stmt_parser_ = true bypasses the usual mutation
+              Stmt mod = this->VisitStmt(stmt);
+              seq.push_back(Substitute(mod, {{var_, make_const(var_.dtype(), i)}}));
+            }
+          }
+          else {
+            seq.push_back(Substitute(stmt, {{var_, make_const(var_.dtype(), i)}}));
+          }
+        }
+        stmt_parser_ = false;
+        return SeqStmt::Flatten(seq);
+      }
     } else {
       // insert a for loop
       Var idx(var_->name_hint + ".s", var_->dtype);
@@ -443,6 +600,33 @@ class VTInjector : public StmtExprMutator {
   bool allow_share_;
   // The allocations that get touched -> extent
   std::unordered_map<const VarNode*, PrimExpr> alloc_remap_;
+
+  // Enhancements for double buffering improvements
+  // Track if a StoreNode is untouched by thread var
+  bool track_untouched_{false};
+  // Track a LoadNode for untouched StoreNode
+  bool track_loadnode_{false};
+  // Store double buffering mutator variable
+  bool has_index_mutator_{false};
+  // Switch for virtual thread injection and skip
+  bool inject_virtual_thread_{true};
+  // Intermediate variables
+  Var index_mutator_, untouched_buffer_var_;
+  // VTA-specific variable to store mutator
+  Var fornode_var_;
+  // Check if ForNode var is used
+  bool found_fornode_var_{false};
+  // Check if loadbuffer is tracked
+  bool loadbuffer_tracked_{false};
+  // Flag to indicate statement parsing for VTA pass
+  bool stmt_parser_{false};
+  // Flag to skip virtual thread injection in VTA pass
+  bool skip_vta_dthread_{false};
+  // String to store buffer name to be skipped
+  std::string skip_buffer_name_{""};
+  // Flag to check if VTA IR pass
+  bool is_vta_pass_{false};
+  
 };
 
 class VirtualThreadInjector : public StmtMutator {

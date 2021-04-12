@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file thread_storage_scope.h
  * \brief Extract thread axis configuration from TVMArgs.
@@ -159,7 +161,7 @@ struct ThreadScope {
    */
   static ThreadScope Create(const std::string& s) {
     ThreadScope r;
-    if (s == "vthread" || s == "cthread") {
+    if (s == "vthread" || s == "cthread" || s == "dthread") {
       // virtual thread at the same level as local
       r.rank = 1;
       r.dim_index = -1;

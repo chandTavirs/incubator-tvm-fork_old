@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Configurable VTA Hareware Environment scope."""
 # pylint: disable=invalid-name, exec-used
 from __future__ import absolute_import as _abs
@@ -38,7 +41,9 @@ def pkg_config(cfg):
     """Returns PkgConfig pkg config object."""
     pkg_config_py = os.path.join(get_vta_hw_path(), "config/pkg_config.py")
     libpkg = {"__file__": pkg_config_py}
-    exec(compile(open(pkg_config_py, "rb").read(), pkg_config_py, "exec"), libpkg, libpkg)
+    fp = open(pkg_config_py, "rb")
+    exec(compile(fp.read(), pkg_config_py, "exec"), libpkg, libpkg)
+    fp.close()
     PkgConfig = libpkg["PkgConfig"]
     return PkgConfig(cfg)
 
@@ -71,6 +76,9 @@ class DevContext(object):
     ALU_OPCODE_MAX = 1
     ALU_OPCODE_ADD = 2
     ALU_OPCODE_SHR = 3
+    ALU_OPCODE_CLP = 4
+    ALU_OPCODE_MOV = 5
+    ALU_OPCODE_MUL = 6
     # Task queue id (pipeline stage)
     QID_LOAD_INP = 1
     QID_LOAD_WGT = 1
@@ -119,10 +127,10 @@ class Environment(object):
     # constants
     MAX_XFER = 1 << 22
     # debug flags
-    DEBUG_DUMP_INSN = 1 << 1
-    DEBUG_DUMP_UOP = 1 << 2
-    DEBUG_SKIP_READ_BARRIER = 1 << 3
-    DEBUG_SKIP_WRITE_BARRIER = 1 << 4
+    DEBUG_DUMP_INSN = (1 << 1)
+    DEBUG_DUMP_UOP = (1 << 2)
+    DEBUG_SKIP_READ_BARRIER = (1 << 3)
+    DEBUG_SKIP_WRITE_BARRIER = (1 << 4)
     # memory scopes
     inp_scope = "local.inp_buffer"
     wgt_scope = "local.wgt_buffer"
@@ -149,10 +157,18 @@ class Environment(object):
         self.ACC_BUFF_SIZE = 1 << self.LOG_ACC_BUFF_SIZE
         self.OUT_BUFF_SIZE = 1 << self.LOG_OUT_BUFF_SIZE
         # bytes per buffer
-        self.INP_ELEM_BITS = self.BATCH * self.BLOCK_IN * self.INP_WIDTH
-        self.WGT_ELEM_BITS = self.BLOCK_OUT * self.BLOCK_IN * self.WGT_WIDTH
-        self.ACC_ELEM_BITS = self.BATCH * self.BLOCK_OUT * self.ACC_WIDTH
-        self.OUT_ELEM_BITS = self.BATCH * self.BLOCK_OUT * self.OUT_WIDTH
+        self.INP_ELEM_BITS = (self.BATCH *
+                              self.BLOCK_IN *
+                              self.INP_WIDTH)
+        self.WGT_ELEM_BITS = (self.BLOCK_OUT *
+                              self.BLOCK_IN *
+                              self.WGT_WIDTH)
+        self.ACC_ELEM_BITS = (self.BATCH *
+                              self.BLOCK_OUT *
+                              self.ACC_WIDTH)
+        self.OUT_ELEM_BITS = (self.BATCH *
+                              self.BLOCK_OUT *
+                              self.OUT_WIDTH)
         self.INP_ELEM_BYTES = self.INP_ELEM_BITS // 8
         self.WGT_ELEM_BYTES = self.WGT_ELEM_BITS // 8
         self.ACC_ELEM_BYTES = self.ACC_ELEM_BITS // 8
@@ -232,7 +248,7 @@ class Environment(object):
             return "llvm -mtriple=armv7-none-linux-gnueabihf"
         if self.TARGET == "ultra96":
             return "llvm -mtriple=aarch64-linux-gnu"
-        if self.TARGET in ["sim", "tsim"]:
+        if self.TARGET in ["sim", "tsim", "bsim"]:
             return "llvm"
         raise ValueError("Unknown target %s" % self.TARGET)
 
@@ -317,10 +333,27 @@ def coproc_dep_pop(op):
 
 def _init_env():
     """Initialize the default global env"""
-    config_path = os.path.join(get_vta_hw_path(), "config/vta_config.json")
+    # Enable split parameter/target configuration.
+    jconfig = f'config/{os.environ.get("VTA_CONFIG")}.json'
+    config_path = os.path.join(get_vta_hw_path(), jconfig)
     if not os.path.exists(config_path):
-        raise RuntimeError("Cannot find config in %s" % str(config_path))
-    cfg = json.load(open(config_path))
+        config_path = os.path.join(get_vta_hw_path(), "config/vta_config.json")
+        if not os.path.exists(config_path):
+            raise RuntimeError("Cannot find config in %s" % str(config_path))
+    with open(config_path) as fp:
+        cfg = json.load(fp)
+    # If target is present use and override config.
+    jtarget = f'config/{os.environ.get("VTA_TARGET")}_target.json'
+    target_path = os.path.join(get_vta_hw_path(), jtarget)
+    if not os.path.exists(target_path):
+        target_path = os.path.join(get_vta_hw_path(), "config/vta_target.json")
+    if os.path.exists(target_path):
+        with open(target_path) as fp:
+            tgt = json.load(fp)
+            cfg.update(tgt)
+    if 'TARGET' not in cfg or 'HW_VER' not in cfg:
+        raise RuntimeError("Cannot find target in %s" % str(target_path))
+
     return Environment(cfg)
 
 

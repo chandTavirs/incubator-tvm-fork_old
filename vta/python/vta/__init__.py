@@ -15,20 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 """VTA Package is a TVM backend extension to support VTA hardware.
 
 Besides the compiler toolchain, it also includes utility functions to
 configure the hardware environment and access remote device through RPC.
 """
 import sys
+import os
 
 from .bitstream import get_bitstream_path, download_bitstream
 from .environment import get_env, Environment
-from .rpc_client import reconfig_runtime, program_fpga
+from .rpc_client import reconfig_runtime, program_fpga, trace_init, trace_done
+
+# Avoid dependencies when running as an RPC server
+if 'IS_RPC_SERVER' not in os.environ:
+    from .build_module import build_config, lower, build
+    from . import top
+
+DEVICE = None
+WORKLOAD = None
 
 __version__ = "0.1.0"
 
-# do not from tvm import topi when running vta.exec.rpc_server
+# do not import topi when running vta.exec.rpc_server
 # to maintain minimum dependency on the board
 if sys.argv[0] not in ("-c", "-m"):
     from . import top

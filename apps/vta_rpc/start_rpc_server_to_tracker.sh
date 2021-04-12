@@ -15,11 +15,14 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 PROJROOT="$( cd "$( dirname '${BASH_SOURCE[0]}' )/../../" && pwd )"
 
 # Derive target specified by vta_config.json
-VTA_CONFIG=${VTA_HW_PATH}/config/vta_config.py
-TARGET=$(python ${VTA_CONFIG} --target)
+VTA_CONFIG_PY=${VTA_HW_PATH}/config/vta_config.py
+TARGET=$(python ${VTA_CONFIG_PY} --target)
 
 export PYTHONPATH=${PYTHONPATH}:${PROJROOT}/python:${PROJROOT}/vta/python
 export PYTHONPATH=${PYTHONPATH}:/home/xilinx/pynq

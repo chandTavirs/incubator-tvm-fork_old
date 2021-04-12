@@ -14,8 +14,13 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Additional Transformation Passes. for VTA"""
 # pylint: disable=len-as-condition, no-else-return, unused-argument, invalid-name
+import math
+import numpy as np
 import tvm
 from tvm import te
 from tvm.topi import utils
@@ -34,9 +39,8 @@ def _match_pragma(stmt, key):
     key : str
         The pragma key
     """
-    return (stmt.attr_key == "pragma_" + key) or (
-        stmt.attr_key == "pragma_scope" and stmt.value.value == key
-    )
+    return ((stmt.attr_key == "pragma_" + key) or
+            (stmt.attr_key == "pragma_scope" and stmt.value.value == key))
 
 
 def FoldUopLoop():
@@ -493,10 +497,20 @@ def InjectDMAIntrin():
 
         raise_error()
 
+
     def _inject_copy(src, dst, pad_before, pad_after, pad_value):
-        # FIXME: pad_value is ignored...
         env = get_env()
-        _ = pad_value
+        is_pad_min_value = 0
+        if isinstance(pad_value, tvm.tir.expr.IntImm) and pad_value.value != 0:
+            if dst.scope == env.acc_scope \
+               and pad_value.value == np.int32(1 << (env.ACC_WIDTH - 1)):
+                is_pad_min_value = 1
+                assert env.ACC_WIDTH == 32, "Only 32-bit acc supported for neg pad value"
+            else:
+                print("WARNING: Unsupported pad value, assuming zero")
+        else:
+            _ = pad_value
+
         if dst.scope == "global":
             # Store
             if pad_before or pad_after:
@@ -608,6 +622,7 @@ def InjectDMAIntrin():
                     y_pad_before,
                     x_pad_after,
                     y_pad_after,
+                    is_pad_min_value,
                     dst.access_ptr("r", "int32"),
                     mem_type,
                 )
@@ -856,6 +871,9 @@ def AnnotateALUCoProcScope():
         _ftransform, opt_level=0, name="tir.vta.AnnotateALUCoProcScope"
     )
 
+# lowering optimization for comm reducer lowering
+comm_suppress_init = []
+comm_rewrite = []
 
 def InjectALUIntrin():
     """Pass to inject ALU micro-ops.
@@ -869,6 +887,7 @@ def InjectALUIntrin():
     def _ftransform(func, mod, ctx):
         env = get_env()
         idxm = tvm.tir.indexmod
+        idxd = tvm.tir.indexdiv
         analyzer = tvm.arith.Analyzer()
 
         def _do_fold(stmt):
@@ -909,7 +928,10 @@ def InjectALUIntrin():
 
                 return rev_src_coeff, rev_dst_coeff, rev_extents
 
-            if _match_pragma(stmt, "alu"):
+            if stmt in comm_suppress_init: # will be suppressed
+                irb = tvm.tir.ir_builder.create()
+                return irb.get()
+            elif _match_pragma(stmt, "alu"):
                 # Get to the innermost loop body
                 loop_body = stmt.body
                 nest_size = 0
@@ -929,13 +951,25 @@ def InjectALUIntrin():
                     tmp_body = tmp_body.body
                 # Derive opcode
                 if isinstance(loop_body.value, tvm.tir.Add):
-                    alu_opcode = env.dev.ALU_OPCODE_ADD
-                    lhs = loop_body.value.a
-                    rhs = loop_body.value.b
+                    if loop_body in comm_rewrite: # replace add with assignment
+                        alu_opcode = env.dev.ALU_OPCODE_MOV
+                        lhs = loop_body.value.a
+                        rhs = loop_body.value.b
+                    else:
+                        alu_opcode = env.dev.ALU_OPCODE_ADD
+                        lhs = loop_body.value.a
+                        rhs = loop_body.value.b
                 elif isinstance(loop_body.value, tvm.tir.Sub):
-                    alu_opcode = env.dev.ALU_OPCODE_SUB
                     lhs = loop_body.value.a
                     rhs = loop_body.value.b
+                    # cannot subtract, must add with negate
+                    if isinstance(lhs, tvm.tir.IntImm):
+                        lhs = -1 * lhs
+                    elif isinstance(rhs, tvm.tir.IntImm):
+                        rhs = -1 * rhs
+                    else:
+                        assert False # must invert 1 operand
+                    alu_opcode = env.dev.ALU_OPCODE_ADD
                 elif isinstance(loop_body.value, tvm.tir.Mul):
                     alu_opcode = env.dev.ALU_OPCODE_MUL
                     lhs = loop_body.value.a
@@ -944,10 +978,26 @@ def InjectALUIntrin():
                     alu_opcode = env.dev.ALU_OPCODE_MIN
                     lhs = loop_body.value.a
                     rhs = loop_body.value.b
-                elif isinstance(loop_body.value, tvm.tir.Max):
-                    alu_opcode = env.dev.ALU_OPCODE_MAX
+                elif isinstance(loop_body.value, tvm.tir.Div):
+                    alu_opcode = env.dev.ALU_OPCODE_SHR
                     lhs = loop_body.value.a
-                    rhs = loop_body.value.b
+                    imm = loop_body.value.b.value
+                    assert (1 << int(math.log2(imm))) == imm, "Only power of two Div supported"
+                    rhs = tvm.ir.make_node("IntImm", dtype="int32", value=int(math.log2(imm)))
+                elif isinstance(loop_body.value, tvm.tir.Max):
+                    if loop_body in comm_rewrite: # replace max with mov
+                        alu_opcode = env.dev.ALU_OPCODE_MOV
+                        lhs = loop_body.value.a
+                        rhs = loop_body.value.b
+                    elif isinstance(loop_body.value.a, tvm.tir.Min): # nested max/min = clip
+                        assert loop_body.value.a.b * -1 == loop_body.value.b
+                        alu_opcode = env.dev.ALU_OPCODE_CLP
+                        lhs = loop_body.value.a.a
+                        rhs = loop_body.value.a.b
+                    else:
+                        alu_opcode = env.dev.ALU_OPCODE_MAX
+                        lhs = loop_body.value.a
+                        rhs = loop_body.value.b
                 elif isinstance(loop_body.value, tvm.tir.Call):
                     if loop_body.value.op.name == "tir.shift_left":
                         alu_opcode = env.dev.ALU_OPCODE_SHR
@@ -965,6 +1015,14 @@ def InjectALUIntrin():
                     alu_opcode = env.dev.ALU_OPCODE_SHR
                     lhs = loop_body.value
                     rhs = tvm.tir.const(0, "int32")
+                elif isinstance(loop_body.value, tvm.tir.expr.IntImm):
+                    if loop_body.value >= -1 * (1 << 15) and loop_body.value < (1 << 15):
+                        alu_opcode = env.dev.ALU_OPCODE_MOV
+                        lhs = loop_body
+                        rhs = analyzer.simplify(loop_body.value)
+                    else:
+                        assert False,\
+                               "ALU MOV imm must fit in int16, not: %d" % (loop_body.value)
                 else:
                     raise RuntimeError(
                         "Expression not recognized %s, %s, %s"
@@ -1051,6 +1109,80 @@ def InjectALUIntrin():
                 if extents:
                     src_coeff, dst_coeff, extents = _flatten_loop(src_coeff, dst_coeff, extents)
 
+                # Batch Tiling
+                # Replace 3 UopLoopBegin with 2 UopLoopBegin
+                # followed by sequence of for loops
+                if len(extents) > 2:
+                    loop_body = stmt.body
+                    loop_vars = []
+                    loop_mins = []
+                    loop_extents = []
+                    for_type = loop_body.kind
+
+                    # Collect for loop info
+                    while isinstance(loop_body, tvm.tir.For):
+                        loop_vars.append(loop_body.loop_var)
+                        loop_mins.append(loop_body.min)
+                        loop_extents.append(loop_body.extent)
+                        loop_body = loop_body.body
+                    begins = []
+                    ends = []
+
+                    # Create 2 topmost VTAUopLoop s
+                    for idx in range(2):
+                        begins.append(tvm.tir.call_extern(
+                            "int32", "VTAUopLoopBegin",
+                            extents[idx], dst_coeff[idx], src_coeff[idx], 0))
+                        ends.append(tvm.tir.call_extern(
+                            "int32", "VTAUopLoopEnd"))
+
+                    start_idx = 2 # VTA ISA supports two VTAUopLoops
+                    if env.BATCH == 1:
+                        end_idx = -1
+                    else:
+                        end_idx = -2
+                    loop_vars = loop_vars[start_idx:end_idx]
+                    loop_mins = loop_mins[start_idx:end_idx]
+                    loop_extents = loop_extents[start_idx:end_idx]
+                    vta_factor = env.BATCH * env.BLOCK_OUT
+                    if use_imm is True:
+                        src_rhs_coeff = tvm.arith.detect_linear_equation(lhs.index, indices)
+                        src_lhs_coeff = tvm.arith.detect_linear_equation(dst_idx, indices)
+                    src_ptr = idxd(src_rhs_coeff[-1], vta_factor)
+                    dst_ptr = idxd(src_lhs_coeff[-1], vta_factor)
+                    src_coeff_set = src_rhs_coeff[2:end_idx-1]
+                    dst_coeff_set = src_lhs_coeff[2:end_idx-1]
+
+                    # Adjust VTAUopPush src and dst indices
+                    for idx, var in enumerate(loop_vars):
+                        src_ptr = tvm.tir.expr.Add(
+                            src_ptr, tvm.tir.expr.Mul(
+                                var,
+                                idxd(src_coeff_set[idx], vta_factor)
+                            ))
+                        dst_ptr = tvm.tir.expr.Add(
+                            dst_ptr, tvm.tir.expr.Mul(
+                                var,
+                                idxd(dst_coeff_set[idx], vta_factor)
+                            ))
+
+                    body = tvm.tir.call_extern(
+                        "int32", "VTAUopPush",
+                        1, 0,
+                        dst_ptr, src_ptr, 0,
+                        alu_opcode, int(use_imm), imm_val)
+
+                    body = tvm.tir.stmt.Evaluate(body)
+                    for idx in range(len(loop_vars)-1, -1, -1):
+                        body = tvm.tir.For(
+                            loop_vars[idx], loop_mins[idx],
+                            loop_extents[idx],
+                            for_type,
+                            body)
+
+                    final = tvm.tir.stmt_seq(*(begins + [body] + ends))
+                    return final
+
                 # Insert ALU micro-ops
                 irb = tvm.tir.ir_builder.create()
                 for idx, extent in enumerate(extents):
@@ -1079,9 +1211,189 @@ def InjectALUIntrin():
                 return irb.get()
             return stmt
 
-        return func.with_body(
-            tvm.tir.stmt_functor.ir_transform(func.body, None, _do_fold, ["tir.AttrStmt"])
-        )
+        def _alu_Mutator_(stmt):
+            if isinstance(stmt, tvm.tir.stmt.AttrStmt) and \
+                isinstance(stmt.body, tvm.tir.stmt.AttrStmt):
+                alu_stmt = stmt.body.body
+                loop_vars = []
+                min_vals = []
+                extents = []
+                for_types = []
+
+                if isinstance(alu_stmt, tvm.tir.stmt.For):
+                    while isinstance(alu_stmt, tvm.tir.stmt.For):
+                        # Collect for-loop structure
+                        loop_vars.append(alu_stmt.loop_var)
+                        min_vals.append(alu_stmt.min)
+                        extents.append(alu_stmt.extent)
+                        for_types.append(alu_stmt.kind)
+                        alu_stmt = alu_stmt.body
+
+                    if isinstance(alu_stmt.value, (tvm.tir.expr.Add, tvm.tir.expr.Mul)):
+                        alu_lhs = alu_stmt.value.a
+                        alu_rhs = alu_stmt.value.b
+                        if isinstance(alu_lhs, tvm.tir.expr.Cast):
+                            alu_lhs = alu_lhs.value
+                        if isinstance(alu_rhs, tvm.tir.expr.Cast):
+                            alu_rhs = alu_rhs.value
+                        if isinstance(alu_lhs, tvm.tir.expr.IntImm):
+                            return None
+                        if isinstance(alu_rhs, tvm.tir.expr.IntImm):
+                            return None
+                        dst_idx = alu_stmt.index
+                        dst_var = alu_stmt.buffer_var
+                        dst_coeff = tvm.arith.detect_linear_equation(dst_idx, loop_vars)
+                        lhs_coeff = tvm.arith.detect_linear_equation(alu_lhs.index, loop_vars)
+                        rhs_coeff = tvm.arith.detect_linear_equation(alu_rhs.index, loop_vars)
+                        lhs_equal = True
+                        rhs_equal = True
+                        for i, coef in enumerate(dst_coeff):
+                            if not tvm.ir.structural_equal(coef, lhs_coeff[i]):
+                                lhs_equal = False
+                            if not tvm.ir.structural_equal(coef, rhs_coeff[i]):
+                                rhs_equal = False
+
+                        if lhs_equal is False and rhs_equal is False:
+                            assert alu_lhs.buffer_var.same_as(dst_var)
+                            assert alu_rhs.buffer_var.same_as(dst_var)
+
+                            # Create a modified MUL stmt and a new MOV stmt
+                            new_alu_lhs = tvm.tir.expr.Load(alu_lhs.dtype, dst_var,
+                                                            dst_idx, alu_lhs.predicate)
+                            if isinstance(alu_stmt.value, tvm.tir.expr.Mul):
+                                new_alu_value = tvm.tir.expr.Mul(new_alu_lhs, alu_rhs)
+                            else:
+                                new_alu_value = tvm.tir.expr.Add(new_alu_lhs, alu_rhs)
+                            new_alu_stmt = tvm.tir.stmt.Store(dst_var, new_alu_value,
+                                                              dst_idx, alu_stmt.predicate)
+
+                            mov_stmt = tvm.tir.stmt.Store(dst_var, alu_lhs,
+                                                          dst_idx, alu_stmt.predicate)
+
+                            for i in range(len(extents)-1, -1, -1):
+                                new_alu_stmt = tvm.tir.stmt.For(loop_vars[i],
+                                                                min_vals[i],
+                                                                extents[i],
+                                                                for_types[i],
+                                                                new_alu_stmt)
+                                mov_stmt = tvm.tir.stmt.For(loop_vars[i],
+                                                            min_vals[i],
+                                                            extents[i],
+                                                            for_types[i],
+                                                            mov_stmt)
+
+                            new_alu_stmt = tvm.tir.stmt.AttrStmt(stmt.body.node,
+                                                                 stmt.body.attr_key,
+                                                                 stmt.body.value,
+                                                                 new_alu_stmt)
+                            mov_stmt = tvm.tir.stmt.AttrStmt(stmt.body.node,
+                                                             stmt.body.attr_key,
+                                                             stmt.body.value,
+                                                             mov_stmt)
+                            alu_stmt_vta = _do_fold(new_alu_stmt)
+                            mov_stmt_vta = _do_fold(mov_stmt)
+                            alu_body = tvm.tir.stmt.AttrStmt(stmt.node, stmt.attr_key,
+                                                             stmt.value, alu_stmt_vta)
+                            mov_body = tvm.tir.stmt.AttrStmt(stmt.node, stmt.attr_key,
+                                                             stmt.value, mov_stmt_vta)
+                            newbody = tvm.tir.stmt_seq(*([mov_body]+[alu_body]))
+                            return newbody
+            return None
+
+        def _find_CommRed(op):
+            if isinstance(op, tvm.tir.stmt.SeqStmt) and len(op.seq) > 3:
+                for i in range(len(op.seq) - 1):
+                    d_i = op.seq[i]
+                    d_j = op.seq[i+1]
+                    suppress_alu = None
+
+                    while isinstance(d_i, (tvm.tir.stmt.AttrStmt, tvm.tir.stmt.For)):
+                        if isinstance(d_i, tvm.tir.stmt.AttrStmt) and _match_pragma(d_i, "alu"):
+                            suppress_alu = d_i
+                        d_i = d_i.body # descend lower
+                    if not isinstance(d_i, tvm.tir.stmt.Store):
+                        continue
+                    while isinstance(d_j, (tvm.tir.stmt.AttrStmt, tvm.tir.stmt.For)):
+                        d_j = d_j.body
+                    if not isinstance(d_j, tvm.tir.stmt.Store):
+                        continue
+
+                    # now we have two stores in back-to-back attr/for-loop nests
+                    if d_i.buffer_var.same_as(d_j.buffer_var) and \
+                       isinstance(d_i.value, tvm.tir.expr.IntImm) and \
+                       isinstance(d_j.value.a, tvm.tir.expr.Load) and \
+                       d_j.value.a.buffer_var.same_as(d_i.buffer_var) and \
+                       suppress_alu is not None:
+                        comm_suppress_init.append(suppress_alu) # remove alu pragma and assignment
+                        comm_rewrite.append(d_j) # rewrite only the store statement at the core
+                        break
+
+        def _clip_Mutator_(stmt):
+            if isinstance(stmt, tvm.tir.stmt.AttrStmt) and \
+                isinstance(stmt.body, tvm.tir.stmt.AttrStmt):
+                alu_stmt = stmt.body.body
+                loop_vars = []
+                min_vals = []
+                extents = []
+                for_types = []
+
+                if isinstance(alu_stmt, tvm.tir.stmt.For):
+                    while isinstance(alu_stmt, tvm.tir.stmt.For):
+                        # Collect for-loop structure
+                        loop_vars.append(alu_stmt.loop_var)
+                        min_vals.append(alu_stmt.min)
+                        extents.append(alu_stmt.extent)
+                        for_types.append(alu_stmt.kind)
+                        alu_stmt = alu_stmt.body
+                    # find nested max/mins with imm ranges
+                    if isinstance(alu_stmt.value, tvm.tir.expr.Max) and\
+                       isinstance(alu_stmt.value.a, tvm.tir.expr.Min) and\
+                       isinstance(alu_stmt.value.b, tvm.tir.expr.IntImm) and\
+                       isinstance(alu_stmt.value.a.b, tvm.tir.expr.IntImm):
+                        max_arg = alu_stmt.value.b.value
+                        min_arg = alu_stmt.value.a.b.value
+                        if not env.ENABLE_INSTRUCTION_CLP or max_arg != -1 * min_arg:
+                            # decompose into max and min
+                            new_min = tvm.tir.stmt.Store(alu_stmt.buffer_var, alu_stmt.value.a,
+                                                         alu_stmt.index, alu_stmt.predicate)
+                            new_max_value_a = tvm.tir.expr.Load(alu_stmt.value.a.dtype,
+                                                                alu_stmt.buffer_var,
+                                                                alu_stmt.index,
+                                                                alu_stmt.predicate)
+                            new_max_value = tvm.tir.expr.Max(new_max_value_a, alu_stmt.value.b)
+                            new_max = tvm.tir.stmt.Store(alu_stmt.buffer_var, new_max_value,
+                                                         alu_stmt.index, alu_stmt.predicate)
+
+                            for i in range(len(extents)-1, -1, -1):
+                                new_min = tvm.tir.stmt.For(loop_vars[i], min_vals[i], extents[i],
+                                                           for_types[i], new_min)
+                                new_max = tvm.tir.stmt.For(loop_vars[i], min_vals[i], extents[i],
+                                                           for_types[i], new_max)
+
+                            new_min = tvm.tir.stmt.AttrStmt(stmt.body.node,
+                                                            stmt.body.attr_key,
+                                                            stmt.body.value,
+                                                            new_min)
+                            new_max = tvm.tir.stmt.AttrStmt(stmt.body.node,
+                                                            stmt.body.attr_key,
+                                                            stmt.body.value,
+                                                            new_max)
+                            min_body = tvm.tir.stmt.AttrStmt(stmt.node, stmt.attr_key,
+                                                             stmt.value, _do_fold(new_min))
+                            max_body = tvm.tir.stmt.AttrStmt(stmt.node, stmt.attr_key,
+                                                             stmt.value, _do_fold(new_max))
+                            newbody = tvm.tir.stmt_seq(*([min_body]+[max_body]))
+                            return newbody
+            return None # change nothing
+
+        # track if a CommReducer optimization can be implemented for VTA
+        comm_suppress_init.clear() # reset
+        comm_rewrite.clear() # reset
+        tvm.tir.stmt_functor.post_order_visit(func.body, _find_CommRed)
+        clip_body = tvm.tir.stmt_functor.ir_transform(func.body, _clip_Mutator_,
+                                                      None, ["tir.AttrStmt"])
+        return func.with_body(tvm.tir.stmt_functor.ir_transform(clip_body, _alu_Mutator_,
+                                                                _do_fold, ["tir.AttrStmt"]))
 
     return tvm.tir.transform.prim_func_pass(
         _ftransform, opt_level=0, name="tir.vta.InjectALUIntrin"

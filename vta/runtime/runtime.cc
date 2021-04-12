@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file runtime.cc
  * \brief Generic VTA runtime in C++11.
@@ -28,6 +30,7 @@
 
 #include <dmlc/logging.h>
 #include <tvm/runtime/c_runtime_api.h>
+#include <tvm/runtime/registry.h>
 #include <vta/driver.h>
 #include <vta/hw_spec.h>
 
@@ -37,10 +40,23 @@
 #include <memory>
 #include <vector>
 
+#include "trace_mgr.h"
+
+#ifdef printf
+#undef printf
+#endif  // printf
+#define printf trace_mgr.printf
+
+const char* mem_fmt = "%-16s virt_addr: 0x%016" PRIxPTR
+                      " phys_addr: 0x%08x "
+                      "sram_addr: 0x%08x elem_bytes: %4" PRIu32 " size_bytes: %8" PRIu32 "\n";
+const char* host_fmt = "%-16s  dst_addr: 0x%016" PRIxPTR
+                       "  src_addr: 0x%08x "
+                       "sram_addr: 0x%08x elem_bytes: %4" PRIu32 " size_bytes: %8" PRIu32 "\n";
 namespace vta {
 
 // Avoid bad configurations.
-static_assert(VTA_UOP_WIDTH == sizeof(VTAUop) * 8, "VTA_UOP_WIDTH do not match VTAUop size");
+static_assert(VTA_UOP_WIDTH == sizeof(VTAUop) * 8, "VTA_UOP_WIDTH does not match VTAUop size");
 
 /*! \brief Enable coherent access of data buffers between VTA and CPU */
 static const bool kBufferCoherent = VTA_COHERENT_ACCESSES;
@@ -77,20 +93,26 @@ struct DataBuffer {
   }
   /*!
    * \brief Performs a copy operation from host memory to buffer allocated with VTAMemAlloc.
-   * \param dst The desination buffer in FPGA-accessible memory. Has to be allocated with
+   * \param dst The destination buffer in FPGA-accessible memory. Has to be allocated with
    * VTAMemAlloc(). \param src The source buffer in host memory. \param size Size of the region in
    * Bytes.
    */
   void MemCopyFromHost(void* dst, const void* src, size_t size) {
+    if (trace_mgr.TraceHost() && trace_mgr.TraceVirtAddr())
+      printf(host_fmt, "CopyFromHost", dst, src, NULL, 0, size);
     VTAMemCopyFromHost(dst, src, size);
   }
   /*!
    * \brief Performs a copy operation from buffer allocated with VTAMemAlloc to host memory.
-   * \param dst The desination buffer in host memory.
+   * \param dst The destination buffer in host memory.
    * \param src The source buffer in FPGA-accessible memory. Has to be allocated with VTAMemAlloc().
    * \param size Size of the region in Bytes.
    */
-  void MemCopyToHost(void* dst, const void* src, size_t size) { VTAMemCopyToHost(dst, src, size); }
+  void MemCopyToHost(void* dst, const void* src, size_t size) {
+    if (trace_mgr.TraceHost() && trace_mgr.TraceVirtAddr())
+      printf(host_fmt, "CopyToHost", dst, src, NULL, 0, size);
+    VTAMemCopyToHost(dst, src, size);
+  }
   /*!
    * \brief Allocate a buffer of a given size.
    * \param size The size of the buffer.
@@ -101,6 +123,10 @@ struct DataBuffer {
     DataBuffer* buffer = new DataBuffer();
     buffer->data_ = data;
     buffer->phy_addr_ = VTAMemGetPhyAddr(data);
+    if (trace_mgr.TraceAlloc()) {
+      printf(mem_fmt, "BufferAlloc", data, buffer->phy_addr_, NULL, 0, size);
+    }
+    garbage_collector_.insert(buffer);
     return buffer;
   }
   /*!
@@ -109,6 +135,10 @@ struct DataBuffer {
    */
   static void Free(DataBuffer* buffer) {
     VTAMemFree(buffer->data_);
+    if (trace_mgr.TraceAlloc()) {
+      printf(mem_fmt, "BufferFree", buffer->data_, NULL, NULL, 0, 0);
+    }
+    garbage_collector_.erase(buffer);
     delete buffer;
   }
   /*!
@@ -120,12 +150,29 @@ struct DataBuffer {
     return const_cast<DataBuffer*>(reinterpret_cast<const DataBuffer*>(buffer));
   }
 
+  static void Collect () {
+    std::set<void*>::iterator i, e = garbage_collector_.end();
+    for (i = garbage_collector_.begin(); i != e; i++) {
+      auto buffer = (DataBuffer*) *i;
+      if (trace_mgr.TraceAlloc()) {
+        printf(mem_fmt, "BufferCollect", buffer->data_, NULL, NULL, 0, 0);
+      }
+      VTAMemFree(buffer->data_);
+      delete buffer;
+    }
+    garbage_collector_.clear();
+  }
+
  private:
   /*! \brief The internal data. */
   void* data_;
   /*! \brief The physical address of the buffer, excluding header. */
   vta_phy_addr_t phy_addr_;
+
+  static std::set<void*> garbage_collector_;
 };
+
+std::set<void*> DataBuffer::garbage_collector_;
 
 /*!
  * \brief Micro op kernel.
@@ -200,11 +247,18 @@ class UopKernel {
   void Push(uint32_t mode, uint32_t reset_out, uint32_t dst_index, uint32_t src_index,
             uint32_t wgt_index, uint32_t opcode, uint32_t use_imm, int32_t imm_val) {
     // The loop nest structure
-    VerifyDep(dst_index);
+    // VerifyDep(dst_index);
     VTAUop op;
-    op.dst_idx = dst_index;
-    op.src_idx = src_index;
-    op.wgt_idx = wgt_index;
+    op.alu.dst_idx = dst_index;
+    if (mode == 1) { // ALU mode: put lower bits in src_idx and any remaining bits in wgt_idx
+      op.alu.src_idx = src_index;
+      CHECK(op.alu.src_idx == src_index);
+    } else { // keep other modes unchanged
+      op.gem.src_idx = src_index;
+      op.gem.wgt_idx = wgt_index;
+      CHECK(op.gem.src_idx == src_index);
+      CHECK(op.gem.wgt_idx == wgt_index);
+    }
     seq_.push_back(op);
     // Ensure that mode is consistent if set
     if (mode_ == 0xFFFFFFFF) {
@@ -234,10 +288,10 @@ class UopKernel {
   /*! \brief Dump kernel micro ops to stdout. */
   void Dump() {
     uint32_t size = seq_.size();
-    printf("There are %u uops\n", size);
+    printf("There are %u uops [%u, %u]\n", size, sram_begin_, sram_end_);
     for (uint32_t i = 0; i < size; ++i) {
-      printf("[%04u]\t acc=%u, inp=%u, wgt=%u\n", i, seq_[i].dst_idx, seq_[i].src_idx,
-             seq_[i].wgt_idx);
+      printf("[%04u]\t acc=%u, inp=%u, wgt=%u\n", i, seq_[i].gem.dst_idx, seq_[i].gem.src_idx,
+             seq_[i].gem.wgt_idx);
     }
     printf("\n");
   }
@@ -255,7 +309,7 @@ class UopKernel {
   void VerifyDep(uint32_t dst_index) {
     size_t step = std::min(static_cast<size_t>(2U), seq_.size());
     for (size_t i = seq_.size() - step; i < seq_.size(); ++i) {
-      CHECK(seq_[i].dst_idx != dst_index);
+      CHECK(seq_[i].gem.dst_idx != dst_index);
     }
   }
   // The uop buffer
@@ -281,10 +335,18 @@ class UopKernel {
 template <class T>
 class BaseQueue {
  public:
-  virtual ~BaseQueue() {
+  void FreeSpace () {
     if (fpga_buff_ != nullptr) {
+      if (trace_mgr.TraceAlloc()) {
+        printf(mem_fmt, "QueueFree", fpga_buff_, NULL, NULL, 0, 0);
+      }
       VTAMemFree(fpga_buff_);
+      fpga_buff_ = nullptr;
     }
+  }
+  virtual ~BaseQueue() {
+    if (fpga_buff_ != nullptr)
+      FreeSpace();
   }
   /*! \return Content of DRAM buffer. */
   char* dram_buffer() const { return dram_buffer_; }
@@ -336,40 +398,96 @@ class BaseQueue {
   vta_phy_addr_t fpga_buff_phy_{0};
 };
 
+// forward declaration
+template <int kMaxBytes, bool kCoherent, bool kAlwaysCache>
+class InsnQueue;
+
 /*!
  * \brief Micro op buffer that manages the micro op cache.
  */
 template <int kMaxBytes, bool kCoherent, bool kAlwaysCache>
-class UopQueue : public BaseQueue<VTAUop> {
+class UopQueue : public BaseQueue<UopKernel *> {
  public:
-  void InitSpace() { BaseQueue::InitSpace(kElemBytes, kMaxBytes, kCoherent, kAlwaysCache); }
+  void InitSpace() {
+    BaseQueue::InitSpace(kElemBytes, kMaxBytes, kCoherent, kAlwaysCache);
+    if (trace_mgr.TraceAlloc()) {
+      printf(mem_fmt, "UopQueue", fpga_buff_, fpga_buff_phy_, NULL, kElemBytes, kMaxBytes);
+    }
+  }
   // Push data to the queue
   template <typename FAutoSync>
   void Push(UopKernel* kernel, FAutoSync fautosync) {
-    // if the micro-op is cached in VTA SRAM, skip
+    // if kernel is already cached in VTA SRAM, must already be in DRAM too, so skip further processing
     if (kernel->cached()) return;
     // check if we've exceeded the size of the allocated FPGA readable buffer
     size_t num_op = kernel->size();
-    if (dram_buffer_.size() + num_op > kMaxElems) {
-      fautosync();
-      CHECK(dram_buffer_.size() <= kMaxElems);
+    // make sure this kernel can fit in SRAM (by itself)
+    CHECK(num_op <= kMaxNumUop); // Cannot have a single kernel larger than SRAM buffer
+    CHECK(num_op > 0); // some ops to add
+    if (VTA_ENABLE_RUNTIME_VALUE_BASED_UOP_CONSOLIDATION) { // are kernel uops already in SRAM?
+      if (!pending() && cache_idx_ > 0) { // a kernel was written before
+        UopKernel * prev = cache_[cache_idx_ - 1];
+        CHECK(prev);
+        if (prev->cached() && num_op == prev->size()) { // prev kernel is cached and same size
+          bool all_match = true; // assume everything matches to start
+          for (uint32_t i = 0; i < num_op; i++) { // go through all uops
+            const VTAUop prev_uop = prev->data()[i];
+            const VTAUop cur_uop = kernel->data()[i];
+
+            if (prev_uop.gem.dst_idx != cur_uop.gem.dst_idx || 
+                prev_uop.gem.wgt_idx != cur_uop.gem.wgt_idx ||
+                prev_uop.gem.src_idx != cur_uop.gem.src_idx) { // any mismatch?
+              all_match = false;
+              break; // no need to look at remaining uops: one mismatch is enough
+            }
+          }
+          // all uops match
+          if (all_match) { // copy from predecessor
+            kernel->sram_begin_ = prev->sram_begin_;
+            kernel->sram_end_ = prev->sram_end_;
+            CHECK(kernel->cached());
+            cache_.insert(cache_.begin() + cache_idx_, kernel);
+            cache_idx_ += 1;
+            return;
+          } // else fall through and eventually create new uop(s) for SRAM
+        }
+      }
     }
-    // Cannot have a micro-op kernel larger than SRAM buffer
-    CHECK(num_op <= kMaxNumUop);
+    // at this point, kernel is not already in SRAM and is not a duplicate of previous kernel
+    bool found_in_dram = false; // is it already in DRAM?
+    size_t ops_already_in_dram = 0; // also calculate how many ops are in DRAM right now
+    for (uint32_t i = 0; i < dram_buffer_.size(); ++i) {
+      if (kernel == dram_buffer_[i]) {
+        found_in_dram = true;
+        break;
+      }
+      ops_already_in_dram += dram_buffer_[i]->size();
+    }
+
+    if (!found_in_dram) { // not already in dram, so add it
+      dram_buffer_.push_back(kernel);
+      // check if we've exceeded the size of the allocated FPGA readable buffer
+      if (ops_already_in_dram + num_op > kMaxElems) {
+        fautosync(); // make more room in the fpga-accessible dram buffer
+        CHECK(ops_already_in_dram + num_op <= kMaxElems); // enough room now
+      }
+    }
+
+    // now try to fit this kernel into the SRAM
     uint32_t uop_begin = 0;
-    if (sram_end_ + num_op > kMaxNumUop) {
-      // Need to evict
+    if (sram_end_ + num_op > kMaxNumUop) { // Need to evict
       cache_idx_ = 0;
       sram_begin_ = 0;
       sram_end_ = num_op;
-    } else {
+    } else { // just add to the end
       uop_begin = sram_end_;
       sram_end_ += num_op;
     }
+
     // Simple eviction policy
     uint32_t evict_begin = cache_idx_;
     for (; cache_idx_ < cache_.size(); ++cache_idx_) {
-      if (cache_[cache_idx_]->sram_begin_ >= sram_end_) break;
+      if (cache_[cache_idx_]->sram_begin_ >= sram_end_) break; // not cached already
       // Mark the kernel as "invalid"
       cache_[cache_idx_]->sram_begin_ = 0;
       cache_[cache_idx_]->sram_end_ = 0;
@@ -382,29 +500,67 @@ class UopQueue : public BaseQueue<VTAUop> {
     cache_.erase(cache_.begin() + evict_begin, cache_.begin() + cache_idx_);
     cache_idx_ = evict_begin + 1;
   }
-  // Flush micro op load instruction
-  void FlushUopLoad(VTAMemInsn* insn) {
-    if (sram_begin_ != sram_end_) {
-      // Derive offset in FPGA-readable buffer
-      int32_t offset = 0;
-      for (uint32_t i = 0; i < cache_idx_ - 1; ++i) {
-        offset += cache_[i]->size() * kElemBytes;
+
+  // Flush micro op load instruction: opportunistically combine with prior loads
+  void FlushUopLoad(InsnQueue<kMaxBytes, kCoherent, kAlwaysCache> & insn_q) {
+    CHECK(pending()); // no need to create a load uop insn if no kernel
+    CHECK(cache_idx_ > 0); // can't flush a uop when there's nothing in SRAM
+    UopKernel * cur = cache_[cache_idx_ - 1];
+    CHECK(cur);
+    CHECK(cur->size() == (sram_end_ - sram_begin_));
+
+    // Derive offset address in FPGA-readable buffer
+    uint32_t offset_bytes = 0;
+    for (uint32_t i = 0; i < dram_buffer_.size(); ++i) {
+      if (dram_buffer_[i] == cur) {
+        break;
       }
-      insn->memory_type = VTA_MEM_ID_UOP;
-      insn->sram_base = sram_begin_;
-      // Update cache idx to physical address map
-      insn->dram_base = (fpga_buff_phy_ + offset) / kElemBytes;
-      insn->y_size = 1;
-      insn->x_size = (sram_end_ - sram_begin_);
-      insn->x_stride = (sram_end_ - sram_begin_);
-      insn->y_pad_0 = 0;
-      insn->y_pad_1 = 0;
-      insn->x_pad_0 = 0;
-      insn->x_pad_1 = 0;
-      // Reset indices
-      sram_begin_ = sram_end_;
+      offset_bytes += dram_buffer_[i]->size() * kElemBytes;
     }
+    uint32_t effective_dram_base = (fpga_buff_phy_ + offset_bytes) / kElemBytes;
+
+    if (VTA_ENABLE_RUNTIME_GREEDY_UOP_LOADS) {
+      //if possible, find a previous load uop instruction to extend
+      union VTAInsn c;
+      for (int32_t i = insn_q.count() - 1; i >= 0; i--) { // find the most recent insn
+        c.generic = insn_q.data()[i];
+        if (c.mem.opcode == VTA_OPCODE_LOAD && c.mem.memory_type == VTA_MEM_ID_UOP) { // uop load
+          if (c.mem.sram_base + c.mem.x_size == sram_begin_ && // adjacent sram
+              c.mem.dram_base + c.mem.x_size == effective_dram_base && // adjacent dram
+              cache_idx_ > 1 && // previous kernel exists
+              cache_[cache_idx_-1]->sram_end_ > cache_[cache_idx_-1]->sram_begin_  && // in SRAM
+              c.mem.sram_base + c.mem.x_size + (sram_end_ - sram_begin_) < kMaxNumUop // fits
+          ) {
+            // just extend that previous instruction's x_size and x_stride
+            reinterpret_cast<VTAMemInsn*>(insn_q.data())[i].x_size += (sram_end_ - sram_begin_);
+            reinterpret_cast<VTAMemInsn*>(insn_q.data())[i].x_stride += (sram_end_ - sram_begin_);
+            // Reset indices
+            sram_begin_ = sram_end_; // nothing is pending anymore
+            return;
+          } else {
+            break; // do not consider any other instructions
+          }
+        }
+      } // if we get here, coudn't find an existing load uop to modify, so we create a new one
+    }
+
+    VTAMemInsn* insn = insn_q.CreateMemInsn(VTA_MEM_ID_UOP);
+    CHECK(insn);
+    insn->opcode = VTA_OPCODE_LOAD;
+    insn->memory_type = VTA_MEM_ID_UOP;
+    insn->sram_base = sram_begin_;
+    insn->dram_base = effective_dram_base;
+    insn->y_size = 1;
+    insn->x_size = (sram_end_ - sram_begin_);
+    insn->x_stride = (sram_end_ - sram_begin_);
+    insn->y_pad_0 = 0;
+    insn->y_pad_1 = 0;
+    insn->x_pad_0 = 0;
+    insn->x_pad_1 = 0;
+    // Reset indices
+    sram_begin_ = sram_end_; // nothing is pending
   }
+
   /*! \brief clear cache and reset base queue buffer.*/
   void Reset() {
     // unmark "cached" status
@@ -416,7 +572,7 @@ class UopQueue : public BaseQueue<VTAUop> {
 
     cache_.clear();
     cache_idx_ = 0;
-    BaseQueue<VTAUop>::Reset();
+    BaseQueue<UopKernel *>::Reset();
   }
   void AutoReadBarrier() { ReadBarrier(); }
   /*! \brief Writer barrier to make sure that data written by CPU is visible to VTA. */
@@ -425,15 +581,15 @@ class UopQueue : public BaseQueue<VTAUop> {
     CHECK(fpga_buff_phy_);
     // Iterate over caches; allocate buffer in FPGA-readable memory
     uint32_t buff_size = 0;
-    for (uint32_t i = 0; i < cache_.size(); ++i) {
-      buff_size += cache_[i]->size() * kElemBytes;
+    for (uint32_t i = 0; i < dram_buffer_.size(); ++i) {
+      buff_size += dram_buffer_[i]->size() * kElemBytes;
     }
     CHECK(buff_size <= kMaxBytes);
     // Move kernel contents to FPGA readable buffer
     uint32_t offset = 0;
-    for (uint32_t i = 0; i < cache_.size(); ++i) {
-      uint32_t ksize = cache_[i]->size() * kElemBytes;
-      VTAMemCopyFromHost(static_cast<char*>(fpga_buff_) + offset, cache_[i]->data(), ksize);
+    for (uint32_t i = 0; i < dram_buffer_.size(); ++i) {
+      uint32_t ksize = dram_buffer_[i]->size() * kElemBytes;
+      VTAMemCopyFromHost(static_cast<char*>(fpga_buff_) + offset, dram_buffer_[i]->data(), ksize);
       // Update offset
       offset += ksize;
     }
@@ -441,6 +597,13 @@ class UopQueue : public BaseQueue<VTAUop> {
     // and if interface is non-coherent
     if (!coherent_ && always_cache_) {
       VTAFlushCache(fpga_buff_, fpga_buff_phy_, offset);
+    }
+  }
+
+  void DumpUop () {
+    printf("There are %u uop kernels\n", cache_.size());
+    for (UopKernel *kernel : cache_) {
+      kernel->Dump();
     }
   }
 
@@ -460,21 +623,33 @@ class UopKernelMap {
  public:
   // Simple hash map
   UopKernel** Get(void* signature, int nbytes) {
-    uint32_t key = 0;
-    CHECK(nbytes == 0 || nbytes == sizeof(int));
+    uint64_t rowkey = 0;
+    uint32_t colkey = 0;
+    CHECK(nbytes == 0 || nbytes == sizeof(int) || nbytes == 2*sizeof(int));
     if (nbytes == sizeof(int)) {
-      memcpy(&key, signature, sizeof(int));
-      key = key + 1;
+      memcpy(&rowkey, signature, sizeof(int));
+      rowkey = rowkey + 1;
     }
-    CHECK_LT(key, 100);
-    if (kmap_.size() <= key) {
-      kmap_.resize(key + 1, nullptr);
+    if (nbytes == 2*sizeof(int)) {
+      memcpy(&rowkey, signature, 2*sizeof(int));
+      colkey = static_cast<uint32_t>(rowkey);
+      rowkey = rowkey >> 32;
+      colkey = colkey + 1;
+      rowkey = rowkey + 1;
     }
-    return &(kmap_[key]);
+    CHECK_LT(rowkey, 1000);
+    CHECK_LT(colkey, 1000);
+    if (kmap_.size() <= rowkey) {
+      kmap_.resize(rowkey + 1);
+    }
+    if (kmap_[rowkey].size() <= colkey) {
+      kmap_[rowkey].resize(colkey + 1, nullptr);
+    }
+    return &(kmap_[rowkey][colkey]);
   }
 
  private:
-  std::vector<UopKernel*> kmap_;
+  std::vector<std::vector<UopKernel*>> kmap_;
 };
 
 enum PipelineStage : int { kNoneStage = 0, kLoadStage = 1, kComputeStage = 2, kStoreStage = 3 };
@@ -489,6 +664,10 @@ class InsnQueue : public BaseQueue<VTAGenericInsn> {
     // Initialize the stage
     std::fill(pending_pop_prev_, pending_pop_prev_ + 4, 0);
     std::fill(pending_pop_next_, pending_pop_next_ + 4, 0);
+    if (trace_mgr.TraceAlloc()) {
+      void* virt_addr = trace_mgr.TraceVirtAddr() ? fpga_buff_ : NULL;
+      printf(mem_fmt, "InsnQueue", virt_addr, fpga_buff_phy_, NULL, kElemBytes, kMaxBytes);
+    }
   }
   /*! \return The data pointer. */
   VTAGenericInsn* data() { return dram_buffer_.data(); }
@@ -597,7 +776,7 @@ class InsnQueue : public BaseQueue<VTAGenericInsn> {
       }
       CommitPendingPop(kComputeStage);
     } else {
-      pending_pop_next_[kComputeStage] = 0;
+        pending_pop_next_[kComputeStage] = 0;
     }
     DepPush(kComputeStage, kLoadStage);
     DepPop(kLoadStage, kComputeStage);
@@ -631,6 +810,15 @@ class InsnQueue : public BaseQueue<VTAGenericInsn> {
       }
     } else if (opcode == VTA_ALU_OPCODE_SHR) {
       return "shr";
+    } else if (opcode == VTA_ALU_OPCODE_CLP) {
+      return "clp";
+    }
+    else if (opcode == VTA_ALU_OPCODE_MOV) {
+      if (use_imm) {
+        return "mov imm";
+      } else {
+        return "mov";
+      }
     }
 
     return "unknown op";
@@ -813,6 +1001,7 @@ class InsnQueue : public BaseQueue<VTAGenericInsn> {
   /*! \return Add new instruction to the buffer. */
   VTAGenericInsn* NextInsn() {
     VTAGenericInsn insn;
+    memset(&insn, 0, sizeof(insn));
     dram_buffer_.push_back(insn);
     return &dram_buffer_.back();
   }
@@ -903,7 +1092,12 @@ class CommandQueue {
     CHECK(device_ != nullptr);
   }
 
-  ~CommandQueue() { VTADeviceFree(device_); }
+  ~CommandQueue() {
+    VTADeviceFree(device_);
+    insn_queue_.FreeSpace();
+    uop_queue_.FreeSpace();
+    DataBuffer::Collect();
+  }
 
   uint32_t GetElemBytes(uint32_t memory_id) {
     uint32_t elem_bytes = 0;
@@ -937,7 +1131,7 @@ class CommandQueue {
 
   void LoadBuffer2D(void* src_dram_addr, uint32_t src_elem_offset, uint32_t x_size, uint32_t y_size,
                     uint32_t x_stride, uint32_t x_pad_before, uint32_t y_pad_before,
-                    uint32_t x_pad_after, uint32_t y_pad_after, uint32_t dst_sram_index,
+                    uint32_t x_pad_after, uint32_t y_pad_after, uint32_t is_pad_min_value, uint32_t dst_sram_index,
                     uint32_t dst_memory_type) {
     VTAMemInsn* insn = insn_queue_.CreateMemInsn(dst_memory_type);
     insn->opcode = VTA_OPCODE_LOAD;
@@ -952,8 +1146,113 @@ class CommandQueue {
     insn->y_pad_1 = y_pad_after;
     insn->x_pad_0 = x_pad_before;
     insn->x_pad_1 = x_pad_after;
+    insn->is_pad_min_value = is_pad_min_value;
     this->CheckInsnOverFlow();
+    if (trace_mgr.TraceLoad()) {
+      // Print out the memory region that will be read by the load instruction
+      // during the run for the layer. At this point the memory has already been
+      // copied from the host so we can read the dram and dump for x-reference.
+      uint32_t elem_bytes = GetElemBytes(dst_memory_type);
+      // PC: There is a bug in the encoding of the memory type in the
+      // memory instruction. Field memory_type has two bits, but there are 5
+      // different memory types that are assigned to it. VTA_MEM_ID_OUT == 4
+      // will be truncated to VTA_MEM_ID_UOP == 0. This means that whenever
+      // VTA_OUT_ELEM_BYTES != VTA_UOP_ELEM_BYTES hell breaks loose.
+      // if (insn->memory_type != dst_memory_type)
+      //{
+      //  printf ("MEMORY TYPE mismatch: 'encoded %u != expected %u'\n",
+      //          (unsigned)insn->memory_type, (unsigned)dst_memory_type);
+      //}
+      // assert (insn->memory_type == dst_memory_type);
+      assert(src->phy_addr() % elem_bytes == 0);
+      uint32_t size_bytes = x_size * y_size * elem_bytes;
+      void* virt_addr = (uint8_t*)src->virt_addr() + src_elem_offset * elem_bytes;
+      uint32_t phys_addr = src->phy_addr() + src_elem_offset * elem_bytes;
+      uint32_t sram_addr = insn->sram_base * elem_bytes;  // can this be truncated?
+      const char* mem_type = "NOP";
+      if (insn->memory_type == VTA_MEM_ID_UOP)
+        mem_type = "LD_UOP";
+      else if (insn->memory_type == VTA_MEM_ID_WGT)
+        mem_type = "LD_WGT";
+      else if (insn->memory_type == VTA_MEM_ID_INP)
+        mem_type = "LD_INP";
+      else if (insn->memory_type == VTA_MEM_ID_ACC)
+        mem_type = "LD_ACC";
+      void* vap = trace_mgr.TraceVirtAddr() ? virt_addr : NULL;
+      printf(mem_fmt, mem_type, vap, phys_addr, sram_addr, elem_bytes, size_bytes);
+      if (trace_mgr.TraceXY()) {
+        printf("y_size: %" PRIu64 "\n", insn->y_size);
+        printf("x_size: %" PRIu64 "\n", insn->x_size);
+        printf("x_strd: %" PRIu64 "\n", insn->x_stride);
+        printf("y_pad0: %" PRIu64 "\n", insn->y_pad_0);
+        printf("y_pad1: %" PRIu64 "\n", insn->y_pad_1);
+        printf("x_pad0: %" PRIu64 "\n", insn->x_pad_0);
+        printf("x_pad1: %" PRIu64 "\n", insn->x_pad_1);
+        printf("is_pad_min_value: %" PRIu64 "\n", insn->is_pad_min_value);
+      }
+      // The sram addr in bytes, not elements.
+      uint8_t *next_addr = (uint8_t*)virt_addr, *dram_addr;
+      // The total load into sram includes padding at beginning and end.
+      uint64_t xtotal = insn->x_size + insn->x_pad_0 + insn->x_pad_1;
+      // uint32_t ytotal = insn->y_size + insn->y_pad_0 + insn->y_pad_1;
+      // Advance sram by head padding.
+      sram_addr += xtotal * insn->y_pad_0 * elem_bytes;
+      uint32_t xfer_bytes = 16 * 8, phys_next = phys_addr;
+
+      if (trace_mgr.TraceVirtAddr()) printf(" %10s", "virt_addr");
+      printf(" %10s %10s", "phys_addr", "sram_addr");
+      if (trace_mgr.TraceXY()) printf(" %4s %4s", "y", "x");
+      printf(" dma transfer\n");
+      for (uint32_t y = 0; y < insn->y_size; ++y) {
+        // memset(sram_ptr, 0, kElemBytes * op->x_pad_0);
+        sram_addr += insn->x_pad_0 * elem_bytes;
+        dram_addr = next_addr;
+        phys_addr = phys_next;
+        // Actual load from dram to sram.
+        // memcpy(sram_ptr, dram_ptr, kElemBytes * op->x_size);
+        // In the VTA implementation, each x read, initial and stride is done with a
+        // sequence of DMA transfers. Check that we do not cross a page boundary
+        // during a tranfer. Dump memory one transfer per line.
+        uint32_t b = 0;
+        bool page_cross = false;
+        for (uint32_t x = 0; x < insn->x_size; ++x) {
+          for (uint32_t z = 0; z < elem_bytes; ++z) {
+            if (b % xfer_bytes) {
+              // Within a DMA trasfer, have we crossed a page boundary?
+              uint32_t this_page = phys_addr & 0xFFFF8000;
+              uint32_t prev_page = (phys_addr - 1) & 0xFFFF8000;
+              if (this_page != prev_page)
+                page_cross = true;
+            } else {
+              if (trace_mgr.TraceVirtAddr()) printf(" 0x%08" PRIxPTR, dram_addr);
+              printf(" 0x%08x 0x%08x", phys_addr, sram_addr);
+              if (trace_mgr.TraceXY()) printf(" %4" PRIu32 " %4" PRIu32, y, x);
+            }
+            printf(" %02x", *dram_addr++);
+            phys_addr++;
+            sram_addr++;
+            if (++b % xfer_bytes == 0) {
+              printf("\n");
+              if (page_cross) {
+                printf("LOAD_PAGE_BOUNDARY_CROSSING\n");
+                page_cross = false;
+              }
+            }
+          }
+        }
+        if (b % xfer_bytes) printf("\n");
+        // memset(sram_ptr, 0, kElemBytes * op->x_pad_1);
+        sram_addr += insn->x_pad_1 * elem_bytes;
+        next_addr += elem_bytes * insn->x_stride;
+        phys_next += elem_bytes * insn->x_stride;
+      }
+      // Tail padding.
+      // memset(sram_ptr, 0, kElemBytes * xtotal * op->y_pad_1);
+      trace_mgr.Flush();
+    }
   }
+
+  std::vector<void*> m_store_virt;
 
   void StoreBuffer2D(uint32_t src_sram_index, uint32_t src_memory_type, void* dst_dram_addr,
                      uint32_t dst_elem_offset, uint32_t x_size, uint32_t y_size,
@@ -971,7 +1270,41 @@ class CommandQueue {
     insn->y_pad_1 = 0;
     insn->x_pad_0 = 0;
     insn->x_pad_1 = 0;
+    insn->is_pad_min_value = 0;
     this->CheckInsnOverFlow();
+    if (trace_mgr.TraceStore()) {
+      uint32_t insn_idx = insn_queue_.count() - 1;
+      // Print out the memory region that will be written by the store instruction
+      // during the run for the layer. We would need to cache this and dump later
+      // after the run has ended for x-reference.
+      uint32_t elem_bytes = GetElemBytes(src_memory_type);
+      // if (insn->memory_type != src_memory_type)
+      //{
+      //  printf ("MEMORY TYPE mismatch: 'encoded %u != expected %u'\n",
+      //          (unsigned)insn->memory_type, (unsigned)src_memory_type);
+      //}
+      // assert (insn->memory_type == src_memory_type);
+      assert(dst->phy_addr() % elem_bytes == 0);
+      assert((uint64_t)dst->virt_addr() % elem_bytes == 0);
+      uint32_t size_bytes = x_size * y_size * elem_bytes;
+      void* virt_addr = (uint8_t*)dst->virt_addr() + dst_elem_offset * elem_bytes;
+      uint32_t phys_addr = dst->phy_addr() + dst_elem_offset * elem_bytes;
+      uint32_t sram_addr = src_sram_index * elem_bytes;
+      void* vap = trace_mgr.TraceVirtAddr() ? virt_addr : NULL;
+      printf(mem_fmt, "ST_OUT", vap, phys_addr, sram_addr, elem_bytes, size_bytes);
+      if (trace_mgr.TraceXY()) {
+        printf("y_size: %" PRIu64 "\n", insn->y_size);
+        printf("x_size: %" PRIu64 "\n", insn->x_size);
+        printf("x_strd: %" PRIu64 "\n", insn->x_stride);
+        printf("y_pad0: %" PRIu64 "\n", insn->y_pad_0);
+        printf("y_pad1: %" PRIu64 "\n", insn->y_pad_1);
+        printf("x_pad0: %" PRIu64 "\n", insn->x_pad_0);
+        printf("x_pad1: %" PRIu64 "\n", insn->x_pad_1);
+        printf("is_pad_min_value: %" PRIu64 "\n", insn->is_pad_min_value);
+      }
+      if (insn_idx >= m_store_virt.size()) m_store_virt.resize(insn_idx + 1);
+      m_store_virt[insn_idx] = virt_addr;
+    }
   }
 
   void DepPush(int from_qid, int to_qid) { insn_queue_.DepPush(from_qid, to_qid); }
@@ -994,7 +1327,7 @@ class CommandQueue {
 
   void Synchronize(uint32_t wait_cycles) {
     // Insert dependences to force serialization
-    if (debug_flag_ & VTA_DEBUG_FORCE_SERIAL) {
+    if (debug_flag_ & VTA_DEBUG_FORCE_SERIAL || trace_mgr.EventEnabled("SERIAL")) {
       insn_queue_.RewriteForceSerial();
     } else {
       // This will issue finish after last store finishes
@@ -1023,9 +1356,82 @@ class CommandQueue {
 
     // Make sure that we don't exceed contiguous physical memory limits
     CHECK(insn_queue_.count() * sizeof(VTAGenericInsn) < VTA_MAX_XFER);
+    if (trace_mgr.TraceInsn()) {
+      printf("VTADeviceRun: insn_count: %d, dram_phy_addr: 0x%x\n", insn_queue_.count(),
+             insn_queue_.dram_phy_addr());
+      uop_queue_.DumpUop();
+      insn_queue_.DumpInsn();
+    }
+    if (trace_mgr.EventEnabled("ISSUE")) {
+      // union VTAInsn c;
+      int insn_count = insn_queue_.count();
+      const VTAGenericInsn* i = insn_queue_.data();
+      for (int x = 0; x < insn_count; ++x, ++i) {
+        // c.generic = ginsn[i];
+        trace_mgr.Event("ISSUE", "%4u %016" PRIx64 "%016" PRIx64 "\n",
+        x, *((uint64_t*)i + 1), *((uint64_t*)i));
+      }
+    }
     int timeout =
         VTADeviceRun(device_, insn_queue_.dram_phy_addr(), insn_queue_.count(), wait_cycles);
     CHECK_EQ(timeout, 0);
+    if (trace_mgr.TraceStore()) {
+      union VTAInsn c;
+      int insn_count = insn_queue_.count();
+      const VTAGenericInsn* ginsn = insn_queue_.data();
+      for (int i = 0; i < insn_count; ++i) {
+        c.generic = ginsn[i];
+        if (c.mem.opcode == VTA_OPCODE_LOAD) {
+          if (c.mem.x_size == 0) continue;
+        } else if (c.mem.opcode == VTA_OPCODE_STORE) {
+          if (c.mem.x_size == 0) continue;
+          // BUG here: c.mem.memory_type is truncated to 0 from 4.
+          // uint32_t elem_bytes = GetElemBytes(c.mem.memory_type);
+          uint32_t elem_bytes = 16, xfer_bytes = 16 * 8; // de10nano
+          uint32_t size_bytes = c.mem.x_size * c.mem.y_size * elem_bytes;
+          uint8_t* virt_addr = (uint8_t*)m_store_virt[i];
+          uint8_t* phys_addr = (uint8_t*)(c.mem.dram_base * elem_bytes);
+          uint32_t sram_addr = c.mem.sram_base * elem_bytes, s;
+          void* vap = trace_mgr.TraceVirtAddr() ? virt_addr : NULL;
+          printf(mem_fmt, "ST_OUT", vap, phys_addr, sram_addr, elem_bytes, size_bytes);
+          uint8_t *v, *p;
+          bool page_cross = false;
+          if (trace_mgr.TraceVirtAddr()) printf(" %10s", "virt_addr");
+          printf(" %10s %10s", "phys_addr", "sram_addr");
+          if (trace_mgr.TraceXY()) printf(" %4s %4s", "y", "x");
+          printf(" elements\n");
+          for (uint32_t y = 0; y < c.mem.y_size; ++y) {
+            uint32_t b = 0; // start of dma transfer
+            for (uint32_t x = 0; x < c.mem.x_size; ++x) {
+              v = virt_addr + (y * c.mem.x_stride + x) * elem_bytes;
+              p = phys_addr + (y * c.mem.x_stride + x) * elem_bytes;
+              s = sram_addr + (y * c.mem.x_size + x) * elem_bytes;
+              if (trace_mgr.TraceVirtAddr()) printf(" 0x%08" PRIxPTR, v);
+              printf(" 0x%08x 0x%08x", p, s);
+              if (trace_mgr.TraceXY()) printf(" %4" PRIu32 " %4" PRIu32, y, x);
+              for (uint32_t j = 0; j < elem_bytes; ++j, b++, p++) {
+                if (b % xfer_bytes) {
+                  // Within a DMA trasfer, have we crossed a page boundary?
+                  uint32_t prev_page = ((uint64_t)(p-1)) & 0xFFFF8000;
+                  uint32_t this_page = ((uint64_t)p) & 0xFFFF8000;
+                  if (this_page != prev_page) {
+                    printf("!%02x", *v++);
+                    page_cross = true;
+                  } else
+                    printf(" %02x", *v++);
+                } else
+                  printf("+%02x", *v++);
+              }
+              printf("\n");
+              if (page_cross) {
+                printf("STORE_PAGE_BOUNDARY_CROSSING\n");
+                page_cross = false;
+              }
+            }
+          }
+        }
+      }
+    }
     // Reset buffers
     uop_queue_.Reset();
     insn_queue_.Reset();
@@ -1093,9 +1499,7 @@ class CommandQueue {
   void PushGEMMOp(UopKernel* kernel) {
     uop_queue_.Push(kernel, [this]() { this->AutoSync(); });
     if (uop_queue_.pending()) {
-      VTAMemInsn* insn = insn_queue_.CreateMemInsn(VTA_MEM_ID_UOP);
-      insn->opcode = VTA_OPCODE_LOAD;
-      uop_queue_.FlushUopLoad(insn);
+      uop_queue_.FlushUopLoad(insn_queue_);
     }
     VTAGemInsn* insn = insn_queue_.CreateGemInsn();
     insn->opcode = VTA_OPCODE_GEMM;
@@ -1104,6 +1508,10 @@ class CommandQueue {
     insn->uop_end = kernel->sram_end_;
     const std::vector<UopKernel::LoopEntry>& loop = kernel->loop();
     if (loop.size() > 0) {
+      assert(loop[0].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[0].wgt_factor < (1 << VTA_WGT_FACTOR_WIDTH));
+      assert(loop[0].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
+      assert(loop[0].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
       insn->iter_out = loop[0].extent;
       insn->wgt_factor_out = loop[0].wgt_factor;
       insn->src_factor_out = loop[0].src_factor;
@@ -1115,6 +1523,10 @@ class CommandQueue {
       insn->dst_factor_out = 0;
     }
     if (loop.size() > 1) {
+      assert(loop[1].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[1].wgt_factor < (1 << VTA_WGT_FACTOR_WIDTH));
+      assert(loop[1].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
+      assert(loop[1].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));    
       insn->iter_in = loop[1].extent;
       insn->wgt_factor_in = loop[1].wgt_factor;
       insn->src_factor_in = loop[1].src_factor;
@@ -1131,15 +1543,14 @@ class CommandQueue {
   void PushALUUop(UopKernel* kernel) {
     uop_queue_.Push(kernel, [this]() { this->AutoSync(); });
     if (uop_queue_.pending()) {
-      VTAMemInsn* insn = insn_queue_.CreateMemInsn(VTA_MEM_ID_UOP);
-      insn->opcode = VTA_OPCODE_LOAD;
-      uop_queue_.FlushUopLoad(insn);
+      uop_queue_.FlushUopLoad(insn_queue_);
     }
     VTAAluInsn* insn = insn_queue_.CreateAluInsn();
     insn->opcode = VTA_OPCODE_ALU;
     insn->reset_reg = kernel->reset_out_;
     insn->uop_bgn = kernel->sram_begin_;
     insn->uop_end = kernel->sram_end_;
+    assert(kernel->opcode_ < (1 << VTA_ALU_OPCODE_BIT_WIDTH));
     insn->alu_opcode = kernel->opcode_;
     insn->use_imm = kernel->use_imm_;
     insn->imm = kernel->imm_val_;
@@ -1155,6 +1566,9 @@ class CommandQueue {
       insn->iter_out = 1;
       insn->dst_factor_out = 0;
       insn->src_factor_out = 0;
+      assert(loop[0].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[0].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
+      assert(loop[0].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
       insn->iter_in = loop[0].extent;
       insn->dst_factor_in = loop[0].dst_factor;
       insn->src_factor_in = loop[0].src_factor;
@@ -1162,6 +1576,9 @@ class CommandQueue {
       insn->iter_out = loop[0].extent;
       insn->dst_factor_out = loop[0].dst_factor;
       insn->src_factor_out = loop[0].src_factor;
+      assert(loop[1].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[1].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
+      assert(loop[1].src_factor < (1 << VTA_INP_FACTOR_WIDTH));      
       insn->iter_in = loop[1].extent;
       insn->dst_factor_in = loop[1].dst_factor;
       insn->src_factor_in = loop[1].src_factor;
@@ -1189,6 +1606,33 @@ class CommandQueue {
   // Device handle
   VTADeviceHandle device_{nullptr};
 };
+
+using tvm::runtime::TVMArgs;
+using tvm::runtime::TVMRetValue;
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.enable").set_body([](TVMArgs args, TVMRetValue* rv) {
+  trace_mgr.Trace(args[0]);
+  *rv = trace_mgr.Trace();
+});
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.enable_event").set_body([](TVMArgs args, TVMRetValue* rv) {
+  trace_mgr.EnableEvent(args[0], args[1]);
+});
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.flush").set_body([](TVMArgs args, TVMRetValue* rv) {
+  trace_mgr.Flush();
+});
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.redirect_stdout")
+    .set_body([](TVMArgs args, TVMRetValue* rv) { trace_mgr.RedirectStdout(); });
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.quit").set_body([](TVMArgs args, TVMRetValue* rv) {
+  trace_mgr.Quit();
+});
+
+TVM_REGISTER_GLOBAL("vta.runtime.trace.init").set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = trace_mgr.Init(args[0]);
+});
 
 }  // namespace vta
 
@@ -1248,10 +1692,10 @@ void VTAReadBarrier(VTACommandHandle cmd, void* buffer, uint32_t elem_bits, uint
 void VTALoadBuffer2D(VTACommandHandle cmd, void* src_dram_addr, uint32_t src_elem_offset,
                      uint32_t x_size, uint32_t y_size, uint32_t x_stride, uint32_t x_pad_before,
                      uint32_t y_pad_before, uint32_t x_pad_after, uint32_t y_pad_after,
-                     uint32_t dst_sram_index, uint32_t dst_memory_type) {
+                     uint32_t is_pad_min_value, uint32_t dst_sram_index, uint32_t dst_memory_type) {
   static_cast<vta::CommandQueue*>(cmd)->LoadBuffer2D(
       src_dram_addr, src_elem_offset, x_size, y_size, x_stride, x_pad_before, y_pad_before,
-      x_pad_after, y_pad_after, dst_sram_index, dst_memory_type);
+      x_pad_after, y_pad_after, is_pad_min_value, dst_sram_index, dst_memory_type);
 }
 
 void VTAStoreBuffer2D(VTACommandHandle cmd, uint32_t src_sram_index, uint32_t src_memory_type,

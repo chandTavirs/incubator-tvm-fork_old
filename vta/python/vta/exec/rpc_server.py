@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """VTA customized TVM RPC Server
 
 Provides additional runtime function and library loading.
@@ -49,7 +52,7 @@ def server_start():
         """Try to load vta dll"""
         if not runtime_dll:
             runtime_dll.append(ctypes.CDLL(dll_path, ctypes.RTLD_GLOBAL))
-        logging.info("Loading VTA library: %s", dll_path)
+            logging.info("Loading VTA library: %s", dll_path)
         return runtime_dll[0]
 
     @tvm.register_func("tvm.rpc.server.load_module", override=True)
@@ -66,6 +69,7 @@ def server_start():
     def program_fpga(file_name):
         # pylint: disable=import-outside-toplevel
         env = get_env()
+        logging.info("Program FPGA with %s ", file_name)
         if env.TARGET == "pynq":
             from pynq import xlnk
 
@@ -76,7 +80,23 @@ def server_start():
             load_vta_dll()
         path = tvm.get_global_func("tvm.rpc.server.workpath")(file_name)
         program_bitstream.bitstream_program(env.TARGET, path)
-        logging.info("Program FPGA with %s ", file_name)
+
+    @tvm.register_func("tvm.contrib.vta.init_trace_mgr", override=True)
+    def init_trace_mgr(node, mode):
+        # pylint: disable=import-outside-toplevel
+        env = get_env()
+        if env.TARGET == "pynq" or env.TARGET == "de10nano":
+            load_vta_dll()
+        logging.info("Init trace %s.%s", node, mode)
+        from verif import trace_mgr
+        trace_mgr(node, mode)
+
+    @tvm.register_func("tvm.contrib.vta.done_trace_mgr", override=True)
+    def done_trace_mgr():
+        # pylint: disable=import-outside-toplevel
+        import builtins
+        logging.info("Done trace %s.%s", builtins.trace_mgr.node, builtins.trace_mgr.mode)
+        del builtins.trace_mgr
 
     @tvm.register_func("tvm.rpc.server.shutdown", override=True)
     def server_shutdown():

@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 """Testing topi conv2d operator for VTA"""
 
 import json
@@ -162,25 +164,14 @@ def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False, 
     # Derive number of ops
     fout_height = (wl.height + 2 * wl.hpad - wl.hkernel) // wl.hstride + 1
     fout_width = (wl.width + 2 * wl.wpad - wl.wkernel) // wl.wstride + 1
-    num_ops = (
-        2
-        * wl.batch
-        * fout_height
-        * fout_width
-        * wl.hkernel
-        * wl.wkernel
-        * wl.out_filter
-        * wl.in_filter
-    )
+    num_ops = 2 * wl.batch * fout_height * fout_width * wl.hkernel * wl.wkernel * wl.out_filter * wl.in_filter
 
     # @memoize("vta.tests.test_benchmark_topi.conv2d.verify_nhwc")
     def get_ref_data():
         # derive min max for act, wgt, and bias types (max non inclusive)
         a_min, a_max = 0 - (1 << (env.INP_WIDTH - 1)), (1 << (env.INP_WIDTH - 1))
         w_min, w_max = 0 - (1 << (env.WGT_WIDTH - 1)), (1 << (env.WGT_WIDTH - 1))
-        b_min, b_max = 0 - 1 << (env.INP_WIDTH + env.WGT_WIDTH - 2), 1 << (
-            env.INP_WIDTH + env.WGT_WIDTH - 2
-        )
+        b_min, b_max = 0 - 1 << (env.INP_WIDTH + env.WGT_WIDTH - 2), 1 << (env.INP_WIDTH + env.WGT_WIDTH - 2)
         a_np = np.random.randint(a_min, a_max, size=a_shape).astype(data.dtype)
         w_np = np.random.randint(w_min, w_max, size=w_shape).astype(kernel.dtype)
         b_np = np.random.randint(b_min, b_max, size=b_shape).astype(env.acc_dtype)
@@ -196,24 +187,16 @@ def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False, 
     data_np, kernel_np, bias_np, res_ref = get_ref_data()
     if data_pack:
         data_np = data_np.reshape(
-            wl.batch // env.BATCH,
-            env.BATCH,
-            wl.in_filter // env.BLOCK_IN,
-            env.BLOCK_IN,
-            wl.height,
-            wl.width,
-        ).transpose((0, 2, 4, 5, 1, 3))
+            wl.batch//env.BATCH, env.BATCH,
+            wl.in_filter//env.BLOCK_IN, env.BLOCK_IN,
+            wl.height, wl.width).transpose((0, 2, 4, 5, 1, 3))
         kernel_np = kernel_np.reshape(
-            wl.out_filter // env.BLOCK_OUT,
-            env.BLOCK_OUT,
-            wl.in_filter // env.BLOCK_IN,
-            env.BLOCK_IN,
-            wl.hkernel,
-            wl.wkernel,
-        ).transpose((0, 2, 4, 5, 1, 3))
+            wl.out_filter//env.BLOCK_OUT, env.BLOCK_OUT,
+            wl.in_filter//env.BLOCK_IN, env.BLOCK_IN,
+            wl.hkernel, wl.wkernel).transpose((0, 2, 4, 5, 1, 3))
         bias_np = bias_np.reshape(
-            wl.batch // env.BATCH, wl.out_filter // env.BLOCK_OUT, 1, 1, env.BATCH, env.BLOCK_OUT
-        )
+            wl.batch//env.BATCH, wl.out_filter//env.BLOCK_OUT,
+            1, 1, env.BATCH, env.BLOCK_OUT)
 
     # Build
     if "vta" in target.keys:
@@ -286,7 +269,6 @@ def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False, 
 
     return correct, cost, stats
 
-
 @pytest.mark.parametrize("device", ["vta", "arm_cpu"])
 def test_conv2d(device):
     def _run(env, remote):
@@ -298,13 +280,12 @@ def test_conv2d(device):
                 reconfig_runtime(remote)
         elif device == "arm_cpu":
             target = env.target_vta_cpu
-        with autotvm.tophub.context(target):  # load pre-tuned schedule parameters
+        with autotvm.tophub.context(target): # load pre-tuned schedule parameters
             for _, wl in resnet_wkls:
                 print(wl)
                 run_conv2d(env, remote, wl, target)
 
     vta.testing.run(_run)
-
 
 if __name__ == "__main__":
     test_conv2d(device="arm_cpu")

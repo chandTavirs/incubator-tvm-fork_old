@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """
 .. _basic-mat-mult:
 
@@ -67,7 +70,7 @@ if env.TARGET == "pynq" or env.TARGET == "de10nano":
     vta.program_fpga(remote, bitstream=None)
 
 # In simulation mode, host the RPC server locally.
-elif env.TARGET in ["sim", "tsim"]:
+elif env.TARGET in ["sim", "tsim", "bsim"]:
     remote = rpc.LocalSession()
 
 ######################################################################
