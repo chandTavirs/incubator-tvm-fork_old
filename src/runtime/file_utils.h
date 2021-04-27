@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file file_utils.h
  * \brief Minimum file manipulation utils for runtime.
@@ -56,6 +58,12 @@ std::string GetMetaFilePath(const std::string& file_name);
  * \return the base name
  */
 std::string GetFileBasename(const std::string& file_name);
+
+/*!
+ * \brief Check that a file exists.
+ * \param file_name The name of the file.
+ */
+bool FileExists(const std::string& file_name);
 
 /*!
  * \brief Load binary file into a in-memory buffer.
