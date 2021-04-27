@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file file_utils.cc
  */
@@ -121,6 +123,11 @@ void LoadBinaryFromFile(const std::string& file_name, std::string* data) {
   fs.seekg(0, std::ios::beg);
   data->resize(size);
   fs.read(&(*data)[0], size);
+}
+
+bool FileExists(const std::string& file_name) {
+  std::ifstream fs(file_name, std::ios::in);
+  return !fs.fail();
 }
 
 void SaveBinaryToFile(const std::string& file_name, const std::string& data) {
