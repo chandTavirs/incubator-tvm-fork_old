@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \brief Utility to make loop nest.
  * \file op_utils.cc
@@ -132,7 +134,9 @@ std::vector<std::vector<Stmt> > MakeLoopNest(const Stage& stage,
                                             it_attr->prefetch_offset[j], no_op));
         }
       }
-    } else if (bind_iv->thread_tag == "vthread" || bind_iv->thread_tag == "cthread") {
+    } else if (bind_iv->thread_tag == "vthread" ||
+               bind_iv->thread_tag == "cthread" ||
+               bind_iv->thread_tag == "dthread") {
       // virtual thread
       // Always restrict threaded IterVar to starts from 0.
       ICHECK(is_zero(dom->min));

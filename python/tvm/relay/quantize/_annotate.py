@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=unused-argument,inconsistent-return-statements
+
+# Modified by contributors from Intel Labs
+
 """Internal module for registering attribute for annotation."""
 import warnings
 from tvm import topi
@@ -405,5 +408,5 @@ def global_avg_pool2d_rewrite(ref_call, new_args, ctx):
     expr = _forward_op(ref_call, [new_args[0].realize()])
 
     # stop quantize after global_avg_pool2d
-    quantize_context().stop_quantize()
+    # quantize_context().stop_quantize()
     return expr

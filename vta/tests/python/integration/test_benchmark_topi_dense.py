@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 """Testing topi gemm operator for VTA"""
 
 import os
@@ -172,7 +174,7 @@ def run_gemm(
     if check_correctness:
         res_orig = res_arr.asnumpy()
         if data_pack:
-            res_orig = res_orig.reshape(batch_size, out_feat)
+            res_orig = res_orig.transpose((0, 2, 1, 3)).reshape(batch_size, out_feat)
         res_ref = res_ref >> 8
         res_ref = np.clip(res_ref, 0, (1 << env.OUT_WIDTH - 1) - 1)
         res_ref = res_ref.astype(env.out_dtype)

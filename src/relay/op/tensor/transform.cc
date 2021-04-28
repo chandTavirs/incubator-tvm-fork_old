@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file transform.cc
  * \brief Transform operators.
@@ -699,7 +701,7 @@ bool ReshapeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   }
   if (!found_dynamic) {
     ICHECK_EQ(oshape_sum, data_shape_sum)
-        << "Input tensor shape and reshaped shape are not compatible";
+       << "Input tensor shape and reshaped shape are not compatible";
   }
 
   reporter->Assign(types[1], TensorType(oshape, data->dtype));

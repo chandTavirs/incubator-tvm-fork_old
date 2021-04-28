@@ -17,6 +17,8 @@
  * under the License.
  */
 
+// Modified by contributors from Intel Labs
+
 /*!
  * \file src/relay/op/nn/nn.h
  * \brief Properties def of nn operators for sharing.
@@ -72,13 +74,26 @@ bool DenseRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   } else {
     if (weight == nullptr) return false;
     Array<tvm::PrimExpr> wshape = weight->shape;
-    ICHECK(static_cast<int>(weight->shape.size()) == 2);
-    if (!data->shape.back().as<tir::AnyNode>()) {
-      ICHECK(reporter->AssertEQ(data->shape[data->shape.size() - 1], weight->shape[1]))
-          << "DenseRel: input dimension doesn't match,"
-          << " data shape=" << data->shape << ", weight shape=" << weight->shape;
+    // ICHECK(static_cast<int>(weight->shape.size()) == 2);
+    if (static_cast<int>(weight->shape.size()) == 2){
+      if (!data->shape.back().as<tir::AnyNode>()) {
+        ICHECK(reporter->AssertEQ(data->shape[data->shape.size() - 1], weight->shape[1]))
+            << "DenseRel: input dimension doesn't match,"
+            << " data shape=" << data->shape << ", weight shape=" << weight->shape;
+      }
+      oshape.Set((oshape.size() - 1), wshape[0]);
     }
-    oshape.Set((oshape.size() - 1), wshape[0]);
+    else {
+      // For packed data, when data->shape.size() = 4
+      if (!data->shape.back().as<tir::AnyNode>()) {
+        ICHECK(reporter->AssertEQ(data->shape[data->shape.size() - 3],
+                                weight->shape[1]))
+            << "DenseRel: input dimension doesn't match,"
+            << " data shape=" << data->shape << ", weight shape=" << weight->shape;
+      }
+      oshape.Set((oshape.size() - 3), wshape[0]);
+      oshape.Set((oshape.size() - 1), wshape[2]);
+    }
   }
 
   DataType out_dtype = param->out_dtype;
