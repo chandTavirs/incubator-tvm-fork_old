@@ -4,8 +4,9 @@ Test Context.
 
 # Modified by contributors from Intel Labs
 
+import json
 from os import system, environ, chdir
-from os.path import abspath, dirname
+from os.path import abspath, dirname, exists
 from shutil import copy, move
 from contextlib import contextmanager
 from .test_utils import home, root
@@ -29,6 +30,14 @@ def config_target(target):
   vta_save = f'{cfg_dir}/vta_config.save'
   tgt_file = f'{cfg_dir}/{target}_target.json'
   if target == 'de10nano' or target == 'pynq':
+    fl = f'{home()}/test/fpga_targets.json'
+    if exists(fl):
+      with open(fl) as fp:
+        fpga_targets = json.load(fp)
+        if 'VTA_RPC_HOST' not in environ:
+          environ['VTA_RPC_HOST'] = fpga_targets[target]['host']
+        if 'VTA_RPC_PORT' not in environ:
+          environ['VTA_RPC_PORT'] = fpga_targets[target]['port']
     assert 'VTA_RPC_HOST' in environ, "Must set VTA_RPC_HOST environment variable"
     assert 'VTA_RPC_PORT' in environ, "Must set VTA_RPC_PORT environment variable"
   try:

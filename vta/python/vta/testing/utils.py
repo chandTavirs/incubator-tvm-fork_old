@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Test Utilities"""
 from __future__ import absolute_import as _abs
 
@@ -32,7 +35,7 @@ def run(run_func):
     """
     env = get_env()
 
-    if env.TARGET in ["sim", "tsim"]:
+    if env.TARGET in ["sim", "tsim", "bsim"]:
         # Talk to local RPC if necessary to debug RPC server.
         # Compile vta on your host with make at the root.
         # Make sure TARGET is set to "sim" in the config.json file.

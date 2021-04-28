@@ -15,15 +15,20 @@ seed(random_seed)
 pytest.register_assert_rewrite('test.deploy_classification')
 
 items = (
-   #'resnet18_v1', # tiger cat,    Egyptian cat, tabby cat,    lynx,         weasel
-    'resnet18_v2', # Egyptian cat, tiger cat,    tabby cat,    bucket,       corn
-   #'resnet34_v1', # tennis ball,  tiger cat,    tabby cat,    Egyptian cat, ping-pong ball
-    'resnet34_v2', # tabby cat,    tiger cat,    Egyptian cat, lynx,         ping-pong ball
-    'resnet50_v2', # tiger cat,    Egyptian cat, tabby cat,    laptop,       Pembroke
+   #'resnet18_v1',  # tiger cat,    Egyptian cat, tabby cat,    lynx,         weasel
+    'resnet18_v2',  # Egyptian cat, tiger cat,    tabby cat,    bucket,       corn
+   #'resnet34_v1',  # tennis ball,  tiger cat,    tabby cat,    Egyptian cat, ping-pong ball
+    'resnet34_v2',  # tabby cat,    tiger cat,    Egyptian cat, lynx,         ping-pong ball
+    'resnet50_v2',  # tiger cat,    Egyptian cat, tabby cat,    laptop,       Pembroke
     'resnet101_v2', # Egyptian cat, Chihuahua,    tabby cat,    tiger cat,    partridge
-    'mobilenet1.0' # tiger cat,   Egyptian cat, tabby cat,    lynx,         Persian cat
+    'mobilenet1.0'  # tiger cat,    Egyptian cat, tabby cat,    lynx,         Persian cat
 )
-params = [(i, t) for t in selected_targets for i in items]
+def filter_out(i, t):
+  return (i == 'mobilenet1.0' and (t == 'bsim' or t == 'pynq')) or \
+         (i == 'resnet50_v2' and t == 'pynq') or \
+         (i == 'resnet101_v2' and t == 'pynq')
+
+params = [(i, t) for t in selected_targets for i in items if not filter_out(i, t)]
 
 @pytest.mark.parametrize('workload,target', params)
 def test_deploy_classification(workload, target, testid):

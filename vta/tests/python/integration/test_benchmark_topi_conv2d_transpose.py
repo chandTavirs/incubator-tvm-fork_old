@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Modified by contributors from Intel Labs
+
 """Testing topi conv2d_transpose operator for VTA"""
 
 import json

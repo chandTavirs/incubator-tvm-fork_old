@@ -13,8 +13,8 @@ from numpy.random import seed
 
 seed(random_seed)
 pytest.register_assert_rewrite('test.test_benchmark_topi_depthwise_conv2d')
-
-targets = selected_targets
+excluded_targets = ['bsim']
+targets = [ t for t in selected_targets if t not in excluded_targets]
 items = (
     'mobilenet.D1',
     'mobilenet.D2',
