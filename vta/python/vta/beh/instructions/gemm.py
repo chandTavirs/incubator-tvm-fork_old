@@ -19,11 +19,11 @@ ENCODING = {
 def gemm(instr, uop_mem, inp_mem, wgt_mem, acc_mem, out_mem):
     '''gemm instruction'''
     with hcl.Stage("gemm"):
-        reset_reg = hcl.scalar(instr[8:7], name="reset_reg")
-        uop_bgn = hcl.scalar(instr[21:8], name="uop_bgn")
-        uop_end = hcl.scalar(instr[35:21], name="uop_end")
-        iter_out = hcl.scalar(instr[49:35], name="iter_out")
-        iter_in = hcl.scalar(instr[63:49], name="iter_in")
+        gemm_opcode = hcl.scalar(instr[9:7], name="gemm_opcode")
+        uop_bgn = hcl.scalar(instr[22:9], name="uop_bgn")
+        uop_end = hcl.scalar(instr[36:22], name="uop_end")
+        iter_out = hcl.scalar(instr[50:36], name="iter_out")
+        iter_in = hcl.scalar(instr[64:50], name="iter_in")
         dst_factor_out = hcl.scalar(instr[75:64], name="dst_factor_out")
         dst_factor_in = hcl.scalar(instr[86:75], name="dst_factor_in")
         src_factor_out = hcl.scalar(instr[97:86], name="src_factor_out")
@@ -34,9 +34,8 @@ def gemm(instr, uop_mem, inp_mem, wgt_mem, acc_mem, out_mem):
         trace_mgr.Event("EXE", "GEM  %016lx%016lx\n", (instr[128:64], instr[64:0]))
         trace_mgr.Event("GEM_LOOP", "%04x %04x %04x %04x\n",
                         (iter_out, iter_in, uop_bgn, uop_end))
-        #hcl.print(reset_reg, "- reset_reg = %d\n")
 
-        gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
+        gemm_core(gemm_opcode, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
                   src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
                   uop_mem, inp_mem, wgt_mem, acc_mem, out_mem)
         trace_mgr.Event("RET", "GEM  %016lx%016lx\n", (instr[128:64], instr[64:0]))
@@ -47,7 +46,7 @@ def decode_uop(uop):
     wgt_idx = hcl.scalar(uop[32:22], dtype=hcl.UInt(16))
     return acc_idx, inp_idx, wgt_idx
 
-def gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
+def gemm_core(gemm_opcode, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
               src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
               uop_mem, inp_mem, wgt_mem, acc_mem, out_mem,
               batch=env.BATCH, blkin=env.BLOCK_IN, blkout=env.BLOCK_OUT):
@@ -106,7 +105,7 @@ def gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, ds
     with hcl.Stage("gemm_core"):
         domain = (hcl.cast(hcl.UInt(32), iter_out.v), hcl.cast(hcl.UInt(32), iter_in.v),
                   (hcl.cast(hcl.UInt(32), uop_end.v-uop_bgn.v)))
-        with hcl.if_(reset_reg.v == 1):
+        with hcl.if_(gemm_opcode.v == 0):
             hcl.mutate(domain, fmutate_reset)
         with hcl.else_():
             hcl.mutate(domain, fmutate)

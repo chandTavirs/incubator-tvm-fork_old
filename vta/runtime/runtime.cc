@@ -902,7 +902,7 @@ class InsnQueue : public BaseQueue<VTAGenericInsn> {
         printf("\tdep - pop prev: %d, pop next: %d, push prev: %d, push next: %d\n",
                static_cast<int>(c.mem.pop_prev_dep), static_cast<int>(c.mem.pop_next_dep),
                static_cast<int>(c.mem.push_prev_dep), static_cast<int>(c.mem.push_next_dep));
-        printf("\treset_out: %d\n", static_cast<int>(c.gemm.reset_reg));
+        printf("\tgemm_opcode: %d\n", static_cast<int>(c.gemm.gemm_opcode));
         printf("\trange (%d, %d)\n", static_cast<int>(c.gemm.uop_bgn),
                static_cast<int>(c.gemm.uop_end));
         printf("\touter loop - iter: %d, wgt: %d, inp: %d, acc: %d\n",
@@ -1503,7 +1503,20 @@ class CommandQueue {
     }
     VTAGemInsn* insn = insn_queue_.CreateGemInsn();
     insn->opcode = VTA_OPCODE_GEMM;
-    insn->reset_reg = kernel->reset_out_;
+    // if reset then opcode 0 else 1 (or 2 or 3 for depthwise)
+    switch (kernel->reset_out_) {
+      case 0:
+        insn->gemm_opcode = VTA_GEMM_OPCODE_NORMAL;
+      break;
+      case 1:
+        insn->gemm_opcode = VTA_GEMM_OPCODE_RESET;
+      break;
+      case 2:
+        insn->gemm_opcode = VTA_GEMM_OPCODE_DEPTHWISE_STRIDE1;
+      break;
+      case 3:
+        insn->gemm_opcode = VTA_GEMM_OPCODE_DEPTHWISE_STRIDE2;
+    }
     insn->uop_bgn = kernel->sram_begin_;
     insn->uop_end = kernel->sram_end_;
     const std::vector<UopKernel::LoopEntry>& loop = kernel->loop();
