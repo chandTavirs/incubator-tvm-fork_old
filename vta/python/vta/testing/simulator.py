@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Modified by contributors from Intel Labs
+
 """Utilities to start simulator."""
 import ctypes
 import json
