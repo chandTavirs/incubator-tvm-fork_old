@@ -14,9 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-# Modified by contributors from Intel Labs
-
 """Utilities to start simulator."""
 import ctypes
 import json
@@ -54,7 +51,7 @@ def _load_sw():
             f = tvm.get_global_func("vta.tsim.init")
             m = tvm.runtime.load_module(lib_hw[0], "vta-tsim")
             f(m)
-            return lib_hw
+            # return lib_hw
         except OSError:
             return []
     elif env.TARGET == 'bsim':
