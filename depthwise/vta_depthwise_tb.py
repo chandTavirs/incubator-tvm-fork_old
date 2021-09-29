@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Created my contributors from Intel Labs
+# Created by contributors from Intel Labs
 
 """Simple Python-based testbench for running depthwise conv stride 1"""
 
