@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Modified by contributors from Intel Labs
+# Created my contributors from Intel Labs
 
 """Simple Python-based testbench for running depthwise conv stride 1"""
 
@@ -73,7 +73,7 @@ FINIT_FUNC_SIG = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 
 # ***** VTA setup
 rt = simulator.LIBS[0]
-simulator.debug_mode(0) # execute functionality
+# simulator.debug_mode(0) # execute functionality
 simulator.clear_stats()
 # print(simulator.stats())
 cmd = rt.VTATLSCommandHandle()
@@ -83,7 +83,7 @@ rt.VTASetDebugMode(cmd, VTA_DEBUG_FORCE_SERIAL + VTA_DEBUG_DUMP_UOP + VTA_DEBUG_
 env = vta.get_env()
 
 Workload = namedtuple(
-    "Conv2DWorkload",
+    "DepthwiseConv2DWorkload",
     [
         "batch",
         "height",
@@ -245,7 +245,7 @@ def run_depthwise(wkl, count=10):
                             0, 0, # don't care opcode, don't care imm
                             0) # imm = don't care
             elif wl.wstride == 2:
-                rt.VTAUopPush(0, 3, # Gemm mode with depthwise stride 1
+                rt.VTAUopPush(0, 3, # Gemm mode with depthwise stride 2
                             0, 0, 0, # dest = 0, inp = 0, wgt = 0
                             0, 0, # don't care opcode, don't care imm
                             0) # imm = don't care
@@ -253,7 +253,7 @@ def run_depthwise(wkl, count=10):
             rt.VTAUopLoopEnd()
             return 0
 
-        rt.VTAPushGEMMOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(gemm_reset), ctypes.POINTER(ctypes.c_int)(), 0)
+        # rt.VTAPushGEMMOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(gemm_reset), ctypes.POINTER(ctypes.c_int)(), 0)
         rt.VTAPushGEMMOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(gemm_kernel), ctypes.POINTER(ctypes.c_int)(), 0)
 
         def alu_add(a):

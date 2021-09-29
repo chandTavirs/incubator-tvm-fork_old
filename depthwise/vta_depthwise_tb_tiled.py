@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Created my contributors from Intel Labs
+
 """Simple Python-based testbench for running depthwise conv stride 1"""
 
 import ctypes
@@ -25,7 +27,7 @@ from vta.testing import simulator
 import numpy as np
 from collections import namedtuple
 from functools import partial
-from itertools import product
+from itertools import product, accumulate
 import argparse
 import json
 
@@ -103,8 +105,8 @@ Workload = namedtuple(
 )
 
 wkls = [
-        # ("depthwise_stride1.small", Workload(env.BATCH, 5, 5, 32, 1, 3, 3, 1, 1, 1, 1)),
-        # ("depthwise_stride2.small", Workload(env.BATCH, 5, 5, 32, 1, 3, 3, 1, 1, 2, 2)),
+        ("depthwise_stride1.small", Workload(env.BATCH, 5, 5, 32, 1, 3, 3, 1, 1, 1, 1)),
+        ("depthwise_stride2.small", Workload(env.BATCH, 5, 5, 32, 1, 3, 3, 1, 1, 2, 2)),
         ('mobilenet.D1',  Workload(env.BATCH, 112, 112, 32, 1, 3, 3, 1, 1, 1, 1)),
         ('mobilenet.D2',  Workload(env.BATCH, 112, 112, 64, 1, 3, 3, 1, 1, 2, 2)),
         ('mobilenet.D3',  Workload(env.BATCH, 56, 56, 128, 1, 3, 3, 1, 1, 1, 1)),
@@ -115,6 +117,55 @@ wkls = [
         ('mobilenet.D8',  Workload(env.BATCH, 14, 14, 512, 1, 3, 3, 1, 1, 2, 2)),
         ('mobilenet.D9',  Workload(env.BATCH, 7, 7, 1024, 1, 3, 3, 1, 1, 1, 1)),
 ]
+
+def balanced_tiling( n, t):
+    k = (n + t - 1)//t
+
+    hi = (n + k - 1)//k
+
+    over = hi*k - n
+
+    hi_lst = [hi] * (k-over)
+    lo_lst = [hi-1] * (over)
+
+    lst = hi_lst + lo_lst
+
+    assert n == sum(lst)
+
+    return lst
+
+def skewed_tiling( n, t):
+    k = (n + t - 1)//t
+
+    hi = t
+
+    over = hi*k - n
+
+    hi_lst = [hi] * (k-1)
+    lo_lst = [hi-over] * (1)
+
+    lst = hi_lst + lo_lst
+
+    assert n == sum(lst)
+    assert all( x > 0 for x in lst)
+
+    return lst
+
+def gen_offsets( lst):
+    return [0] + list(accumulate(lst))[:-1]
+
+def test_skewed_tiling():
+    n = 112
+    for t in range(1, n+1):
+        lst = skewed_tiling(n, t)
+        assert lst[:-1] == ([lst[0]]*(len(lst[:-1])))
+
+def test_balanced_tiling():
+    n = 112
+    for t in range(1, n+1):
+        lst = balanced_tiling(n, t)
+        assert all( x in {lst[0], lst[0]-1} for x in lst)
+        assert all( x >= y for (x,y) in zip(lst[:-1],lst[1:]))
 
 def dw_tiling_algorithm(wl, buffering, ow_tile_in=None, oh_tile_in=None):
 
@@ -146,22 +197,22 @@ def dw_tiling_algorithm(wl, buffering, ow_tile_in=None, oh_tile_in=None):
         assert owidth % 2 == 0
 
     print( wl)
-    # print( f'INP_BUFF_SIZE {env.INP_BUFF_SIZE} {env.INP_BUFF_SIZE // env.BLOCK_IN}')
-    # print( f'ACC_BUFF_SIZE {env.ACC_BUFF_SIZE} {env.ACC_BUFF_SIZE // env.BLOCK_OUT // 4}')
-    # print( f'IM2COL_LINE_SIZE {env.IM2COL_LINE_SIZE}')
+    print( f'INP_BUFF_SIZE {env.INP_BUFF_SIZE} {env.INP_BUFF_SIZE // env.BLOCK_IN}')
+    print( f'ACC_BUFF_SIZE {env.ACC_BUFF_SIZE} {env.ACC_BUFF_SIZE // env.BLOCK_OUT // 4}')
+    print( f'IM2COL_LINE_SIZE {env.IM2COL_LINE_SIZE}')
 
     def check_if_tiling_fits( oh_tile, ow_tile, wl):
         ih_tile_padded, iw_tile_padded = inp_tile([oh_tile, ow_tile], wl)
         inp_remaining = env.INP_BUFF_SIZE - ih_tile_padded * iw_tile_padded * env.BLOCK_IN * buffering
         # the + 1 accounts for bias storage
         out_remaining = env.ACC_BUFF_SIZE // 4 - (oh_tile * ow_tile + 1) * env.BLOCK_OUT * buffering
-        # print( f'inp_remaining: {inp_remaining} out_remaining: {out_remaining}')
+        print( f'inp_remaining: {inp_remaining} out_remaining: {out_remaining}')
         return inp_remaining >= 0 and out_remaining >= 0
 
     def check_width( oh_tile, ow_tile, wl):
         ih_tile_padded, iw_tile_padded = inp_tile([oh_tile, ow_tile], wl)
         line_size_remaining = env.IM2COL_LINE_SIZE - iw_tile_padded
-        # print( f'line_size_remaining: {line_size_remaining}')
+        print( f'line_size_remaining: {line_size_remaining}')
         return line_size_remaining >= 0
 
     # Reduce scratchpad size by 2x, first in height then in width
@@ -218,8 +269,8 @@ def dw_tiling_algorithm(wl, buffering, ow_tile_in=None, oh_tile_in=None):
 
         factors_oheight = factors(oheight)
         factors_owidth = factors(owidth)
-        # print( f'factors of oheight: {oheight} = {factors_oheight}')
-        # print( f'factors of owidth: {owidth} = {factors_owidth}')
+        print( f'factors of oheight: {oheight} = {factors_oheight}')
+        print( f'factors of owidth: {owidth} = {factors_owidth}')
 
         legal = []
         for (fh, fw) in product( factors_oheight, factors_owidth):
@@ -238,7 +289,7 @@ def dw_tiling_algorithm(wl, buffering, ow_tile_in=None, oh_tile_in=None):
 
         sorted_legal = list(sorted( legal, key=cost))
 
-        # print( [(p,cost(p)) for p in sorted_legal])
+        print( [(p,cost(p)) for p in sorted_legal])
         return sorted_legal[-1]
 
 
@@ -257,7 +308,7 @@ def dw_tiling_algorithm(wl, buffering, ow_tile_in=None, oh_tile_in=None):
     # print("oh_tile = ", oh_tile, "; ow_tile = ", ow_tile, "; c_tile = ", c_tile)
 
     tiling_params = {'IHT': ih_tile_padded, 'IWT': iw_tile_padded, 'OHT': oh_tile, 'OWT': ow_tile, 'CT': c_tile}
-    # print(tiling_params)
+    print(tiling_params)
 
     #constraints 
     assert c_tile == env.BLOCK_OUT
@@ -372,9 +423,9 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
     wgt_single_buffer_sz = 1
 
 
-    # print( f'inp_single_buffer_sz: {inp_single_buffer_sz}')
-    # print( f'out_single_buffer_sz: {out_single_buffer_sz}')
-    # print( f'wgt_single_buffer_sz: {wgt_single_buffer_sz}')
+    print( f'inp_single_buffer_sz: {inp_single_buffer_sz}')
+    print( f'out_single_buffer_sz: {out_single_buffer_sz}')
+    print( f'wgt_single_buffer_sz: {wgt_single_buffer_sz}')
 
 
     # ***** definition of the compute instructions       
@@ -445,6 +496,20 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
     ow_max = (owidth + ow_tile - 1)  // ow_tile
 
 
+    # choose between balanced or skewed tiling
+    oh_lst = balanced_tiling(oheight, oh_tile)
+    ow_lst = balanced_tiling(owidth,  ow_tile)
+
+    print(f'oh_lst: {oh_lst}')
+    print(f'ow_lst: {ow_lst}')
+
+    oh_offset_lst = gen_offsets(oh_lst)
+    ow_offset_lst = gen_offsets(ow_lst)
+
+    assert len(oh_lst) == oh_max
+    assert len(ow_lst) == ow_max
+
+
     for oc in range(oc_max):
         block_count = ow_max*oh_max*oc
 
@@ -476,32 +541,26 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
             inp_parity = block_count % buffering
 
             #height computations
-            oh_offset = oh * oh_tile               
-            oh_tile_local = oheight - oh_offset if oh == oh_max - 1 else oh_tile
+            oh_offset = oh_offset_lst[oh]
+            oh_tile_local = oh_lst[oh]
 
             hpad_before = wl.hpad if oh == 0 else 0
             hpad_after  = wl.hpad if oh == oh_max - 1 and wl.hstride == 1 else 0
 
-            #between two consecutive input tile there is (wl.hkernel - wl.hstride) overlap
-            ih_offset = 0 if oh == 0 else (oh - 1) * ih_tile_padded + (ih_tile_padded - wl.hpad) - (wl.hkernel - wl.hstride) * oh
-
-            ih_tile = ih_tile_padded - hpad_before - hpad_after   #input height tile without padding (if any)
-            ih_tile_local = ih_tile + oh_tile_local - oh_tile
-            ih_tile_padded_local = ih_tile_padded + oh_tile_local - oh_tile
+            ih_offset = 0 if oh == 0 else wl.hstride*oh_offset_lst[oh] - wl.hpad
+            ih_tile_padded_local = oh_tile_local*wl.hstride + (1 if wl.hstride == 2 else 2)
+            ih_tile_local = ih_tile_padded_local - hpad_before - hpad_after
 
             #width computations
-            ow_offset = ow * ow_tile 
-            ow_tile_local = owidth - ow_offset if ow == ow_max - 1 else ow_tile
+            ow_offset = ow_offset_lst[ow]
+            ow_tile_local = ow_lst[ow]
 
             wpad_before = wl.wpad if ow == 0 else 0
             wpad_after  = wl.wpad if ow == ow_max - 1 and wl.wstride == 1 else 0
 
-            #between two consecutive input tile there is (wl.wkernel - wl.wstride) overlap
-            iw_offset = 0 if ow == 0 else (ow - 1) * iw_tile_padded + (iw_tile_padded - wl.wpad) - (wl.wkernel - wl.wstride) * ow
-
-            iw_tile = iw_tile_padded - wpad_before - wpad_after   #input width tile without padding (if any)
-            iw_tile_local = iw_tile + ow_tile_local - ow_tile
-            iw_tile_padded_local = iw_tile_padded + ow_tile_local - ow_tile
+            iw_offset = 0 if ow == 0 else wl.wstride*ow_offset_lst[ow] - wl.wpad
+            iw_tile_padded_local = ow_tile_local*wl.wstride + (1 if wl.wstride == 2 else 2)
+            iw_tile_local = iw_tile_padded_local - wpad_before - wpad_after
 
 
             # *****input load instruction
@@ -514,11 +573,11 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
                                0, # is pad min value
                                inp_single_buffer_sz*inp_parity, VTA_MEM_ID_INP)
 
-            rt.VTADepPush(cmd, kLoadStage, kComputeStage)
+            rt.VTADepPush(cmd, kLoadStage, kComputeStage);
 
 
             # ******compute instructions
-            rt.VTADepPop(cmd, kLoadStage, kComputeStage)
+            rt.VTADepPop(cmd, kLoadStage, kComputeStage);
             if block_count >= buffering:
                 rt.VTADepPop(cmd, kStoreStage, kComputeStage);                        
             rt.VTAPushGEMMOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(partial(gemm_kernel, inp_parity, wgt_parity, ow_tile_local, ih_tile_padded_local, iw_tile_padded_local)), ctypes.POINTER(ctypes.c_int)(), 0)
@@ -527,20 +586,20 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
             rt.VTAPushALUOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(partial(alu_add, inp_parity, wgt_parity, oh_tile_local, ow_tile_local)), ctypes.POINTER(ctypes.c_int)(), 0)
             rt.VTAPushALUOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(partial(alu_min, inp_parity, oh_tile_local, ow_tile_local)), ctypes.POINTER(ctypes.c_int)(), 0)
             rt.VTAPushALUOp(ctypes.byref(ctypes.c_int()), FINIT_FUNC_SIG(partial(alu_max, inp_parity, oh_tile_local, ow_tile_local)), ctypes.POINTER(ctypes.c_int)(), 0)
-            rt.VTADepPush(cmd, kComputeStage, kStoreStage)
+            rt.VTADepPush(cmd, kComputeStage, kStoreStage);
 
             max_block_count = oc_max*oh_max*ow_max
 
             if block_count < max_block_count - buffering:
-                rt.VTADepPush(cmd, kComputeStage, kLoadStage)
+                rt.VTADepPush(cmd, kComputeStage, kLoadStage);
 
             # ***** store instructions
-            rt.VTADepPop(cmd, kComputeStage, kStoreStage)
+            rt.VTADepPop(cmd, kComputeStage, kStoreStage);
             rt.VTAStoreBuffer2D(cmd, out_single_buffer_sz*inp_parity, VTA_MEM_ID_OUT, # src
                                 r_vta_dram, oc*owidth*oheight+ow_offset+owidth*oh_offset, # dest
                                 ow_tile_local, oh_tile_local, owidth) # 25 row, 1 column, 25 stride
             if block_count < max_block_count - buffering:
-                rt.VTADepPush(cmd, kStoreStage, kComputeStage)
+                rt.VTADepPush(cmd, kStoreStage, kComputeStage);
 
     # ***** run program
     rt.VTASynchronize(cmd, 1000000)
@@ -548,7 +607,10 @@ def run_depthwise(wkl, buffering=2, oh_tile_in=None, ow_tile_in=None, out_file=N
 
     if out_file is not None:
         with open(out_file, 'wt') as fp:
-            json.dump( simulator.stats(), fp=fp, indent=2)
+            d = dict(simulator.stats())
+            d['oh_lst'] = oh_lst
+            d['ow_lst'] = ow_lst
+            json.dump( d, fp=fp, indent=2)
 
 
     # ***** print arrays/stats
