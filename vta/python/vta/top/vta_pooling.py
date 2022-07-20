@@ -110,7 +110,7 @@ def pooling_packed(cfg, data, kernel, stride, padding, pool_type,
             scratch = scratch + out_range[0] # subtract back to output range if needed
         return scratch
     # max pool is much simpler, just use the topi code
-    res = topi.nn.pool(data, kernel, stride, padding, pool_type, layout=layout)
+    res = topi.nn.pool(data, kernel, stride, padding, pool_type, ceil_mode=ceil_mode, layout=layout)
     return res
 
 @autotvm.register_topi_schedule("pooling_packed.vta")

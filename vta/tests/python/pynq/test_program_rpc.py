@@ -20,7 +20,7 @@ from tvm import te
 from tvm import rpc
 from vta import get_bitstream_path, download_bitstream, program_fpga, reconfig_runtime
 
-host = os.environ.get("VTA_RPC_HOST", "pynq")
+host = os.environ.get("VTA_RPC_HOST", "192.168.2.99")
 port = int(os.environ.get("VTA_RPC_PORT", "9091"))
 
 

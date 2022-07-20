@@ -46,14 +46,14 @@ env = vta.get_env()
 
 # Pooling workloads
 pool_wklds = [
-    ('pool.max.small', Workload('max', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 0, 0, 2, 2)),
-    ('pool.max.pad',    Workload('max', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 1, 1, 2, 2)),
-    ('pool.max.medium', Workload('max', env.BATCH, env.BLOCK_OUT * 2, 20, 20, 4, 4, 0, 0, 4, 4)),
-    ('pool.max.resnet', Workload('max', env.BATCH, env.BLOCK_OUT, 111, 111, 3, 3, 1, 1, 2, 2)),
-    ('pool.avg.tiny',  Workload('avg', env.BATCH, env.BLOCK_OUT, 1, 1, 1, 1, 0, 0, 1, 1)),
-    ('pool.avg.small', Workload('avg', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 0, 0, 1, 1)),
-    ('pool.avg.medium', Workload('avg', env.BATCH, env.BLOCK_OUT * 4, 3, 3, 3, 3, 0, 0, 1, 1)),
-    ('pool.avg.resnet', Workload('avg', env.BATCH, 512, 7, 7, 7, 7, 0, 0, 1, 1)),
+    # ('pool.max.small', Workload('max', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 0, 0, 2, 2)),
+    # ('pool.max.pad',    Workload('max', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 1, 1, 2, 2)),
+    # ('pool.max.medium', Workload('max', env.BATCH, env.BLOCK_OUT * 2, 20, 20, 4, 4, 0, 0, 4, 4)),
+     ('pool.max.resnet', Workload('max', env.BATCH, 64, 112, 112, 2, 2, 0, 0, 2, 2)),
+    # ('pool.avg.tiny',  Workload('avg', env.BATCH, env.BLOCK_OUT, 1, 1, 1, 1, 0, 0, 1, 1)),
+    # ('pool.avg.small', Workload('avg', env.BATCH, env.BLOCK_OUT, 2, 2, 2, 2, 0, 0, 1, 1)),
+    # ('pool.avg.medium', Workload('avg', env.BATCH, env.BLOCK_OUT * 4, 3, 3, 3, 3, 0, 0, 1, 1)),
+    # ('pool.avg.resnet', Workload('avg', env.BATCH, 512, 7, 7, 7, 7, 0, 0, 1, 1)),
 ]
 
 def run_pool(env, remote, wl, target,
