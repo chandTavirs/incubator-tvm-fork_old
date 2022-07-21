@@ -44,6 +44,9 @@ import os
 import torch
 from torch import nn
 # os.environ["TVM_LOG_DEBUG"] = "1"
+
+max_stop_count=20
+
 schedule_log_files = ['/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_400mf.log',
                       '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.googlenet.log',
                       '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.squeezenet1.1.log',
@@ -58,8 +61,9 @@ schedule_log_files = ['/home/srchand/Desktop/research/VTA_scripts/logs/tuning_lo
                       '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.mnasnet_0_5.log',
                       '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.resnext50_32x4d.log']
 
-sample_re = re.compile(".*write bytes = ([\d]+)\s+read bytes = ([\d]+)\s+ write b/w = ([\d\.]+)\s+read b/w = ([\d\.]+).*")
-overall_re = re.compile(".*total write bytes = ([\d]+) and total read bytes = ([\d]+)")
+sample_re = re.compile("^slot ([\d])\s+write bytes = ([\d]+)\s+read bytes = ([\d]+)\s+ write b/w = ([\d\.]+)\s+read b/w = ([\d\.]+)$")
+overall_re = re.compile("^slot ([\d])\s+total write bytes = ([\d]+) and total read bytes = ([\d]+)$")
+total_samples_re = re.compile("^total samples =\s+([\d]+)$")
 Workload = namedtuple(
     "Conv2DWorkload",
     [
@@ -196,7 +200,7 @@ def my_clip(x, a_min, a_max):
     return x
 
 
-def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json', host_ip ='192.168.2.99'):
+def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json', samples=10, host_ip ='192.168.2.99'):
 
     # Workload assertions
     assert conv_wl.hpad == conv_wl.wpad
@@ -288,21 +292,32 @@ def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json'
     ctx = remote.ext_dev(0)
     m = graph_runtime.create(graph, lib, ctx)
 
-    result_dict = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}}
-
-    #with open("/home/srchand/Desktop/research/TVM/tvm/vta/sri_trial/logs/conv_profiling_results.txt", 'a') as myfile:
-        #myfile.write("\n")
-        #myfile.write(str(wl))
+    result_dict = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, "total_samples": 0}
+    workload_dict = {"height": conv_wl.height, "width": conv_wl.width, "in_filter": conv_wl.in_filter, "out_filter": conv_wl.out_filter,
+                     "hkernel": conv_wl.hkernel, "wkernel": conv_wl.wkernel, "hpad": conv_wl.hpad, "wpad": conv_wl.wpad,
+                     "hstride": conv_wl.hstride, "wstride": conv_wl.wstride, "results": [],
+                     "workload_str": '({},{},{},{},{},{},{},{},{},{})'.format(conv_wl.height, conv_wl.width, conv_wl.in_filter,
+                                                                              conv_wl.out_filter, conv_wl.hkernel, conv_wl.wkernel,
+                                                                              conv_wl.hpad, conv_wl.wpad, conv_wl.hstride, conv_wl.wstride)}
+    # with open("/home/srchand/Desktop/research/TVM/tvm/vta/sri_trial/logs/conv_profiling_results.txt", 'a') as myfile:
+    # myfile.write("\n")
+    # myfile.write(str(wl))
     m.set_input(**params)
     m.set_input(input_name, input_data)
-    for slot in range(6):
-        per_slot_dict = {"samples": [], "overall": {"write_bytes": 0, "read_bytes": 0}}
-        #myfile.write("\nSlot {} ".format(slot))
+    for i in range(samples):
+        total_samples = 0
+        result_dict_temp = {}
+
+        for slot in range(6):
+            result_dict_temp[slot] = {"samples": [], "overall": {"write_bytes": 0, "read_bytes": 0}}
+        # myfile.write("\nSlot {} ".format(slot))
 
         print("starting polling subprocess")
-        proc = subprocess.Popen(["sshpass", "-p", "Srivat95", "ssh", "-t", "xilinx@{}".format(host_ip), "sudo", "python3",
-                             "/home/xilinx/tvm_il/vta/python/vta/poll_apm.py", "--slot", str(slot)], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            ["sshpass", "-p", "Srivat95", "ssh", "-t", "xilinx@{}".format(host_ip), "sudo", "python3",
+             "/home/xilinx/tvm_il/vta/python/vta/poll_apm_simul.py", "--slots", "0,1,2,3,4,5", "--stop_count",
+             str(max_stop_count)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
         count = 0
         for i in range(200000000):
             count += 1
@@ -313,36 +328,37 @@ def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json'
             if not line:
                 break
             line = line.decode("utf-8")
-            match = re.search(sample_re, line)
-            if match:
-                #print("write {} read {} write bw {} read bw {}".format(match.group(1),match.group(2),match.group(3),match.group(4)))
-                if match.group(1) != '0' or match.group(2) != '0':
-                    #result_dict[slot].append([match.group(1),match.group(2),match.group(3),match.group(4)])
-                    per_sample_dict = {"write_bytes": int(match.group(1)), "read_bytes": int(match.group(2)),
-                                       "write_bw": float(match.group(3)), "read_bw": float(match.group(4))}
-                    per_slot_dict["samples"].append(per_sample_dict)
-            else:
-                match = re.search(overall_re,line)
-                if match:
-                    per_slot_dict["overall"]["write_bytes"] = int(match.group(1))
-                    per_slot_dict["overall"]["read_bytes"] = int(match.group(2))
+            match_sample = re.search(sample_re, line)
+            match_overall = re.search(overall_re, line)
+            match_total_samples = re.search(total_samples_re, line)
+            if match_sample:
 
-                    #result_dict[slot].append([match.group(1), match.group(2)])
+                result_dict_temp[int(match_sample.group(1))]["samples"].append(
+                    {"write_bytes": int(match_sample.group(2)), "read_bytes": int(match_sample.group(3)),
+                     "write_bw": float(match_sample.group(4)), "read_bw": float(match_sample.group(5))})
+            elif match_overall:
 
-        result_dict[slot] = per_slot_dict
-        #myfile.write(str(result_dict[slot]))
+                result_dict_temp[int(match_overall.group(1))]["overall"]["write_bytes"] = int(match_overall.group(2))
+                result_dict_temp[int(match_overall.group(1))]["overall"]["read_bytes"] = int(match_overall.group(3))
 
-        print("Ran max pool successfully!!")
-    workload_dict["results"]["({},{},{},{},{},{},{})".format(pool_cfg.hkernel, pool_cfg.wkernel, pool_cfg.hpad,
-                                                             pool_cfg.wpad, pool_cfg.hstride, pool_cfg.wstride,
-                                                             pool_cfg.ceil_mode)] = result_dict
+            elif match_total_samples:
+                total_samples = int(match_total_samples.group(1))
+
+        for slot in result_dict_temp.keys():
+            result_dict_temp[slot]["samples"] = result_dict_temp[slot]["samples"][:total_samples]
+            result_dict[slot] = result_dict_temp[slot]
+            result_dict["total_samples"] = total_samples
+        # myfile.write(str(result_dict[slot]))
+        workload_dict["results"].append(result_dict)
+        print("Ran convolution+relu+maxpool successfully!!")
+
     with open(log_file, 'r+') as myfile:
         file_data = json.load(myfile)
         file_data["workloads"].append(workload_dict)
         myfile.seek(0)
         json.dump(file_data, myfile, indent=4)
 
-def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99'):
+def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99', num_samples=10):
     #device_host = os.environ.get("VTA_RPC_HOST", "192.168.2.99")
 
     device_host = host_ip
@@ -354,7 +370,7 @@ def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99'):
         target = env.target
         if env.TARGET not in ["sim", "tsim", "intelfocl"]:
             assert tvm.runtime.enabled("rpc")
-            program_fpga(remote, bitstream="/home/srchand/Desktop/overlays/vta_il/vta_il_apm.bit")
+            program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_IL/tvm/vta/sri_scripts/bitstreams/vta_il_apm.bit")
             reconfig_runtime(remote)
     elif device == "arm_cpu":
         target = env.target_vta_cpu
@@ -362,19 +378,21 @@ def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99'):
         for _, wl in resnet_wkls:
             print(wl)
             for _, pool_cfg in maxPoolConfigs:
-                run_maxpool(env, remote, wl, pool_cfg, target, log_file=log_file, host_ip=host_ip)
+                run_maxpool(env, remote, wl, pool_cfg, target, log_file=log_file, host_ip=host_ip, samples=num_samples)
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='AXI Performance Monitor Convolution + Maxpool Benchmark')
-    parser.add_argument('--log_file', type=str, default="logs/apm_logs/log.json",
+    parser.add_argument('--log_file', type=str, default="profiling_results/log.json",
                         help='output log file path')
     parser.add_argument('--host_ip', type=str, default='192.168.2.99',
                         help='pynq board IP')
+    parser.add_argument('--samples', type=int, default=10,
+                        help='number of times to run convolutions')
 
     args = parser.parse_args()
     #test_conv2d(device="arm_cpu")
-    test_maxpool(device="vta", log_file = args.log_file, host_ip = args.host_ip)
+    test_maxpool(device="vta", log_file = args.log_file, host_ip = args.host_ip, num_samples=args.samples)
 
 
