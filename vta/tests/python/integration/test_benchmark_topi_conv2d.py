@@ -276,7 +276,8 @@ def test_conv2d(device):
             target = env.target
             if env.TARGET not in ["sim", "tsim"]:
                 assert tvm.runtime.enabled("rpc")
-                program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/python/vta/vta.bit")
+                #program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/python/vta/vta.bit")
+                program_fpga(remote, None)
                 reconfig_runtime(remote)
         elif device == "arm_cpu":
             target = env.target_vta_cpu
@@ -288,5 +289,5 @@ def test_conv2d(device):
     vta.testing.run(_run)
 
 if __name__ == "__main__":
-    #test_conv2d(device="arm_cpu")
+    test_conv2d(device="arm_cpu")
     test_conv2d(device="vta")
