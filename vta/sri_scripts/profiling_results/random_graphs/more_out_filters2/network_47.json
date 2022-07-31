@@ -1,0 +1,2078 @@
+{
+    "network_id": 47,
+    "network_nodes": "[Conv2DWorkload(batch=1, height=28, width=28, in_filter=64, out_filter=64, hkernel=1, wkernel=1, hpad=0, wpad=0, hstride=1, wstride=1), ReluConfig(num_filters=64), Conv2DWorkload(batch=1, height=28, width=28, in_filter=64, out_filter=64, hkernel=1, wkernel=1, hpad=0, wpad=0, hstride=1, wstride=1), ReluConfig(num_filters=64), Conv2DWorkload(batch=1, height=28, width=28, in_filter=64, out_filter=64, hkernel=1, wkernel=1, hpad=0, wpad=0, hstride=1, wstride=1), ReluConfig(num_filters=64), Conv2DWorkload(batch=1, height=28, width=28, in_filter=64, out_filter=64, hkernel=1, wkernel=1, hpad=0, wpad=0, hstride=1, wstride=1), ReluConfig(num_filters=64), Conv2DWorkload(batch=1, height=28, width=28, in_filter=64, out_filter=160, hkernel=1, wkernel=1, hpad=0, wpad=0, hstride=1, wstride=1), BatchNorm2DConfig(num_filters=160), ReluConfig(num_filters=160), MaxPool2DConfig(hkernel=2, wkernel=2, hpad=0, wpad=0, hstride=2, wstride=2, ceil_mode=1), Conv2DWorkload(batch=1, height=14, width=14, in_filter=160, out_filter=320, hkernel=3, wkernel=3, hpad=1, wpad=1, hstride=1, wstride=1), BatchNorm2DConfig(num_filters=320), ReluConfig(num_filters=320)]",
+    "layer_sequence": [
+        "conv",
+        "relu",
+        "conv",
+        "relu",
+        "conv",
+        "relu",
+        "conv",
+        "relu",
+        "conv",
+        "bn",
+        "relu",
+        "maxpool",
+        "conv",
+        "bn",
+        "relu"
+    ],
+    "results": [
+        {
+            "0": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 30928,
+                        "write_bw": 0.0,
+                        "read_bw": 26.713884690131728
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 107472,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 77.21854590132132
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 138144,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 106.1674313513015
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 110992,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 86.49962981724661
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 35968,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 25.02887840452034
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 273840,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 179.96372335112116
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 311600,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 205.16332080142746
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 191168,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 145.12108099901315
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 103232,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 73.14259802462837
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 1518256
+                }
+            },
+            "1": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.2852515655366015
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.0691268079236091
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2976,
+                        "write_bw": 0.0,
+                        "read_bw": 2.2871371590620893
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2704,
+                        "write_bw": 0.0,
+                        "read_bw": 2.1073140318746835
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1056,
+                        "write_bw": 0.0,
+                        "read_bw": 0.6939880655082673
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2592,
+                        "write_bw": 0.0,
+                        "read_bw": 1.7066217186049422
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 12304
+                }
+            },
+            "2": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 29312,
+                        "write_bw": 0.0,
+                        "read_bw": 25.31807385014036
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 103808,
+                        "write_bw": 0.0,
+                        "read_bw": 74.58596483664921
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 133120,
+                        "write_bw": 0.0,
+                        "read_bw": 102.30635034084185
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 105984,
+                        "write_bw": 0.0,
+                        "read_bw": 82.59673459844912
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 35328,
+                        "write_bw": 0.0,
+                        "read_bw": 24.583524696254855
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 78208,
+                        "write_bw": 0.0,
+                        "read_bw": 51.493623213215784
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 190528,
+                        "write_bw": 0.0,
+                        "read_bw": 144.63523874591968
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 102592,
+                        "write_bw": 0.0,
+                        "read_bw": 72.68914112428969
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 993792
+                }
+            },
+            "3": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.11055927445476141
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09196789745579434
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 256,
+                        "write_bw": 0.0,
+                        "read_bw": 0.19674298142469585
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09975451038460038
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 16,
+                        "write_bw": 0.0,
+                        "read_bw": 0.010514970689519202
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1808,
+                        "write_bw": 0.0,
+                        "read_bw": 1.1904213222367805
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 2464
+                }
+            },
+            "4": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2048,
+                        "write_bw": 0.0,
+                        "read_bw": 1.4714863592927094
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1792,
+                        "write_bw": 0.0,
+                        "read_bw": 1.3772008699728708
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2176,
+                        "write_bw": 0.0,
+                        "read_bw": 1.6958266765382066
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4453537082654865
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 272768,
+                        "write_bw": 0.0,
+                        "read_bw": 179.25922031492337
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 228992,
+                        "write_bw": 0.0,
+                        "read_bw": 150.77265454736994
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.48584225309344875
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4534569003386756
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 509696
+                }
+            },
+            "5": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 0,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 0,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 0,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 0,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 0
+                }
+            },
+            "total_samples": 10
+        },
+        {
+            "0": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 30928,
+                        "write_bw": 0.0,
+                        "read_bw": 26.713884690131728
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 107472,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 77.21854590132132
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 138144,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 106.1674313513015
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 110992,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 86.49962981724661
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 35968,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 25.02887840452034
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 273840,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 179.96372335112116
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 311600,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 205.16332080142746
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 191168,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 145.12108099901315
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 103232,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 73.14259802462837
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 1518256
+                }
+            },
+            "1": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.2852515655366015
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.0691268079236091
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2976,
+                        "write_bw": 0.0,
+                        "read_bw": 2.2871371590620893
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2704,
+                        "write_bw": 0.0,
+                        "read_bw": 2.1073140318746835
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1056,
+                        "write_bw": 0.0,
+                        "read_bw": 0.6939880655082673
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2592,
+                        "write_bw": 0.0,
+                        "read_bw": 1.7066217186049422
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 12304
+                }
+            },
+            "2": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 29312,
+                        "write_bw": 0.0,
+                        "read_bw": 25.31807385014036
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 103808,
+                        "write_bw": 0.0,
+                        "read_bw": 74.58596483664921
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 133120,
+                        "write_bw": 0.0,
+                        "read_bw": 102.30635034084185
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 105984,
+                        "write_bw": 0.0,
+                        "read_bw": 82.59673459844912
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 35328,
+                        "write_bw": 0.0,
+                        "read_bw": 24.583524696254855
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 78208,
+                        "write_bw": 0.0,
+                        "read_bw": 51.493623213215784
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 190528,
+                        "write_bw": 0.0,
+                        "read_bw": 144.63523874591968
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 102592,
+                        "write_bw": 0.0,
+                        "read_bw": 72.68914112428969
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 993792
+                }
+            },
+            "3": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.11055927445476141
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09196789745579434
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 256,
+                        "write_bw": 0.0,
+                        "read_bw": 0.19674298142469585
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09975451038460038
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 16,
+                        "write_bw": 0.0,
+                        "read_bw": 0.010514970689519202
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1808,
+                        "write_bw": 0.0,
+                        "read_bw": 1.1904213222367805
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 2464
+                }
+            },
+            "4": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2048,
+                        "write_bw": 0.0,
+                        "read_bw": 1.4714863592927094
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1792,
+                        "write_bw": 0.0,
+                        "read_bw": 1.3772008699728708
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2176,
+                        "write_bw": 0.0,
+                        "read_bw": 1.6958266765382066
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4453537082654865
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 272768,
+                        "write_bw": 0.0,
+                        "read_bw": 179.25922031492337
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 228992,
+                        "write_bw": 0.0,
+                        "read_bw": 150.77265454736994
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.48584225309344875
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4534569003386756
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 509696
+                }
+            },
+            "5": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 0,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 0,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 0,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 0,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 0
+                }
+            },
+            "total_samples": 10
+        },
+        {
+            "0": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 30928,
+                        "write_bw": 0.0,
+                        "read_bw": 26.713884690131728
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 107472,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 77.21854590132132
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 138144,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 106.1674313513015
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 110992,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 86.49962981724661
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 35968,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 25.02887840452034
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 273840,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 179.96372335112116
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 311600,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 205.16332080142746
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 191168,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 145.12108099901315
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 103232,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 73.14259802462837
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 1518256
+                }
+            },
+            "1": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.2852515655366015
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.0691268079236091
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2976,
+                        "write_bw": 0.0,
+                        "read_bw": 2.2871371590620893
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2704,
+                        "write_bw": 0.0,
+                        "read_bw": 2.1073140318746835
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1056,
+                        "write_bw": 0.0,
+                        "read_bw": 0.6939880655082673
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2592,
+                        "write_bw": 0.0,
+                        "read_bw": 1.7066217186049422
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 12304
+                }
+            },
+            "2": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 29312,
+                        "write_bw": 0.0,
+                        "read_bw": 25.31807385014036
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 103808,
+                        "write_bw": 0.0,
+                        "read_bw": 74.58596483664921
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 133120,
+                        "write_bw": 0.0,
+                        "read_bw": 102.30635034084185
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 105984,
+                        "write_bw": 0.0,
+                        "read_bw": 82.59673459844912
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 35328,
+                        "write_bw": 0.0,
+                        "read_bw": 24.583524696254855
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 78208,
+                        "write_bw": 0.0,
+                        "read_bw": 51.493623213215784
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 190528,
+                        "write_bw": 0.0,
+                        "read_bw": 144.63523874591968
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 102592,
+                        "write_bw": 0.0,
+                        "read_bw": 72.68914112428969
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 993792
+                }
+            },
+            "3": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.11055927445476141
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09196789745579434
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 256,
+                        "write_bw": 0.0,
+                        "read_bw": 0.19674298142469585
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09975451038460038
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 16,
+                        "write_bw": 0.0,
+                        "read_bw": 0.010514970689519202
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1808,
+                        "write_bw": 0.0,
+                        "read_bw": 1.1904213222367805
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 2464
+                }
+            },
+            "4": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2048,
+                        "write_bw": 0.0,
+                        "read_bw": 1.4714863592927094
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1792,
+                        "write_bw": 0.0,
+                        "read_bw": 1.3772008699728708
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2176,
+                        "write_bw": 0.0,
+                        "read_bw": 1.6958266765382066
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4453537082654865
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 272768,
+                        "write_bw": 0.0,
+                        "read_bw": 179.25922031492337
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 228992,
+                        "write_bw": 0.0,
+                        "read_bw": 150.77265454736994
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.48584225309344875
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4534569003386756
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 509696
+                }
+            },
+            "5": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 0,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 0,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 0,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 0,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 0
+                }
+            },
+            "total_samples": 10
+        },
+        {
+            "0": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 30928,
+                        "write_bw": 0.0,
+                        "read_bw": 26.713884690131728
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 107472,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 77.21854590132132
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 138144,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 106.1674313513015
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 110992,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 86.49962981724661
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 35968,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 25.02887840452034
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 273840,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 179.96372335112116
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 311600,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 205.16332080142746
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 191168,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 145.12108099901315
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 103232,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 73.14259802462837
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 1518256
+                }
+            },
+            "1": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.2852515655366015
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.0691268079236091
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2976,
+                        "write_bw": 0.0,
+                        "read_bw": 2.2871371590620893
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2704,
+                        "write_bw": 0.0,
+                        "read_bw": 2.1073140318746835
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1056,
+                        "write_bw": 0.0,
+                        "read_bw": 0.6939880655082673
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2592,
+                        "write_bw": 0.0,
+                        "read_bw": 1.7066217186049422
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 12304
+                }
+            },
+            "2": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 29312,
+                        "write_bw": 0.0,
+                        "read_bw": 25.31807385014036
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 103808,
+                        "write_bw": 0.0,
+                        "read_bw": 74.58596483664921
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 133120,
+                        "write_bw": 0.0,
+                        "read_bw": 102.30635034084185
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 105984,
+                        "write_bw": 0.0,
+                        "read_bw": 82.59673459844912
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 35328,
+                        "write_bw": 0.0,
+                        "read_bw": 24.583524696254855
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 78208,
+                        "write_bw": 0.0,
+                        "read_bw": 51.493623213215784
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 190528,
+                        "write_bw": 0.0,
+                        "read_bw": 144.63523874591968
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 102592,
+                        "write_bw": 0.0,
+                        "read_bw": 72.68914112428969
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 993792
+                }
+            },
+            "3": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.11055927445476141
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09196789745579434
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 256,
+                        "write_bw": 0.0,
+                        "read_bw": 0.19674298142469585
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09975451038460038
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 16,
+                        "write_bw": 0.0,
+                        "read_bw": 0.010514970689519202
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1808,
+                        "write_bw": 0.0,
+                        "read_bw": 1.1904213222367805
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 2464
+                }
+            },
+            "4": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2048,
+                        "write_bw": 0.0,
+                        "read_bw": 1.4714863592927094
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1792,
+                        "write_bw": 0.0,
+                        "read_bw": 1.3772008699728708
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2176,
+                        "write_bw": 0.0,
+                        "read_bw": 1.6958266765382066
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4453537082654865
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 272768,
+                        "write_bw": 0.0,
+                        "read_bw": 179.25922031492337
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 228992,
+                        "write_bw": 0.0,
+                        "read_bw": 150.77265454736994
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.48584225309344875
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4534569003386756
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 509696
+                }
+            },
+            "5": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 0,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 0,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 0,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 0,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 0
+                }
+            },
+            "total_samples": 10
+        },
+        {
+            "0": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 30928,
+                        "write_bw": 0.0,
+                        "read_bw": 26.713884690131728
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 107472,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 77.21854590132132
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 138144,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 106.1674313513015
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 110992,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 86.49962981724661
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 35968,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 25.02887840452034
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 273840,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 179.96372335112116
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 311600,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 205.16332080142746
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 191168,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 145.12108099901315
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 103232,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 73.14259802462837
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 1518256
+                }
+            },
+            "1": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.2852515655366015
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1488,
+                        "write_bw": 0.0,
+                        "read_bw": 1.0691268079236091
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2976,
+                        "write_bw": 0.0,
+                        "read_bw": 2.2871371590620893
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2704,
+                        "write_bw": 0.0,
+                        "read_bw": 2.1073140318746835
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1056,
+                        "write_bw": 0.0,
+                        "read_bw": 0.6939880655082673
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2592,
+                        "write_bw": 0.0,
+                        "read_bw": 1.7066217186049422
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 12304
+                }
+            },
+            "2": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 29312,
+                        "write_bw": 0.0,
+                        "read_bw": 25.31807385014036
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 103808,
+                        "write_bw": 0.0,
+                        "read_bw": 74.58596483664921
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 133120,
+                        "write_bw": 0.0,
+                        "read_bw": 102.30635034084185
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 105984,
+                        "write_bw": 0.0,
+                        "read_bw": 82.59673459844912
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 35328,
+                        "write_bw": 0.0,
+                        "read_bw": 24.583524696254855
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 78208,
+                        "write_bw": 0.0,
+                        "read_bw": 51.493623213215784
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 214912,
+                        "write_bw": 0.0,
+                        "read_bw": 160.41081984833104
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 190528,
+                        "write_bw": 0.0,
+                        "read_bw": 144.63523874591968
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 102592,
+                        "write_bw": 0.0,
+                        "read_bw": 72.68914112428969
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 993792
+                }
+            },
+            "3": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.11055927445476141
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09196789745579434
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 256,
+                        "write_bw": 0.0,
+                        "read_bw": 0.19674298142469585
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 128,
+                        "write_bw": 0.0,
+                        "read_bw": 0.09975451038460038
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 16,
+                        "write_bw": 0.0,
+                        "read_bw": 0.010514970689519202
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1808,
+                        "write_bw": 0.0,
+                        "read_bw": 1.1904213222367805
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 2464
+                }
+            },
+            "4": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2048,
+                        "write_bw": 0.0,
+                        "read_bw": 1.4714863592927094
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 1792,
+                        "write_bw": 0.0,
+                        "read_bw": 1.3772008699728708
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 2176,
+                        "write_bw": 0.0,
+                        "read_bw": 1.6958266765382066
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4453537082654865
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 272768,
+                        "write_bw": 0.0,
+                        "read_bw": 179.25922031492337
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 228992,
+                        "write_bw": 0.0,
+                        "read_bw": 150.77265454736994
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.48584225309344875
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 640,
+                        "write_bw": 0.0,
+                        "read_bw": 0.4534569003386756
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 0,
+                    "read_bytes": 509696
+                }
+            },
+            "5": {
+                "samples": [
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 100352,
+                        "read_bytes": 0,
+                        "write_bw": 72.10283160534276,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 75264,
+                        "read_bytes": 0,
+                        "write_bw": 57.84243653886058,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 103488,
+                        "read_bytes": 0,
+                        "write_bw": 80.65152164594942,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 47040,
+                        "read_bytes": 0,
+                        "write_bw": 32.73349755751326,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.304671275728818,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 15680,
+                        "read_bytes": 0,
+                        "write_bw": 10.32400792736323,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 0,
+                        "read_bytes": 0,
+                        "write_bw": 0.0,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 23.80627040157899,
+                        "read_bw": 0.0
+                    },
+                    {
+                        "write_bytes": 31360,
+                        "read_bytes": 0,
+                        "write_bw": 22.219388116595105,
+                        "read_bw": 0.0
+                    }
+                ],
+                "overall": {
+                    "write_bytes": 420224,
+                    "read_bytes": 0
+                }
+            },
+            "total_samples": 10
+        }
+    ]
+}
