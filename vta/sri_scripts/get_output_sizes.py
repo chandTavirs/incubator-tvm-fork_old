@@ -69,9 +69,9 @@ def calc_sizes(network):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Network output sizes calculator')
-    parser.add_argument("--input_log_file", type=str, default='profiling_results/random_graphs/more_out_filters2/networks_profiled.log',
+    parser.add_argument("--input_log_file", type=str, default='profiling_results/random_graphs/graphs_500/networks_profiled.log',
                         help="path to file containing profiled network structures")
-    parser.add_argument("--output_log_file", type=str, default='profiling_results/random_graphs/more_out_filters2/networks_profiled_output_sizes.log',
+    parser.add_argument("--output_log_file", type=str, default='profiling_results/random_graphs/graphs_500/networks_profiled_output_sizes.log',
                         help="path to file to store output sizes of networks")
 
     args = parser.parse_args()
