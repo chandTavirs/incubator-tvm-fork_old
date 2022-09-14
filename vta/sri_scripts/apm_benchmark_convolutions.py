@@ -43,6 +43,7 @@ import re
 import os
 import torch
 from torch import nn
+from Wkls import ALL_TUNED_WKLS
 
 max_stop_count = 20
 schedule_log_files = ['/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_400mf.log',
@@ -337,7 +338,7 @@ def test_conv2d(device, log_file ="profiling_results/log.json", host_ip ='192.16
     elif device == "arm_cpu":
         target = env.target_vta_cpu
     with autotvm.tophub.context(target):  # load pre-tuned schedule parameters
-        for _, wl in resnet_wkls:
+        for _, wl in ALL_TUNED_WKLS:
             print(wl)
             run_conv2d(env, remote, wl, target, log_file=log_file, host_ip=host_ip, samples=num_samples)
 

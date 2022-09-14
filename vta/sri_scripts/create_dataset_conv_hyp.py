@@ -74,6 +74,8 @@ def create_dataset_file(file_data, file_name, output_dataset_dir):
                                     str(data_read_accum), str(ofm_dim_label), str(ifm_dim_label), str(kernel_dim_label),
                                     str(stride_label), str(pad_label)])+'\n')
 
+            #myfile.writelines("{.3f}\t{.3f}\t{.3f}\t{.3f}\t{.3f}\t{}\t{}\t{}\t{}\t{}")
+
     # df = pd.DataFrame.from_dict(data_list)
     #
     # np.savetxt(os.path.join(output_dataset_dir, file_name.split('.')[0].split('/')[1] + '.txt'), df.values)
