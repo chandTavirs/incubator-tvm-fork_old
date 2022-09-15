@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Convolution hyperparameters estimation dataset preparation script')
     parser.add_argument('--log_file', type=str, default="profiling_results/conv2d_50_tuned_wkls_5_samples.json",
                         help='apm log files dir')
-    parser.add_argument('--output_dataset_dir', type=str, default="dataset/conv_hyp",
+    parser.add_argument('--output_dataset_dir', type=str, default="dataset/trial",
                         help='output dataset directory')
 
     args = parser.parse_args()
