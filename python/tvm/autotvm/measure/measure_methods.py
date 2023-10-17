@@ -534,7 +534,7 @@ def run_through_rpc(
             # pylint: disable=import-outside-toplevel
             from vta import program_fpga, reconfig_runtime
 
-            program_fpga(remote, None)
+            # program_fpga(remote, None)
             reconfig_runtime(remote)
         remote.upload(build_result.filename)
         func = remote.load_module(os.path.split(build_result.filename)[1])
