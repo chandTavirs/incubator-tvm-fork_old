@@ -27,7 +27,7 @@ import os
 
 from .bitstream import get_bitstream_path, download_bitstream
 from .environment import get_env, Environment
-from .rpc_client import reconfig_runtime, program_fpga, trace_init, trace_done
+from .rpc_client import reconfig_runtime, program_fpga, trace_init, trace_done, start_power_monitor, stop_power_monitor, start_ro_monitor, stop_ro_monitor, reset_ro_monitor
 
 # Avoid dependencies when running as an RPC server
 if 'IS_RPC_SERVER' not in os.environ:

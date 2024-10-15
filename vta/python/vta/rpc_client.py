@@ -92,3 +92,24 @@ def trace_done(remote):
         del builtins.trace_mgr
     except Exception as exception:
         logging.warning("Trace manager: %s", str(exception))
+
+
+def start_power_monitor(remote, interval=1e-6):
+    fstart_pm = remote.get_function("tvm.contrib.vta.start_power_monitor")
+    fstart_pm(interval)
+
+def stop_power_monitor(remote, file_name='/home/xilinx/power_expts/test.csv'):
+    fstop_pm = remote.get_function("tvm.contrib.vta.stop_power_monitor")
+    fstop_pm(file_name)
+
+def start_ro_monitor(remote):
+    fstart_pm = remote.get_function("tvm.contrib.vta.start_ro_monitor")
+    fstart_pm()
+
+def stop_ro_monitor(remote, file_number):
+    fstop_pm = remote.get_function("tvm.contrib.vta.stop_ro_monitor")
+    fstop_pm(file_number)
+
+def reset_ro_monitor(remote):
+    fstart_pm = remote.get_function("tvm.contrib.vta.reset_ro_monitor")
+    fstart_pm()

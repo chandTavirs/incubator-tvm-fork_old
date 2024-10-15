@@ -40,6 +40,9 @@
 #include <memory>
 #include <vector>
 
+//import memory_integrity_tree.h
+#include <memory_integrity_tree.h>
+
 #include "trace_mgr.h"
 
 #ifdef printf

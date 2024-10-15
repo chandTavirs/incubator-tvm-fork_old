@@ -63,7 +63,7 @@ env = vta.get_env()
 # ResNet18 workloads
 resnet_wkls = [
     # Workloads of resnet18 on imagenet
-    # ('resnet-18.C1',  Workload(env.BATCH, 224, 224, 3,   64,  7, 7, 3, 3, 2, 2)),
+    ('resnet-18.C1',  Workload(env.BATCH, 224, 224, 3,   64,  7, 7, 3, 3, 2, 2)),
     ("resnet-18.C2", Workload(env.BATCH, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1)),
     ("resnet-18.C3", Workload(env.BATCH, 56, 56, 64, 128, 3, 3, 1, 1, 2, 2)),
     ("resnet-18.C4", Workload(env.BATCH, 56, 56, 64, 128, 1, 1, 0, 0, 2, 2)),
@@ -277,7 +277,8 @@ def test_conv2d(device):
             if env.TARGET not in ["sim", "tsim"]:
                 assert tvm.runtime.enabled("rpc")
                 #program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/python/vta/vta.bit")
-                program_fpga(remote, None)
+                #program_fpga(remote, None)
+                #program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/sri_scripts/bitstreams/vta_zcu104_wrapper.bit")
                 reconfig_runtime(remote)
         elif device == "arm_cpu":
             target = env.target_vta_cpu
