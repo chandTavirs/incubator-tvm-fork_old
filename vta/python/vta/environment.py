@@ -246,7 +246,7 @@ class Environment(object):
         """The target host"""
         if self.TARGET in ["pynq", "de10nano"]:
             return "llvm -mtriple=armv7-none-linux-gnueabihf"
-        if self.TARGET == "ultra96":
+        if self.TARGET == "ultra96" or "zcu104":
             return "llvm -mtriple=aarch64-linux-gnu"
         if self.TARGET in ["sim", "tsim", "bsim"]:
             return "llvm"
@@ -337,20 +337,30 @@ def _init_env():
     jconfig = f'config/{os.environ.get("VTA_CONFIG")}.json'
     config_path = os.path.join(get_vta_hw_path(), jconfig)
     if not os.path.exists(config_path):
-        config_path = os.path.join(get_vta_hw_path(), "config/vta_config.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_alt.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_2x16x16.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/pynq_config.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_1x32x32.json")
+
+        config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_1x8x32.json")
         if not os.path.exists(config_path):
             raise RuntimeError("Cannot find config in %s" % str(config_path))
     with open(config_path) as fp:
         cfg = json.load(fp)
     # If target is present use and override config.
-    jtarget = f'config/{os.environ.get("VTA_TARGET")}_target.json'
+    #jtarget = f'config/{os.environ.get("VTA_TARGET")}_target.json'
+    jtarget = f'config/zcu104_target.json'
+    # jtarget = f'config/pynq_target.json'
     target_path = os.path.join(get_vta_hw_path(), jtarget)
     if not os.path.exists(target_path):
         target_path = os.path.join(get_vta_hw_path(), "config/vta_target.json")
     if os.path.exists(target_path):
         with open(target_path) as fp:
             tgt = json.load(fp)
+            # print(tgt)
             cfg.update(tgt)
+            # print(cfg)
     if 'TARGET' not in cfg or 'HW_VER' not in cfg:
         raise RuntimeError("Cannot find target in %s" % str(target_path))
 

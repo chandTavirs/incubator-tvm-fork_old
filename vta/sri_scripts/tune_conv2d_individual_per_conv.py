@@ -19,7 +19,7 @@ from torch import nn
 import torch
 from vta.top import graph_pack
 from Wkls import ALL_TUNED_WKLS as pynq_wkls
-
+from Wkls import MOBILENET_V2 as mnet_wkls
 Workload = namedtuple(
     "Conv2DWorkload",
     [
@@ -153,6 +153,7 @@ def construct_tasks(env, wl, task_name='conv2d_packed.vta'):
     relay_prog = graph_pack(
         mod["main"],
         env.BATCH,
+        env.BLOCK_IN,
         env.BLOCK_OUT,
         env.WGT_WIDTH,
         start_name="cast",
@@ -175,7 +176,7 @@ def construct_tasks(env, wl, task_name='conv2d_packed.vta'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='AXI Performance Monitor Convolution Benchmark')
-    parser.add_argument('--model', type=str, default="test_model",
+    parser.add_argument('--model', type=str, default="mobilenet_v2",
                         help='output log file path')
 
     args = parser.parse_args()
@@ -185,11 +186,18 @@ if __name__ == "__main__":
     tracker_port = int(os.environ.get("TVM_TRACKER_PORT", 9190))
     target = env.target
     register_vta_tuning_tasks()
-    for wkl_name, wl in pynq_wkls:
+    if args.model == "mobilenet_v2":
+        wkls_to_tune = mnet_wkls
+    elif args.model == "all_wkls":
+        wkls_to_tune = pynq_wkls
+    else:
+        wkls_to_tune = pynq_wkls
+
+    for wkl_name, wl in wkls_to_tune:
         #tasks.append(construct_tasks(env, wl))
 
         device = "vta"
-        log_file = "logs/tuning_logs/%s.%s.%s.log" % (device, args.model, wkl_name)
+        log_file = "logs/tuning_logs/vta_2x16x16/%s.%s.%s.log" % (device, args.model, wkl_name)
         tuning_option = {
             "log_filename": log_file,
             "tuner": "random",

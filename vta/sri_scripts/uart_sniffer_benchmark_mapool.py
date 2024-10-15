@@ -24,8 +24,9 @@ from tvm.contrib import graph_runtime
 import pytest
 import numpy as np
 from collections import namedtuple
-from vta.top import graph_pack
 
+from vta.top import graph_pack
+import serial
 import tvm
 from tvm import te
 from tvm import relay
@@ -43,151 +44,40 @@ import re
 import os
 import torch
 from torch import nn
+from Wkls import ALL_TUNED_WKLS as pynq_wkls
+from Wkls import MAX_POOL_WKLS as mp_wkls
+import glob
+import pandas as pd
+import multiprocessing
+zero_line = "slot0::0000000000slot1::0000000000slot2::0000000000slot3::0000000000slot4::0000000000"
 # os.environ["TVM_LOG_DEBUG"] = "1"
-
+schedule_log_files = glob.glob(r'logs/tuning_logs/*.log')
 max_stop_count=20
 
-schedule_log_files = ['/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_400mf.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.googlenet.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.squeezenet1.1.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.mobilenet_v2.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_800mf.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.inceptionv3.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.vgg11.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.wide_resnet50_2.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_1_6gf.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.regnet_x_3_2gf.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.vgg16.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.mnasnet_0_5.log',
-                      '/home/srchand/Desktop/research/VTA_scripts/logs/tuning_logs/vta.resnext50_32x4d.log']
-
-sample_re = re.compile("^slot ([\d])\s+write bytes = ([\d]+)\s+read bytes = ([\d]+)\s+ write b/w = ([\d\.]+)\s+read b/w = ([\d\.]+)$")
-overall_re = re.compile("^slot ([\d])\s+total write bytes = ([\d]+) and total read bytes = ([\d]+)$")
-total_samples_re = re.compile("^total samples =\s+([\d]+)$")
-Workload = namedtuple(
-    "Conv2DWorkload",
-    [
-        "batch",
-        "height",
-        "width",
-        "in_filter",
-        "out_filter",
-        "hkernel",
-        "wkernel",
-        "hpad",
-        "wpad",
-        "hstride",
-        "wstride",
-    ],
-)
 
 # Get batch info from env
 env = vta.get_env()
 
-# ResNet18 workloads
-# resnet_wkls = [
-#     # Workloads of resnet18 on imagenet
-#     #('resnet-18.C1',  Workload(env.BATCH, 224, 224, 3,   64,  7, 7, 3, 3, 2, 2)),
-#     ("resnet-18.C2", Workload(env.BATCH, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1)),
-#     ("resnet-18.C3", Workload(env.BATCH, 56, 56, 64, 128, 3, 3, 1, 1, 2, 2)),
-#     ("resnet-18.C4", Workload(env.BATCH, 56, 56, 64, 128, 1, 1, 0, 0, 2, 2)),
-#     ("resnet-18.C5", Workload(env.BATCH, 28, 28, 128, 128, 3, 3, 1, 1, 1, 1)),
-#     ("resnet-18.C6", Workload(env.BATCH, 28, 28, 128, 256, 3, 3, 1, 1, 2, 2)),
-#     ("resnet-18.C7", Workload(env.BATCH, 28, 28, 128, 256, 1, 1, 0, 0, 2, 2)),
-#     ("resnet-18.C8", Workload(env.BATCH, 14, 14, 256, 256, 3, 3, 1, 1, 1, 1)),
-#     ("resnet-18.C9", Workload(env.BATCH, 14, 14, 256, 512, 3, 3, 1, 1, 2, 2)),
-#     ("resnet-18.C10", Workload(env.BATCH, 14, 14, 256, 512, 1, 1, 0, 0, 2, 2)),
-#     ("resnet-18.C11", Workload(env.BATCH, 7, 7, 512, 512, 3, 3, 1, 1, 1, 1)),
-# ]
+empty_wkls = []
 
-#resnet_wkls = [
-    # Workloads of resnet18 on imagenet
-    #('resnet-18.C1',  Workload(env.BATCH, 224, 224, 3,   64,  7, 7, 3, 3, 2, 2)),
-    #("resnet-18.C2", Workload(env.BATCH, 112, 112, 64, 128, 3, 3, 1, 1, 1, 1)),
-    # ("resnet-18.C2", Workload(env.BATCH, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1)),
-    # ("resnet-18.C2", Workload(env.BATCH, 28, 28, 64, 64, 3, 3, 1, 1, 1, 1)),
-    # ("resnet-18.C2", Workload(env.BATCH, 14, 14, 64, 64, 3, 3, 1, 1, 1, 1)),
-    # ("resnet-18.C11", Workload(env.BATCH, 7, 7, 64, 64, 3, 3, 1, 1, 1, 1)),
-#]
-
-resnet_wkls = [
-    ("workload_0", Workload(env.BATCH, 208, 208, 16, 32, 3, 3, 1, 1, 1, 1)),
-    ("workload_1", Workload(env.BATCH, 104, 104, 32, 64, 3, 3, 1, 1, 1, 1)),
-    ("workload_2", Workload(env.BATCH, 26, 26, 128, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_3", Workload(env.BATCH, 13, 13, 256, 512, 3, 3, 1, 1, 1, 1)),
-    ("workload_4", Workload(env.BATCH, 13, 13, 512, 1024, 3, 3, 1, 1, 1, 1)),
-    ("workload_5", Workload(env.BATCH, 52, 52, 64, 128, 3, 3, 1, 1, 1, 1)),
-    ("workload_6", Workload(env.BATCH, 13, 13, 256, 128, 1, 1, 0, 0, 1, 1)),
-    ("workload_7", Workload(env.BATCH, 13, 13, 1024, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_8", Workload(env.BATCH, 26, 26, 384, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_9", Workload(env.BATCH, 13, 13, 512, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_10", Workload(env.BATCH, 26, 26, 256, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_11", Workload(env.BATCH, 14, 14, 256, 512, 3, 3, 1, 1, 2, 2)),
-    ("workload_12", Workload(env.BATCH, 7, 7, 512, 512, 3, 3, 1, 1, 1, 1)),
-    ("workload_13", Workload(env.BATCH, 28, 28, 128, 256, 3, 3, 1, 1, 2, 2)),
-    ("workload_14", Workload(env.BATCH, 14, 14, 256, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_15", Workload(env.BATCH, 56, 56, 64, 128, 3, 3, 1, 1, 2, 2)),
-    ("workload_16", Workload(env.BATCH, 28, 28, 128, 128, 3, 3, 1, 1, 1, 1)),
-    ("workload_17", Workload(env.BATCH, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1)),
-    ("workload_18", Workload(env.BATCH, 56, 56, 64, 128, 1, 1, 0, 0, 2, 2)),
-    ("workload_19", Workload(env.BATCH, 28, 28, 128, 256, 1, 1, 0, 0, 2, 2)),
-    ("workload_20", Workload(env.BATCH, 14, 14, 256, 512, 1, 1, 0, 0, 2, 2)),
-    ("workload_21", Workload(env.BATCH, 14, 14, 1024, 2048, 1, 1, 0, 0, 2, 2)),
-    ("workload_22", Workload(env.BATCH, 28, 28, 512, 1024, 1, 1, 0, 0, 2, 2)),
-    ("workload_23", Workload(env.BATCH, 56, 56, 256, 512, 1, 1, 0, 0, 2, 2)),
-    ("workload_24", Workload(env.BATCH, 56, 56, 64, 64, 1, 1, 0, 0, 1, 1)),
-    ("workload_25", Workload(env.BATCH, 56, 56, 256, 64, 1, 1, 0, 0, 1, 1)),
-    ("workload_26", Workload(env.BATCH, 56, 56, 64, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_27", Workload(env.BATCH, 56, 56, 256, 128, 1, 1, 0, 0, 1, 1)),
-    ("workload_28", Workload(env.BATCH, 56, 56, 128, 128, 3, 3, 1, 1, 2, 2)),
-    ("workload_29", Workload(env.BATCH, 28, 28, 512, 128, 1, 1, 0, 0, 1, 1)),
-    ("workload_30", Workload(env.BATCH, 28, 28, 128, 512, 1, 1, 0, 0, 1, 1)),
-    ("workload_31", Workload(env.BATCH, 28, 28, 512, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_32", Workload(env.BATCH, 28, 28, 256, 256, 3, 3, 1, 1, 2, 2)),
-    ("workload_33", Workload(env.BATCH, 14, 14, 1024, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_34", Workload(env.BATCH, 14, 14, 256, 1024, 1, 1, 0, 0, 1, 1)),
-    ("workload_35", Workload(env.BATCH, 14, 14, 1024, 512, 1, 1, 0, 0, 1, 1)),
-    ("workload_36", Workload(env.BATCH, 14, 14, 512, 512, 3, 3, 1, 1, 2, 2)),
-    ("workload_37", Workload(env.BATCH, 7, 7, 2048, 512, 1, 1, 0, 0, 1, 1)),
-    ("workload_38", Workload(env.BATCH, 7, 7, 512, 2048, 1, 1, 0, 0, 1, 1)),
-    ("workload_39", Workload(env.BATCH, 27, 27, 64, 192, 5, 5, 2, 2, 1, 1)),
-    ("workload_40", Workload(env.BATCH, 13, 13, 192, 384, 3, 3, 1, 1, 1, 1)),
-    ("workload_41", Workload(env.BATCH, 13, 13, 384, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_42", Workload(env.BATCH, 13, 13, 256, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_43", Workload(env.BATCH, 112, 112, 64, 128, 3, 3, 1, 1, 1, 1)),
-    ("workload_44", Workload(env.BATCH, 112, 112, 128, 128, 3, 3, 1, 1, 1, 1)),
-    ("workload_45", Workload(env.BATCH, 56, 56, 128, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_46", Workload(env.BATCH, 56, 56, 256, 256, 3, 3, 1, 1, 1, 1)),
-    ("workload_47", Workload(env.BATCH, 28, 28, 256, 512, 3, 3, 1, 1, 1, 1)),
-    ("workload_48", Workload(env.BATCH, 28, 28, 512, 512, 3, 3, 1, 1, 1, 1)),
-    ("workload_49", Workload(env.BATCH, 14, 14, 512, 512, 3, 3, 1, 1, 1, 1)),
-]
-
-maxPoolConfig = namedtuple(
-    "MaxPool2DConfig",
-    [
-        "hkernel",
-        "wkernel",
-        "hpad",
-        "wpad",
-        "hstride",
-        "wstride",
-        "ceil_mode"
-    ],
-)
-
-maxPoolConfigs = [
-    #("Config_0", maxPoolConfig(2, 2, 0, 0, 1, 1)),
-    # ("Config_0", maxPoolConfig(2, 2, 0, 0, 2, 2, 0)),
-    # #("Config_2", maxPoolConfig(2, 2, 1, 1, 1, 1)),
-    # #("Config_3", maxPoolConfig(2, 2, 1, 1, 2, 2)),
-    # #("Config_4", maxPoolConfig(3, 3, 0, 0, 1, 1)),
-    ("Config_1", maxPoolConfig(3, 3, 0, 0, 2, 2, 1)),
-    ("Config_2", maxPoolConfig(3, 3, 1, 1, 1, 1, 1)),
-    ("Config_3", maxPoolConfig(3, 3, 1, 1, 2, 2, 0)),
-    ("Config_4", maxPoolConfig(2, 2, 0, 0, 2, 2, 1))
-
-]
+def poll_serial_port(port="/dev/ttyUSB3", baud=921600, log_file="uart_sniffer_data/tmp.log"):
+    ser = serial.Serial(port, baud, timeout=2)
+    flag = False
+    layer_count = 0
+    with open(log_file, 'w') as myfile:
+        while True:
+            line = ser.readline().decode()
+            if (line is not None and line != "" and zero_line not in line):
+                flag = True
+                layer_count += 1
+                myfile.write(line)
+                # if args.print_to_console:
+                #     print(line)
+            elif flag:
+                # print("Layer count:: {}".format(layer_count))
+                myfile.write("Layer count:: {}".format(layer_count))
+                ser.close()
+                break
 
 # FIXME: we need a custom clip operator to circumvent a pattern detection limitation
 @tvm.te.tag_scope(tag=topi.tag.ELEMWISE)
@@ -200,7 +90,8 @@ def my_clip(x, a_min, a_max):
     return x
 
 
-def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json', samples=10, host_ip ='192.168.2.99'):
+def run_maxpool(env, remote, conv_wl, pool_cfg, cfg_id, target, log_file='logs/log.json', samples=10, host_ip ='192.168.2.99',
+                file_prefix="axi_uart_sniffer_fifo", port="/dev/ttyUSB3", baud=921600):
 
     # Workload assertions
     assert conv_wl.hpad == conv_wl.wpad
@@ -305,6 +196,8 @@ def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json'
     m.set_input(**params)
     m.set_input(input_name, input_data)
     for i in range(samples):
+        print("Sample measurement #{}".format(i))
+
         total_samples = 0
         result_dict_temp = {}
 
@@ -313,42 +206,23 @@ def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json'
         # myfile.write("\nSlot {} ".format(slot))
 
         print("starting polling subprocess")
-        proc = subprocess.Popen(
-            ["sshpass", "-p", "Srivat95", "ssh", "-t", "xilinx@{}".format(host_ip), "sudo", "python3",
-             "/home/xilinx/tvm_il/vta/python/vta/poll_apm_simul.py", "--slots", "0,1,2,3,4,5", "--stop_count",
-             str(max_stop_count)], stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-        count = 0
-        for i in range(200000000):
-            count += 1
+
+        serial_read_process = multiprocessing.Process(target=poll_serial_port, args=(port, baud,
+                                                                                     "uart_sniffer_data/maxpools/{}_{}_{}_sample{}.log"
+                                                                                     .format(file_prefix,
+                                                                                             workload_dict[
+                                                                                                 'workload_str'], cfg_id, i)))
+        serial_read_process.start()
+        time.sleep(3)
         m.run()
 
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.decode("utf-8")
-            match_sample = re.search(sample_re, line)
-            match_overall = re.search(overall_re, line)
-            match_total_samples = re.search(total_samples_re, line)
-            if match_sample:
+        time.sleep(3)
+        print("Exiting polling process...")
 
-                result_dict_temp[int(match_sample.group(1))]["samples"].append(
-                    {"write_bytes": int(match_sample.group(2)), "read_bytes": int(match_sample.group(3)),
-                     "write_bw": float(match_sample.group(4)), "read_bw": float(match_sample.group(5))})
-            elif match_overall:
-
-                result_dict_temp[int(match_overall.group(1))]["overall"]["write_bytes"] = int(match_overall.group(2))
-                result_dict_temp[int(match_overall.group(1))]["overall"]["read_bytes"] = int(match_overall.group(3))
-
-            elif match_total_samples:
-                total_samples = int(match_total_samples.group(1))
-
-        for slot in result_dict_temp.keys():
-            result_dict_temp[slot]["samples"] = result_dict_temp[slot]["samples"][:total_samples]
-            result_dict[slot] = result_dict_temp[slot]
-            result_dict["total_samples"] = total_samples
-        # myfile.write(str(result_dict[slot]))
+        serial_read_process.join(10)
+        if serial_read_process.is_alive():
+            serial_read_process.terminate()
+            empty_wkls.append(workload_dict['workload_str']+"_"+cfg_id)
         workload_dict["results"].append(result_dict)
         print("Ran convolution+relu+maxpool successfully!!")
 
@@ -358,7 +232,8 @@ def run_maxpool(env, remote, conv_wl, pool_cfg, target, log_file='logs/log.json'
         myfile.seek(0)
         json.dump(file_data, myfile, indent=4)
 
-def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99', num_samples=10):
+def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99', num_samples=10,
+                 file_prefix="axi_uart_sniffer_fifo", port="/dev/ttyUSB3", baud=921600):
     #device_host = os.environ.get("VTA_RPC_HOST", "192.168.2.99")
 
     device_host = host_ip
@@ -370,15 +245,16 @@ def test_maxpool(device, log_file = "logs/log.json", host_ip = '192.168.2.99', n
         target = env.target
         if env.TARGET not in ["sim", "tsim", "intelfocl"]:
             assert tvm.runtime.enabled("rpc")
-            program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_IL/tvm/vta/sri_scripts/bitstreams/vta_il_apm.bit")
+            # program_fpga(remote, bitstream="/home/srchand/Desktop/research/TVM_IL/tvm/vta/sri_scripts/bitstreams/vta_il_apm.bit")
             reconfig_runtime(remote)
     elif device == "arm_cpu":
         target = env.target_vta_cpu
     with autotvm.tophub.context(target, extra_files=schedule_log_files):  # load pre-tuned schedule parameters
-        for _, wl in resnet_wkls:
+        for _, wl in pynq_wkls:
             print(wl)
-            for _, pool_cfg in maxPoolConfigs:
-                run_maxpool(env, remote, wl, pool_cfg, target, log_file=log_file, host_ip=host_ip, samples=num_samples)
+            for cfg_id, pool_cfg in mp_wkls:
+                run_maxpool(env, remote, wl, pool_cfg, cfg_id, target, log_file=log_file, host_ip=host_ip, samples=num_samples,
+                            file_prefix=file_prefix, port=port, baud=baud)
 
 
 
@@ -390,9 +266,20 @@ if __name__ == "__main__":
                         help='pynq board IP')
     parser.add_argument('--samples', type=int, default=10,
                         help='number of times to run convolutions')
+    parser.add_argument('--data_file_prefix', type=str, default="axi_uart_sniffer_fifo",
+                        help='prefix of conv uart data files')
+    parser.add_argument('--serial_port', type=str, default="/dev/ttyUSB3",
+                        help='serial port name')
+    parser.add_argument('--baud', type=int, default=921600,
+                        help='serial port baud rate')
 
     args = parser.parse_args()
     #test_conv2d(device="arm_cpu")
-    test_maxpool(device="vta", log_file = args.log_file, host_ip = args.host_ip, num_samples=args.samples)
+    test_maxpool(device="vta", log_file = args.log_file, host_ip = args.host_ip, num_samples=args.samples,
+                 file_prefix=args.data_file_prefix, port=args.serial_port, baud=args.baud)
+
+    if len(empty_wkls) > 0:
+        print("NEED TO RERUN THE FOLLOWING....")
+        print(empty_wkls)
 
 

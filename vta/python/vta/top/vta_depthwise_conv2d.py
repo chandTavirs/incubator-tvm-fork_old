@@ -163,6 +163,8 @@ def schedule_depthwise_conv2d_packed(cfg, outs):
     cfg.define_split('tile_h', x_i, num_outputs=2)
     cfg.define_split('tile_w', x_j, num_outputs=2)
     cfg.define_split('tile_co', x_co, num_outputs=2)
+    cfg.define_knob("oc_nthread", [1, 2])
+    # cfg.define_knob("h_nthread", [1, 2])
 
     # Apply tiling
     x_bo0, x_bo1 = cfg['tile_b'].apply(s, output, x_bo)

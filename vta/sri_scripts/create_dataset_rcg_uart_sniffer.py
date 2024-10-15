@@ -1,11 +1,25 @@
 import argparse
 import os
+import re
+
 from alt_wkl_configs import *
 import ast
 from get_output_sizes import calc_conv_output_size, calc_maxpool_output_size
 
 broken_networks = []
 broken_files = []
+
+
+def check_layer_count_match(len_data_records, layer_count_line):
+    match = re.search(r"Layer count:: (\d+)", layer_count_line)
+    if match:
+        layer_count_number = int(match.group(1))
+        if layer_count_number == len_data_records:
+            return True
+        else:
+            return False
+    else:
+        return False
 
 
 def file_write_line_conv(cur_conv, layer_type):
@@ -95,6 +109,8 @@ def generate_labels_file(networks, output_dataset_dir):
 
 def clean_data_records(log_files_dir, output_dataset_dir):
     for i, filename in enumerate(os.listdir(output_dataset_dir)):
+        if 'network' not in filename:
+            continue
         with open(os.path.join(output_dataset_dir, filename)) as dataset_file:
             filename_no_ext = filename.split('.')[0]
             dataset_file_lines = dataset_file.readlines()[1:]
@@ -107,6 +123,13 @@ def clean_data_records(log_files_dir, output_dataset_dir):
             if len_data_record == 0:
                 broken_files.append(filename_no_ext + '_sample0.log')
                 break
+            if not check_layer_count_match(len_data_record, layer_count_line):
+                new_layer_count_line = f'Layer count:: {len_data_record}'
+                lines = data_record_file_lines
+                lines.append(new_layer_count_line)
+                with open(os.path.join(log_files_dir, filename_no_ext + '_sample0.log'), 'w+') as data_record_file:
+                    data_record_file.writelines(lines)
+
             if len_dataset == len_data_record:
                 continue
             else:
@@ -120,7 +143,7 @@ def clean_data_records(log_files_dir, output_dataset_dir):
                         continue
                     elif 2 * req_total == cur_total:
                         double_line = data_record_file_lines[i]
-                        half_line = ":".join([str(int(int(reading)/2)) for reading in double_line.split(':')])+'\n'
+                        half_line = ":".join([str(int(int(reading) / 2)) for reading in double_line.split(':')]) + '\n'
                         data_record_file_lines[i] = half_line
                         data_record_file_lines.insert(i + 1, half_line)
                         cur_total = int(half_line.split(':')[1])
@@ -130,7 +153,13 @@ def clean_data_records(log_files_dir, output_dataset_dir):
                             cur_line += 1
                             if cur_line >= len_data_record:
                                 break
-                            cur_total += int(data_record_file_lines[cur_line].split(':')[1])
+                            try:
+                                cur_total += int(data_record_file_lines[cur_line].split(':')[1])
+                            except:
+                                print(
+                                    f'Exception occurred at network {filename_no_ext}. putting it as a broken network')
+                                broken_networks.append(filename_no_ext)
+                                break
                         if cur_total != req_total:
                             broken_networks.append(filename_no_ext)
                             break
@@ -146,20 +175,26 @@ def clean_data_records(log_files_dir, output_dataset_dir):
                     if cur_total != req_total:
                         broken_networks.append(filename_no_ext)
                         break
-                data_record_file_lines.append(layer_count_line)
-                with open(os.path.join(log_files_dir, filename_no_ext + '_sample0.log'), 'w+') as data_record_file:
-                    data_record_file.writelines(data_record_file_lines)
-
+                if not check_layer_count_match(len(data_record_file_lines), layer_count_line):
+                    new_layer_count_line = f'Layer count:: {len(data_record_file_lines)}'
+                    data_record_file_lines.append(new_layer_count_line)
+                    with open(os.path.join(log_files_dir, filename_no_ext + '_sample0.log'), 'w+') as data_record_file:
+                        data_record_file.writelines(data_record_file_lines)
+                else:
+                    data_record_file_lines.append(layer_count_line)
+                    with open(os.path.join(log_files_dir, filename_no_ext + '_sample0.log'), 'w+') as data_record_file:
+                        data_record_file.writelines(data_record_file_lines)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='UART Sniffer random compute graphs dataset preparation script')
-    parser.add_argument('--log_files_dir', type=str, default="uart_sniffer_data/rcg",
+    parser.add_argument('--log_files_dir', type=str, default="uart_sniffer_data/asp_dac/rcg/4x8x8",
                         help='apm log files dir')
-    parser.add_argument('--networks_file', type=str, default="profiling_results/uart_sniffer/rcg/networks_profiled.log",
+    parser.add_argument('--networks_file', type=str,
+                        default="profiling_results/uart_sniffer/asp_dac/rcg/4x8x8/networks_profiled.log",
                         help='profiled networks list')
-    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/rcg",
+    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/4x8x8",
                         help='output dataset directory')
 
     args = parser.parse_args()
@@ -168,11 +203,11 @@ if __name__ == "__main__":
 
     networks_file = args.networks_file
 
-    # with open(networks_file, 'r') as myfile:
-    #     networks = myfile.readlines()
-    #     generate_labels_file(networks, args.output_dataset_dir)
+    with open(networks_file, 'r') as myfile:
+        networks = myfile.readlines()
+        generate_labels_file(networks, args.output_dataset_dir)
 
-    clean_data_records(args.log_files_dir, args.output_dataset_dir)
-
-    print("Broken networks:: ", broken_networks)
-    print("Broken files:: ", broken_files)
+    # clean_data_records(args.log_files_dir, args.output_dataset_dir)
+    # broken_networks = list(set(broken_networks))
+    # print("Broken networks:: ", broken_networks)
+    # print("Broken files:: ", broken_files)

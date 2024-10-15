@@ -19,6 +19,7 @@ from torch import nn
 import torch
 from vta.top import graph_pack
 
+from Wkls import ALL_TUNED_WKLS as pynq_wkls
 
 Workload = namedtuple(
     "Conv2DWorkload",
@@ -208,7 +209,7 @@ if __name__ == "__main__":
     target = env.target
     register_vta_tuning_tasks()
     tasks = []
-    for _, wl in tune_wkls:
+    for _, wl in pynq_wkls:
         tasks.append(construct_tasks(env, wl))
 
     assert len(tasks) == len(tune_wkls)
