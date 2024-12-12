@@ -308,14 +308,14 @@ def clean_data_records(log_files_dirs, output_dataset_dir, networks, batch=4):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='UART Sniffer random compute graphs dataset preparation script')
-    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/asp_dac/rcg/4x8x8_75000_333",
+    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/asp_dac/rcg/1x8x32_175k/",
                         help='apm log files dir')
     parser.add_argument('--networks_files', type=str,
-                        default="profiling_results/uart_sniffer/asp_dac/rcg/4x8x8_75000_333/networks_profiled.log",
+                        default="profiling_results/uart_sniffer/asp_dac/rcg/1x8x32_175k/networks_profiled.log",
                         help='profiled networks list')
-    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/4x8x8_75000_333",
+    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/1x8x32_175k",
                         help='output dataset directory')
-    parser.add_argument('--batch', type=int, default=4,
+    parser.add_argument('--batch', type=int, default=1,
                         help='batch size of VTA')
 
     args = parser.parse_args()

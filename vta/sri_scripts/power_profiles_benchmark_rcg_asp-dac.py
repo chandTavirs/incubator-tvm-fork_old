@@ -8,7 +8,7 @@ import serial
 
 from wkl_configs import *
 from Wkls import MAX_POOL_WKLS
-from Wkls import WKLS_1x1x0, WKLS_1x2x0, WKLS_3x1x0, WKLS_3x1x1, WKLS_3x2x0, WKLS_5x1x0, WKLS_3x2x1, WKLS_5x1x2, WKLS_5x2x2
+from Wkls import WKLS_1x1x0, WKLS_1x2x0, WKLS_3x1x0, WKLS_3x1x1, WKLS_3x2x0, WKLS_5x1x0, WKLS_3x2x1, WKLS_5x1x2, WKLS_5x2x2, broken_1x8x32
 import argparse
 
 import os
@@ -47,7 +47,7 @@ BN = batchNormConfig.__name__
 
 env = vta.get_env()
 
-schedule_log_files = glob.glob(r'logs/tuning_logs/vta_2x16x16/*.log')
+schedule_log_files = glob.glob(r'logs/tuning_logs/vta_1x8x32/*.log')
 # schedule_log_files = glob.glob(r'logs/tuning_logs/*.log')
 
 
@@ -73,18 +73,17 @@ def calc_maxpool_output_shape(wkl, pool_cfg):
     return out_height, out_width
 
 
-def construct_random_graph(args):
-
+def construct_random_graph(args, broken_wkls):
     wkl_prob_tuples = [(args.conv_3x1x1_prob, WKLS_3x1x1),
-                (args.conv_3x2x0_prob, WKLS_3x2x0),
-                (args.conv_3x2x1_prob, WKLS_3x2x1),
-                (args.conv_3x1x0_prob, WKLS_3x1x0),
-                (args.conv_1x2x0_prob, WKLS_1x2x0),
-                (args.conv_1x1x0_prob, WKLS_1x1x0),
-                (args.conv_5x2x2_prob, WKLS_5x2x2),
-                (args.conv_5x1x2_prob, WKLS_5x1x2),
-                (args.conv_5x1x0_prob, WKLS_5x1x0),
-                ]
+                       (args.conv_3x2x0_prob, WKLS_3x2x0),
+                       (args.conv_3x2x1_prob, WKLS_3x2x1),
+                       (args.conv_3x1x0_prob, WKLS_3x1x0),
+                       (args.conv_1x2x0_prob, WKLS_1x2x0),
+                       (args.conv_1x1x0_prob, WKLS_1x1x0),
+                       (args.conv_5x2x2_prob, WKLS_5x2x2),
+                       (args.conv_5x1x2_prob, WKLS_5x1x2),
+                       (args.conv_5x1x0_prob, WKLS_5x1x0),
+                       ]
 
     probs, wkl_list = zip(*wkl_prob_tuples)
 
@@ -92,7 +91,7 @@ def construct_random_graph(args):
 
         conv_wkl = choice(choices(wkl_list, probs)[0])[1]
         # conv_wkl = wkl_list[randrange(len(wkl_list))][1]
-        if conv_wkl.height < 26 or conv_wkl.out_filter < conv_wkl.in_filter:
+        if conv_wkl.height < 26 or conv_wkl.out_filter < conv_wkl.in_filter or conv_wkl in broken_wkls:
             continue
 
         layers = []
@@ -138,47 +137,47 @@ def construct_random_graph(args):
             pot_3x1x1 = []
             for _, wkl in WKLS_3x1x1:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                      wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_3x1x1.append(wkl)
             pot_3x2x1 = []
             for _, wkl in WKLS_3x2x1:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_3x2x1.append(wkl)
             pot_3x2x0 = []
             for _, wkl in WKLS_3x2x0:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_3x2x0.append(wkl)
             pot_1x2x0 = []
             for _, wkl in WKLS_1x2x0:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_1x2x0.append(wkl)
             pot_1x1x0 = []
             for _, wkl in WKLS_1x1x0:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_1x1x0.append(wkl)
             pot_5x2x2 = []
             for _, wkl in WKLS_5x2x2:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_5x2x2.append(wkl)
             pot_5x1x2 = []
             for _, wkl in WKLS_5x1x2:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_5x1x2.append(wkl)
             pot_5x1x0 = []
             for _, wkl in WKLS_5x1x0:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_5x1x0.append(wkl)
             pot_3x1x0 = []
             for _, wkl in WKLS_3x1x0:
                 if wkl.height == out_height and wkl.width == out_width and conv_wkl.out_filter == wkl.in_filter and \
-                        wkl not in layers:
+                        wkl not in layers and wkl not in broken_wkls:
                     pot_3x1x0.append(wkl)
 
             if len(pot_3x1x1) == 0 and len(pot_3x2x1) == 0 and len(pot_3x2x0) == 0 and len(pot_3x1x0) == 0 and \
@@ -206,7 +205,6 @@ def construct_random_graph(args):
                 else:
                     conv_wkl = choice(next_wkl_list)
                     break
-
 
         conv_count = 0
         for layer in layers:
@@ -267,7 +265,7 @@ def run_and_collect(env, remote, network_id, network, target, log_file_path, sam
                 # exit(0)
 
             # Perform graph packing and constant folding for VTA target
-            assert env.BLOCK_IN == env.BLOCK_OUT
+            # assert env.BLOCK_IN == env.BLOCK_OUT
             # do device annotation if target is intelfocl or sim
             relay_prog = graph_pack(
                 mod["main"],
@@ -420,14 +418,14 @@ if __name__ == "__main__":
     parser.add_argument('--wkl_list', type=str, default='all',
                         help='wkl list to pick convolutions from. Options - pre, man, incep, all, working')
     parser.add_argument("--log_file_dir", type=str,
-                        default='profiling_results/uart_sniffer/asp_dac/rcg/4x8x8_75000_333/',
+                        default='profiling_results/uart_sniffer/asp_dac/rcg/1x8x32_power_monitor/',
                         help="path to json file to store profiling data")
     parser.add_argument("--power_profile_log_dir", type=str,
-                        default='/home/xilinx/i2c_prog/pmbus_recordings/2x16x16_rcg/',
+                        default='/home/xilinx/i2c_prog/pmbus_recordings/1x8x32_rcg/',
                         help="path to directory to store power profile logs in zcu104")
     parser.add_argument('--samples', type=int, default=5,
                         help='number of times to run each network')
-    parser.add_argument('--data_file_prefix', type=str, default='power_monitor_2x16x16',
+    parser.add_argument('--data_file_prefix', type=str, default='power_monitor_1x8x32',
                         help='prefix of conv uart data files')
     # parser.add_argument('--load_networks_from_log', type=str, default='',
     #                     help='load random graphs from file and profile them')
@@ -458,9 +456,10 @@ if __name__ == "__main__":
     # if args.load_networks_from_log != '':
     #     assert os.path.exists(args.load_networks_from_log)
     #     with open(args.load_networks_from_log, 'r') as myfile:
+    broken_1x8x32_wkls = [wkl[1] for wkl in broken_1x8x32]
 
     while len(networks) < args.num_graphs:
-        networks.append(construct_random_graph(args))
+        networks.append(construct_random_graph(args, broken_1x8x32_wkls))
 
     # create networks log file dir if it doesn't exist. args.networks_log_file is the file path.
     if not os.path.exists(args.log_file_dir):

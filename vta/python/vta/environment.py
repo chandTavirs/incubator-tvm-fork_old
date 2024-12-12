@@ -339,11 +339,11 @@ def _init_env():
     if not os.path.exists(config_path):
         # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_alt.json")
         # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_2x16x16.json")
-        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config.json")
+        config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config.json")
         # config_path = os.path.join(get_vta_hw_path(), "config/pynq_config.json")
         # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_1x32x32.json")
 
-        config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_1x8x32.json")
+        # config_path = os.path.join(get_vta_hw_path(), "config/zcu104_config_1x8x32.json")
         if not os.path.exists(config_path):
             raise RuntimeError("Cannot find config in %s" % str(config_path))
     with open(config_path) as fp:

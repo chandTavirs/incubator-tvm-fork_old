@@ -264,14 +264,21 @@ INCEPTION_TUNED = [
 ]
 
 ALL_TUNED_WKLS = [
+    # not working
     # ("workload_0", Workload(1, 28, 28, 256, 512, 1, 1, 0, 0, 1, 1)),
+
+
     # ("workload_1", Workload(1, 35, 35, 96, 96, 3, 3, 0, 0, 2, 2)),
     # ("workload_2", Workload(1, 28, 28, 128, 192, 3, 3, 1, 1, 1, 1)),
     # ("workload_3", Workload(1, 14, 14, 160, 160, 3, 3, 1, 1, 1, 1)),
     # ("workload_4", Workload(1, 28, 28, 512, 128, 1, 1, 0, 0, 1, 1)),
     # ("workload_5", Workload(1, 27, 27, 32, 128, 1, 1, 0, 0, 1, 1)),
     # ("workload_6", Workload(1, 7, 7, 512, 512, 3, 3, 1, 1, 1, 1)),
+
+    # not working
     # ("workload_7", Workload(1, 13, 13, 384, 48, 1, 1, 0, 0, 1, 1)),
+    #
+    #
     # ("workload_8", Workload(1, 28, 28, 128, 512, 1, 1, 0, 0, 1, 1)),
     # ("workload_9", Workload(1, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1)),
     # ("workload_10", Workload(1, 7, 7, 160, 320, 3, 3, 1, 1, 1, 1)),
@@ -284,7 +291,11 @@ ALL_TUNED_WKLS = [
     # ("workload_17", Workload(1, 112, 112, 32, 32, 1, 1, 0, 0, 1, 1)),
     # ("workload_18", Workload(1, 56, 56, 256, 256, 1, 1, 0, 0, 1, 1)),
     # ("workload_19", Workload(1, 17, 17, 768, 160, 1, 1, 0, 0, 1, 1)),
-    # ("workload_20", Workload(1, 55, 55, 64, 16, 1, 1, 0, 0, 1, 1)),
+
+    # not working
+    #("workload_20", Workload(1, 55, 55, 64, 16, 1, 1, 0, 0, 1, 1)),
+
+
     # ("workload_21", Workload(1, 28, 28, 256, 512, 1, 1, 0, 0, 2, 2)),
     #
     # ("workload_22", Workload(1, 112, 112, 128, 128, 3, 3, 1, 1, 1, 1)),
@@ -292,22 +303,31 @@ ALL_TUNED_WKLS = [
     # ("workload_23", Workload(1, 13, 13, 512, 64, 1, 1, 0, 0, 1, 1)),
     # ("workload_24", Workload(1, 8, 8, 1280, 448, 1, 1, 0, 0, 1, 1)),
     # ("workload_25", Workload(1, 28, 28, 256, 64, 1, 1, 0, 0, 1, 1)),
-    ("workload_26", Workload(1, 14, 14, 528, 256, 1, 1, 0, 0, 1, 1)),
-    ("workload_27", Workload(1, 13, 13, 384, 256, 3, 3, 1, 1, 1, 1)),
+    # ("workload_26", Workload(1, 14, 14, 528, 256, 1, 1, 0, 0, 1, 1)),
+    # ("workload_27", Workload(1, 13, 13, 384, 256, 3, 3, 1, 1, 1, 1)),
+    #
+    # ("workload_28", Workload(1, 224, 224, 64, 64, 3, 3, 1, 1, 1, 1)),
+    #
+    # ("workload_29", Workload(1, 14, 14, 480, 64, 1, 1, 0, 0, 1, 1)),
+    # ("workload_30", Workload(1, 56, 56, 256, 256, 3, 3, 1, 1, 2, 2)),
+    # ("workload_31", Workload(1, 35, 35, 192, 64, 1, 1, 0, 0, 1, 1)),
+    # ("workload_32", Workload(1, 35, 35, 48, 64, 5, 5, 2, 2, 1, 1)),
 
-    ("workload_28", Workload(1, 224, 224, 64, 64, 3, 3, 1, 1, 1, 1)),
+    # not working
+    # ("workload_33", Workload(1, 14, 14, 48, 48, 5, 5, 2, 2, 2, 2)),
 
-    ("workload_29", Workload(1, 14, 14, 480, 64, 1, 1, 0, 0, 1, 1)),
-    ("workload_30", Workload(1, 56, 56, 256, 256, 3, 3, 1, 1, 2, 2)),
-    ("workload_31", Workload(1, 35, 35, 192, 64, 1, 1, 0, 0, 1, 1)),
-    ("workload_32", Workload(1, 35, 35, 48, 64, 5, 5, 2, 2, 1, 1)),
-    ("workload_33", Workload(1, 14, 14, 48, 48, 5, 5, 2, 2, 2, 2)),
-    ("workload_34", Workload(1, 7, 7, 384, 64, 1, 1, 0, 0, 1, 1)),
+    # ("workload_34", Workload(1, 7, 7, 384, 64, 1, 1, 0, 0, 1, 1)),
+    #
+    # ("workload_35", Workload(1, 55, 55, 16, 64, 3, 3, 1, 1, 1, 1)),
 
-    ("workload_35", Workload(1, 55, 55, 16, 64, 3, 3, 1, 1, 1, 1)),
-    ("workload_36", Workload(1, 7, 7, 832, 128, 1, 1, 0, 0, 1, 1)),
-    ("workload_37", Workload(1, 56, 56, 32, 32, 1, 1, 0, 0, 1, 1)),
-    ("workload_38", Workload(1, 14, 14, 400, 400, 3, 3, 1, 1, 2, 2)),
+    # ("workload_36", Workload(1, 7, 7, 832, 128, 1, 1, 0, 0, 1, 1)),
+
+    # not working
+    # ("workload_37", Workload(1, 56, 56, 32, 32, 1, 1, 0, 0, 1, 1)),
+
+    # not working
+    # ("workload_38", Workload(1, 14, 14, 400, 400, 3, 3, 1, 1, 2, 2)),
+
     ("workload_39", Workload(1, 56, 56, 16, 48, 1, 1, 0, 0, 1, 1)),
     ("workload_40", Workload(1, 28, 28, 192, 32, 1, 1, 0, 0, 1, 1)),
     ("workload_41", Workload(1, 104, 104, 32, 64, 3, 3, 1, 1, 1, 1)),
@@ -1157,4 +1177,51 @@ broken_wkls_2x16x16_75000 = [
     # ('workloads_9', Workload(1, 14, 14, 1024, 1024, 3, 3, 1, 1, 2, 2)),
     # ('workloads_10', Workload(1, 73, 73, 80, 192, 3, 3, 0, 0, 1, 1)),
     # ('workloads_11', Workload(1, 112, 112, 64, 128, 3, 3, 1, 1, 1, 1)),
+]
+
+broken_1x8x32 = [
+    ('workload_0', Workload(1, 56, 56, 16, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_1', Workload(1, 56, 56, 48, 48, 3, 3, 1, 1, 1, 1)),
+    ('workload_2', Workload(1, 7, 7, 912, 912, 1, 1, 0, 0, 1, 1)),
+    ('workload_3', Workload(1, 7, 7, 240, 240, 3, 3, 1, 1, 1, 1)),
+    ('workload_4', Workload(1, 14, 14, 512, 144, 1, 1, 0, 0, 1, 1)),
+    ('workload_5', Workload(1, 14, 14, 160, 400, 1, 1, 0, 0, 2, 2)),
+    ('workload_6', Workload(1, 14, 14, 48, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_7', Workload(1, 112, 112, 32, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_8', Workload(1, 28, 28, 144, 144, 3, 3, 1, 1, 1, 1)),
+    ('workload_9', Workload(1, 55, 55, 128, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_10', Workload(1, 7, 7, 240, 240, 5, 5, 2, 2, 1, 1)),
+    ('workload_11', Workload(1, 7, 7, 288, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_12', Workload(1, 27, 27, 256, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_13', Workload(1, 7, 7, 400, 400, 1, 1, 0, 0, 1, 1)),
+    ('workload_14', Workload(1, 73, 73, 64, 80, 1, 1, 0, 0, 1, 1)),
+    ('workload_15', Workload(1, 14, 14, 16, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_16', Workload(1, 14, 14, 160, 400, 1, 1, 0, 0, 1, 1)),
+    ('workload_17', Workload(1, 7, 7, 912, 912, 3, 3, 1, 1, 2, 2)),
+    ('workload_18', Workload(1, 7, 7, 240, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_19', Workload(1, 14, 14, 16, 48, 3, 3, 1, 1, 1, 1)),
+    ('workload_20', Workload(1, 28, 28, 144, 144, 3, 3, 1, 1, 2, 2)),
+    ('workload_21', Workload(1, 7, 7, 832, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_22', Workload(1, 7, 7, 400, 400, 3, 3, 1, 1, 1, 1)),
+    ('workload_23', Workload(1, 14, 14, 96, 208, 3, 3, 1, 1, 1, 1)),
+    ('workload_24', Workload(1, 35, 35, 192, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_25', Workload(1, 35, 35, 256, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_26', Workload(1, 14, 14, 512, 112, 1, 1, 0, 0, 1, 1)),
+    ('workload_27', Workload(1, 7, 7, 144, 144, 5, 5, 2, 2, 2, 2)),
+    ('workload_28', Workload(1, 14, 14, 48, 48, 3, 3, 1, 1, 1, 1)),
+    ('workload_29', Workload(1, 56, 56, 16, 16, 3, 3, 1, 1, 1, 1)),
+    ('workload_30', Workload(1, 14, 14, 480, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_31', Workload(1, 56, 56, 48, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_32', Workload(1, 35, 35, 288, 48, 1, 1, 0, 0, 1, 1)),
+    ('workload_33', Workload(1, 28, 28, 192, 16, 1, 1, 0, 0, 1, 1)),
+    ('workload_34', Workload(1, 56, 56, 144, 144, 3, 3, 1, 1, 2, 2)),
+    ('workload_35', Workload(1, 56, 56, 32, 144, 1, 1, 0, 0, 1, 1)),
+    ('workload_36', Workload(1, 56, 56, 144, 144, 3, 3, 1, 1, 1, 1)),
+    ('workload_37', Workload(1, 112, 112, 32, 16, 1, 1, 0, 0, 1, 1)),
+    ("workload_38", Workload(1, 28, 28, 256, 512, 1, 1, 0, 0, 1, 1)),
+    ("workload_39", Workload(1, 13, 13, 384, 48, 1, 1, 0, 0, 1, 1)),
+    ("workload_40", Workload(1, 55, 55, 64, 16, 1, 1, 0, 0, 1, 1)),
+    ("workload_41", Workload(1, 14, 14, 48, 48, 5, 5, 2, 2, 2, 2)),
+    ("workload_42", Workload(1, 56, 56, 32, 32, 1, 1, 0, 0, 1, 1)),
+    ("workload_43", Workload(1, 14, 14, 400, 400, 3, 3, 1, 1, 2, 2)),
 ]
