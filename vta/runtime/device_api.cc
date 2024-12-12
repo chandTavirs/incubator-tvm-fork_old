@@ -27,7 +27,7 @@
 
 #include "../../src/runtime/workspace_pool.h"
 #include "runtime.h"
-#include "memory_integrity_tree.h"
+//#include "memory_integrity_tree.h"
 
 namespace tvm {
 namespace runtime {
@@ -36,11 +36,11 @@ class VTADeviceAPI final : public DeviceAPI {
  public:
     VTADeviceAPI() {
         // Initialize MemoryIntegrityTree with the total DRAM size used by VTA
-        size_t total_dram_size = 9600;
-        memory_integrity_tree_ = new MemoryIntegrityTree(total_dram_size);
+//        size_t total_dram_size = 9600;
+//        memory_integrity_tree_ = new MemoryIntegrityTree(total_dram_size);
     }
     ~VTADeviceAPI() {
-    delete memory_integrity_tree_;
+//    delete memory_integrity_tree_;
   }
 
   void SetDevice(TVMContext ctx) final {}
@@ -82,7 +82,7 @@ class VTADeviceAPI final : public DeviceAPI {
   }
 
   private:
-  MemoryIntegrityTree* memory_integrity_tree_;
+//  MemoryIntegrityTree* memory_integrity_tree_;
 };
 
 struct VTAWorkspacePool : public WorkspacePool {

@@ -37,6 +37,8 @@ Workload = namedtuple(
     ],
 )
 
+broken_wkls = []
+
 # Get batch info from env
 env = vta.get_env()
 
@@ -148,18 +150,21 @@ def construct_tasks(env, wl, task_name='conv2d_packed.vta'):
         with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0]):
             mod = relay.quantize.quantize(mod, params=params)
 
-    assert env.BLOCK_IN == env.BLOCK_OUT
-
-    relay_prog = graph_pack(
-        mod["main"],
-        env.BATCH,
-        env.BLOCK_IN,
-        env.BLOCK_OUT,
-        env.WGT_WIDTH,
-        start_name="cast",
-        start_name_idx=6,
-        stop_name="nn.adaptive_avg_pool2d",
-    )
+    # assert env.BLOCK_IN == env.BLOCK_OUT
+    try:
+        relay_prog = graph_pack(
+            mod["main"],
+            env.BATCH,
+            env.BLOCK_IN,
+            env.BLOCK_OUT,
+            env.WGT_WIDTH,
+            start_name="cast",
+            start_name_idx=6,
+            stop_name="nn.adaptive_avg_pool2d",
+        )
+    except:
+        # if there is an exception in the graph pack, print name of workload and exception message and return None
+        return None
 
     mod = tvm.IRModule.from_expr(relay_prog)
     extracted_tasks = autotvm.task.extract_from_program(
@@ -197,7 +202,7 @@ if __name__ == "__main__":
         #tasks.append(construct_tasks(env, wl))
 
         device = "vta"
-        log_file = "logs/tuning_logs/vta_2x16x16/%s.%s.%s.log" % (device, args.model, wkl_name)
+        log_file = "logs/tuning_logs/vta_1x8x32/%s.%s.%s.log" % (device, args.model, wkl_name)
         tuning_option = {
             "log_filename": log_file,
             "tuner": "random",
@@ -220,6 +225,14 @@ if __name__ == "__main__":
         tasks = [construct_tasks(env, wl)]
         # for _, wl in pynq_wkls:
         #     tasks.append(construct_tasks(env, wl))
+
+        if tasks[0] is None:
+            print(f"Error in packing graph for workload {wkl_name}, {wl}")
+
+            # add wl to list of broken workloads
+            broken_wkls.append(wkl_name)
+
+            continue
 
         assert len(tasks) == 1
         print("Extracted {} conv2d tasks:".format(len(tasks)))
@@ -257,3 +270,6 @@ if __name__ == "__main__":
         print("Tuning...")
         tune_tasks(tasks, **tuning_option)
         print("Tuning Done!!!!!!")
+
+    # print broken workloads
+    print(f"Broken workloads: {broken_wkls}")
