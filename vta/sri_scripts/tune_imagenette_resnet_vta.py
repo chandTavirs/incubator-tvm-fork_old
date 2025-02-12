@@ -216,12 +216,12 @@ start_pack = "nn.max_pool2d"
 stop_pack = "nn.adaptive_avg_pool2d"
 
 # Tuning option
-log_file = "logs/tuning_logs/vta_4x8x8/imagenette_resnet/%s.%s.log" % (device, "resnet18")
+log_file = "logs/%s.%s.log" % (device, "resnet18")
 tuning_option = {
     "log_filename": log_file,
     "tuner": "random",
-    "n_trial": 1000,
-    "early_stopping": None,
+    "n_trial": 50,
+    "early_stopping": 600,
     "measure_option": autotvm.measure_option(
         builder=autotvm.LocalBuilder(),
         runner=autotvm.RPCRunner(
@@ -363,45 +363,45 @@ def tune_and_evaluate(tuning_opt):
     print("Extract tasks...")
     relay_prog, params = compile_network(env, target, network, start_pack, stop_pack)
     mod = tvm.IRModule.from_expr(relay_prog)
-    tasks = autotvm.task.extract_from_program(
-        mod,
-        params=params,
-        ops=(relay.op.get("nn.conv2d"),),
-        target=target,
-        target_host=env.target_host,
-    )
-
-    # filter out non-packed conv2d task
-    tasks = list(filter(lambda t: len(t.args[0][1]) > 4 and "conv" in t.name, tasks))
-
-    # We should have extracted 10 convolution tasks
-    assert len(tasks) == 10
-    print("Extracted {} conv2d tasks:".format(len(tasks)))
-    for tsk in tasks:
-        inp = tsk.args[0][1]
-        wgt = tsk.args[1][1]
-        batch = inp[0] * inp[4]
-        in_filter = inp[1] * inp[5]
-        out_filter = wgt[0] * wgt[4]
-        height, width = inp[2], inp[3]
-        hkernel, wkernel = wgt[2], wgt[3]
-        hstride, wstride = tsk.args[2][0], tsk.args[2][1]
-        hpad, wpad = tsk.args[3][0], tsk.args[3][1]
-        print(
-            "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})".format(
-                batch,
-                height,
-                width,
-                in_filter,
-                out_filter,
-                hkernel,
-                wkernel,
-                hpad,
-                wpad,
-                hstride,
-                wstride,
-            )
-        )
+    # tasks = autotvm.task.extract_from_program(
+    #     mod,
+    #     params=params,
+    #     ops=(relay.op.get("nn.conv2d"),),
+    #     target=target,
+    #     target_host=env.target_host,
+    # )
+    #
+    # # filter out non-packed conv2d task
+    # tasks = list(filter(lambda t: len(t.args[0][1]) > 4 and "conv" in t.name, tasks))
+    #
+    # # We should have extracted 10 convolution tasks
+    # assert len(tasks) == 10
+    # print("Extracted {} conv2d tasks:".format(len(tasks)))
+    # for tsk in tasks:
+    #     inp = tsk.args[0][1]
+    #     wgt = tsk.args[1][1]
+    #     batch = inp[0] * inp[4]
+    #     in_filter = inp[1] * inp[5]
+    #     out_filter = wgt[0] * wgt[4]
+    #     height, width = inp[2], inp[3]
+    #     hkernel, wkernel = wgt[2], wgt[3]
+    #     hstride, wstride = tsk.args[2][0], tsk.args[2][1]
+    #     hpad, wpad = tsk.args[3][0], tsk.args[3][1]
+    #     print(
+    #         "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})".format(
+    #             batch,
+    #             height,
+    #             width,
+    #             in_filter,
+    #             out_filter,
+    #             hkernel,
+    #             wkernel,
+    #             hpad,
+    #             wpad,
+    #             hstride,
+    #             wstride,
+    #         )
+    #     )
 
     # We do not run the tuning in our webpage server since it takes too long.
     # Comment the following line to run it by yourself.
@@ -409,7 +409,7 @@ def tune_and_evaluate(tuning_opt):
 
     # run tuning tasks
     print("Tuning...")
-    tune_tasks(tasks, **tuning_opt)
+    # tune_tasks(tasks, **tuning_opt)
 
     # evaluate with tuning history
     if env.TARGET != "sim":
@@ -419,7 +419,7 @@ def tune_and_evaluate(tuning_opt):
         )
         # Reconfigure the JIT runtime and FPGA.
         vta.reconfig_runtime(remote)
-        vta.program_fpga(remote, bitstream=None)
+        # vta.program_fpga(remote, bitstream=None)
     else:
         # In simulation mode, host the RPC server locally.
         remote = rpc.LocalSession()
@@ -452,7 +452,7 @@ def tune_and_evaluate(tuning_opt):
 
         # upload parameters to device
         image = tvm.nd.array((np.random.uniform(size=(env.BATCH, 3, 224, 224))).astype("float32"))
-        m.set_input("data", image)
+        m.set_input("input0", image)
 
         # evaluate
         print("Evaluate inference time cost...")

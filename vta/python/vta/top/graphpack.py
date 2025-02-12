@@ -395,6 +395,7 @@ class ExprPack(ExprMutator):
         self.bfactor = bfactor
         self.blockin = blockin
         self.blockout = blockout
+        # self.typetrack = False
         self.typetrack = False
         self.is_packed = False
         if self.blockin != self.blockout:
@@ -442,6 +443,8 @@ class ExprPack(ExprMutator):
                     return _unpack_batch_channel(data, data_shape, self.blockout, self.typetrack)
                 return data
         if self.start_pack:
+            if odtype == 'float32':
+                pseudo_break=True
             # Operator cases
             if call.op == self.conv2d and odtype == "int32":
                 self.number_of_conv2d += 1

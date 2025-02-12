@@ -17,6 +17,24 @@ Conv2DWorkload = namedtuple(
     ],
 )
 
+DepthwiseConv2DWorkload = namedtuple(
+    "DepthwiseConv2DWorkload",
+    [
+        "batch",
+        "height",
+        "width",
+        "in_filter",
+        "out_filter",
+        "hkernel",
+        "wkernel",
+        "hpad",
+        "wpad",
+        "hstride",
+        "wstride",
+        "groups"
+    ],
+)
+
 MaxPool2DConfig = namedtuple(
     "MaxPool2DConfig",
     [

@@ -113,3 +113,7 @@ def stop_ro_monitor(remote, file_number):
 def reset_ro_monitor(remote):
     fstart_pm = remote.get_function("tvm.contrib.vta.reset_ro_monitor")
     fstart_pm()
+
+def remote_cmd_exec(remote):
+    fremote_cmd_exec = remote.get_function("tvm.contrib.vta.remote_cmd_exec")
+    fremote_cmd_exec()
