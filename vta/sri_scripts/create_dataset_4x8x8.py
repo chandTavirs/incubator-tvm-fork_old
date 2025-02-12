@@ -1,5 +1,5 @@
 from collections import namedtuple
-from wkl_configs import Workload, maxPoolConfig, batchNormConfig, reluConfig
+from wkl_configs import Workload, maxPoolConfig, batchNormConfig, reluConfig, DepthwiseConv2D
 
 import argparse
 import os
@@ -32,7 +32,10 @@ def get_broken_convs(network_str):
     # convert each string in network_str into named tuple objects in wkl_configs
     network = []
     for wkl in network_str:
-        if 'Conv2DWorkload' in wkl:
+        if 'DepthwiseConv2DWorkload' in wkl:
+            wkl = wkl.replace('DepthwiseConv2DWorkload', 'DepthwiseConv2D')
+            network.append(eval(wkl))
+        elif 'Conv2DWorkload' in wkl:
             wkl = wkl.replace('Conv2DWorkload', 'Workload')
             network.append(eval(wkl))
         else:
@@ -116,6 +119,13 @@ def generate_labels_file(networks, output_dataset_dir, set_id=0):
                 layer_type = []
                 cur_conv = layer
                 layer_type.append('C')
+            elif isinstance(layer, DepthwiseConv2DWorkload):
+                if i > 0 and len(layer_type) > 0:
+                    with open(os.path.join(output_dataset_dir, network_name + f'_set_{set_id}'+ ".txt"), 'a') as myfile:
+                        myfile.write(file_write_line_conv(cur_conv, "".join(layer_type)))
+                layer_type = []
+                cur_conv = layer
+                layer_type.append('D')
             elif isinstance(layer, BatchNorm2DConfig):
                 layer_type.append('B')
             elif isinstance(layer, ReluConfig):
@@ -308,12 +318,12 @@ def clean_data_records(log_files_dirs, output_dataset_dir, networks, batch=4):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='UART Sniffer random compute graphs dataset preparation script')
-    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/asp_dac/rcg/1x8x32_175k/",
+    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/asp_dac/rcg/1x16x16_35k_dconv2d/",
                         help='apm log files dir')
     parser.add_argument('--networks_files', type=str,
-                        default="profiling_results/uart_sniffer/asp_dac/rcg/1x8x32_175k/networks_profiled.log",
+                        default="profiling_results/uart_sniffer/asp_dac/rcg/1x16x16_35k_dconv2d/networks_profiled.log",
                         help='profiled networks list')
-    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/1x8x32_175k",
+    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/1x16x16_35k_dconv2d",
                         help='output dataset directory')
     parser.add_argument('--batch', type=int, default=1,
                         help='batch size of VTA')

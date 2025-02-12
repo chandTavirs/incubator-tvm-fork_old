@@ -49,8 +49,7 @@ BN = batchNormConfig.__name__
 max_stop_count = 20
 
 env = vta.get_env()
-print(env.BATCH)
-exit(0)
+
 
 # schedule_log_files = glob.glob(r'logs/tuning_logs/vta_4x8x8/*.log')
 # schedule_log_files = glob.glob(r'logs/tuning_logs/*.log')
@@ -497,7 +496,7 @@ if __name__ == "__main__":
                         help='probability that relu follows convolution')
     parser.add_argument('--maxpool_prob', type=float, default=0.2,
                         help='probability that maxpool follows convolution')
-    parser.add_argument('--Depthwise_conv2d_prob', type=float, default=0.3,
+    parser.add_argument('--Depthwise_conv2d_prob', type=float, default=0.2,
                         help='probability that the convolution is depthwise')
     parser.add_argument('--conv_3x1x1_prob', type=float, default=0.45,
                         help='probability that conv hyp is (K, S, P) (3, 1, 1)')
