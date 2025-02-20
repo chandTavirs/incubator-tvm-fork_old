@@ -413,6 +413,7 @@ class ExprPack(ExprMutator):
         self.pad = op.op.get("nn.pad")
         self.upsampling = op.op.get("nn.upsampling")
         self.reshape = op.op.get("reshape")
+        self.strided_slice = op.op.get("strided_slice")
         self.global_avg_pool2d = op.op.get("nn.global_avg_pool2d")
         self.max_pool2d = op.op.get("nn.max_pool2d")
         self.dense = op.op.get("nn.dense")
@@ -725,6 +726,46 @@ class ExprPack(ExprMutator):
                 (data,) = args
                 data = op.transpose(data, axes=(0, 4, 1, 5, 2, 3))
                 return op.reshape(data, [int(x) for x in input_types[0].shape])
+            # elif call.op.name == "concatenate":
+            #     concat = True
+            elif call.op == self.strided_slice:
+                strided_slice = True
+                # print input shape
+                # data = args[0]
+                # data_shape = _get_tensor_shape(data)
+                (data,) = args
+                data_shape = _to_shape(input_types[0].shape)
+                if data_shape[-1] != self.blockout:
+                    data = _unpack_batch_channel(data, input_types[0].shape,
+                                                 self.blockout, self.typetrack)
+                    data = _pack_batch_channel(data, input_types[0].shape,
+                                               self.bfactor, self.blockout, self.typetrack)
+
+
+                begin = [call.attrs.begin[0] // self.bfactor, call.attrs.begin[1] // self.blockout, call.attrs.begin[2], call.attrs.begin[3], 0, 0]
+                end = [call.attrs.end[0] // self.bfactor, call.attrs.end[1] // self.blockout, call.attrs.end[2], call.attrs.end[3], self.bfactor, self.blockout]
+                strides = [1, 1, 1, 1, 1, 1]
+
+                # end = [0] * 6
+                # end[1] = call.attrs.end[1] // self.blockout
+                #
+                # strides = [1] * 6
+
+                # axes = [0,1,0,0,0,0]
+
+                # print strided slice arguments
+                # print("Strided slice shape:: ",data_shape)
+                # print("slice indices:: ",begin, end, strides)
+
+                # alter end to match the new shape
+
+
+                # print("Strided slice shape:: ",data_shape)
+                # print("slice indices:: ",call.attrs.begin, call.attrs.end, call.attrs.strides)
+                # print("slice axes:: ",call.attrs.axes)
+                # data = op.transpose(data, axes=(0, 2, 1, 3))
+                return op.strided_slice(data, begin, end, strides)
+
         callnode = relay.Call(self.visit(call.op), args, call.attrs)
         if self.typetrack:
             callnode._checked_type_ = tvm.ir.tensor_type.TensorType(oshape)

@@ -76,7 +76,8 @@ Expr MakeSqueeze(Expr data, Array<Integer> axis);
 Expr MakeStack(Expr data, int axis);
 
 Expr MakeStridedSlice(Expr data, Array<Integer> begin, Array<Integer> end, Array<Integer> strides,
-                      String slice_mode);
+                      String slice_mode,
+                      Optional<Array<Integer>> axes = NullValue<Array<Integer>>());
 
 Expr MakeTile(Expr data, Array<Integer> reps);
 
