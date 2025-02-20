@@ -117,3 +117,7 @@ def reset_ro_monitor(remote):
 def remote_cmd_exec(remote):
     fremote_cmd_exec = remote.get_function("tvm.contrib.vta.remote_cmd_exec")
     fremote_cmd_exec()
+
+def reset_xilinx_driver(remote):
+    freset_xilinx_driver = remote.get_function("tvm.contrib.vta.reset_xilinx_driver")
+    freset_xilinx_driver()

@@ -861,7 +861,7 @@ def split(data, indices_or_sections, axis=0):
     return TupleWrapper(_make.split(data, indices_or_sections, axis), ret_size)
 
 
-def strided_slice(data, begin, end, strides=None, slice_mode="end"):
+def strided_slice(data, begin, end, strides=None, axes=None, slice_mode="end"):
     """Strided slice of an array.
 
     Parameters
@@ -879,6 +879,12 @@ def strided_slice(data, begin, end, strides=None, slice_mode="end"):
         Specifies the stride values, it can be negative in that case,
         the input tensor will be reversed in that particular axis.
 
+    axes : Tuple[int] or List[int], optional
+        Axes along which slicing is applied. When it is specified, the length of begin, end,
+        strides, and axes must be equal. Moreover, begin, end, strides, and axes must be
+        static (cannot be relay.Expr). Axes argument for dynamic parameter slicing is
+        not supported yet.
+
     slice_mode : str, optional
         The slice mode [end, size].
         end: The ending indices for the slice [default].
@@ -893,11 +899,11 @@ def strided_slice(data, begin, end, strides=None, slice_mode="end"):
     """
     strides = strides or [1]
     if isinstance(begin, Constant):
-        begin = list(begin.data.asnumpy())
+        begin = list(begin.data.numpy())
     if isinstance(end, Constant):
-        end = list(end.data.asnumpy())
+        end = list(end.data.numpy())
     if isinstance(strides, Constant):
-        strides = list(strides.data.asnumpy())
+        strides = list(strides.data.numpy())
     if isinstance(begin, Expr) or isinstance(end, Expr) or isinstance(strides, Expr):
         if isinstance(begin, (tuple, list)):
             begin = const(list(begin))
@@ -905,11 +911,15 @@ def strided_slice(data, begin, end, strides=None, slice_mode="end"):
             end = const(list(end))
         if isinstance(strides, (tuple, list)):
             strides = const(list(strides))
-        normalized_begin = _make.where(
-            begin < cast_like(const(0), begin), begin + cast_like(shape_of(data), begin), begin
-        )
-        return _dyn_make.strided_slice(data, normalized_begin, end, strides, slice_mode)
-    return _make.strided_slice(data, begin, end, strides, slice_mode)
+
+        ishape = cast_like(shape_of(data), begin)
+        ishape_slice = slice_like(ishape, begin)
+        begin = _make.where(begin < cast_like(const(0), begin), begin + ishape_slice, begin)
+        begin = _make.where(begin >= ishape_slice, ishape_slice, begin)
+        # TODO(masahi): Support axes argument in dynamic strided slice
+        assert axes is None, "Axes argument for dynamic parameter slicing is not supported yet."
+        return _dyn_make.strided_slice(data, begin, end, strides, slice_mode)
+    return _make.strided_slice(data, begin, end, strides, slice_mode, axes)
 
 
 def strided_set(data, v, begin, end, strides=None):
