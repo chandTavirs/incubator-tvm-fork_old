@@ -318,12 +318,12 @@ def clean_data_records(log_files_dirs, output_dataset_dir, networks, batch=4):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='UART Sniffer random compute graphs dataset preparation script')
-    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/asp_dac/rcg/1x16x16_35k_dconv2d/",
+    parser.add_argument('--log_files_dirs', type=str, default="uart_sniffer_data/neurob/rcg/1x16x16_50k,uart_sniffer_data/neurob/rcg/1x16x16_50k_set2,uart_sniffer_data/neurob/rcg/1x16x16_50k_set3",
                         help='apm log files dir')
     parser.add_argument('--networks_files', type=str,
-                        default="profiling_results/uart_sniffer/asp_dac/rcg/1x16x16_35k_dconv2d/networks_profiled.log",
+                        default="profiling_results/uart_sniffer/neurob/rcg/1x16x16_50k/networks_profiled.log,profiling_results/uart_sniffer/neurob/rcg/1x16x16_50k_set2/networks_profiled.log,profiling_results/uart_sniffer/neurob/rcg/1x16x16_50k_set3/networks_profiled.log",
                         help='profiled networks list')
-    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/asp_dac/rcg/1x16x16_35k_dconv2d",
+    parser.add_argument('--output_dataset_dir', type=str, default="dataset/uart_sniffer/neurob/rcg/1x16x16_50k",
                         help='output dataset directory')
     parser.add_argument('--batch', type=int, default=1,
                         help='batch size of VTA')
@@ -334,7 +334,9 @@ if __name__ == "__main__":
     log_files_dirs = log_files_dirs.split(',')
 
     networks_files = args.networks_files
-    networks_files = networks_files.split(',')
+    networks_files = [x.strip() for x in networks_files.split(',')]
+
+
     networks = {}
 
     for i, networks_file in enumerate(networks_files):

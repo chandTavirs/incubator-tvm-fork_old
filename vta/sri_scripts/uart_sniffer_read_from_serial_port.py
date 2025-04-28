@@ -46,7 +46,7 @@ port = '/dev/ttyUSB3'
 baud = 921600
 
 reset_serial_port(port=port, baud=baud)
-send_sampling_rate(port=port, baud=baud, sampling_rate=35000)
+send_sampling_rate(port=port, baud=baud, sampling_rate=50000)
 # send_sampling_rate(port=port, baud=baud, sampling_rate=125000)
 
 serial_read_process = multiprocessing.Process(target=poll_serial_port, args=(port, baud))
@@ -62,7 +62,7 @@ print("Exiting polling process...")
 
 
 
-serial_read_process.join(10)
+serial_read_process.join(20)
 
 
 # reset_serial_port(port,baud)

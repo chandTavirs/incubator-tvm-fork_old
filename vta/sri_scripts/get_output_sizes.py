@@ -18,6 +18,11 @@ def calc_conv_output_size(wkl):
 
     return out_height, out_width, out_height*out_width*wkl.out_filter
 
+def calc_conv_input_size(oheight, owidth, hkernel, wkernel, hstride, wstride, hpad, wpad):
+    in_height = (oheight - 1) * hstride - 2 * hpad + hkernel + (hstride - 1)
+    in_width = (owidth - 1) * wstride - 2 * wpad + wkernel + (wstride - 1)
+
+    return in_height, in_width
 
 def calc_maxpool_output_size(wkl, pool_cfg):
     in_height, in_width, _ = calc_conv_output_size(wkl)

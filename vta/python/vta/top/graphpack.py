@@ -444,8 +444,8 @@ class ExprPack(ExprMutator):
                     return _unpack_batch_channel(data, data_shape, self.blockout, self.typetrack)
                 return data
         if self.start_pack:
-            if odtype == 'float32':
-                pseudo_break=True
+            # if odtype == 'float32':
+            #     pseudo_break=True
             # Operator cases
             if call.op == self.conv2d and odtype == "int32":
                 self.number_of_conv2d += 1
@@ -729,7 +729,6 @@ class ExprPack(ExprMutator):
             # elif call.op.name == "concatenate":
             #     concat = True
             elif call.op == self.strided_slice:
-                strided_slice = True
                 # print input shape
                 # data = args[0]
                 # data_shape = _get_tensor_shape(data)
