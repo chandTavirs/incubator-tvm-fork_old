@@ -339,100 +339,103 @@ def run_and_collect(env, remote, network_id, network, target, log_file_path, sam
     shape_list = [(input_name, input_shape)]
 
     mod, params = relay.frontend.from_pytorch(scripted_model, shape_list)
+    try:
+        if target.device_name == "vta":
+            # Perform quantization in Relay
+            # Note: We set opt_level to 3 in order to fold batch norm
+            with tvm.transform.PassContext(opt_level=3):
+                with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0]):
+                    mod = relay.quantize.quantize(mod, params=params)
 
-    if target.device_name == "vta":
-        # Perform quantization in Relay
-        # Note: We set opt_level to 3 in order to fold batch norm
-        with tvm.transform.PassContext(opt_level=3):
-            with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0]):
-                mod = relay.quantize.quantize(mod, params=params)
+                    # print(mod.astext(show_meta_data=False))
+                    # exit(0)
 
-                # print(mod.astext(show_meta_data=False))
-                # exit(0)
+                # Perform graph packing and constant folding for VTA target
+                # assert env.BLOCK_IN == env.BLOCK_OUT
+                # do device annotation if target is intelfocl or sim
+                relay_prog = graph_pack(
+                    mod["main"],
+                    env.BATCH,
+                    env.BLOCK_IN,
+                    env.BLOCK_OUT,
+                    env.WGT_WIDTH,
+                    start_name='cast',
+                    start_name_idx=7,
+                    stop_name='nn.adaptive_avg_pool2d',
+                    device_annot=(env.TARGET == "intelfocl"),
+                )
+        else:
+            relay_prog = mod["main"]
 
-            # Perform graph packing and constant folding for VTA target
-            # assert env.BLOCK_IN == env.BLOCK_OUT
-            # do device annotation if target is intelfocl or sim
-            relay_prog = graph_pack(
-                mod["main"],
-                env.BATCH,
-                env.BLOCK_IN,
-                env.BLOCK_OUT,
-                env.WGT_WIDTH,
-                start_name='cast',
-                start_name_idx=7,
-                stop_name='nn.adaptive_avg_pool2d',
-                device_annot=(env.TARGET == "intelfocl"),
+        with vta.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
+            graph, lib, params = relay.build(
+                relay_prog, target=target, params=params, target_host=env.target_host
             )
-    else:
-        relay_prog = mod["main"]
 
-    with vta.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
-        graph, lib, params = relay.build(
-            relay_prog, target=target, params=params, target_host=env.target_host
-        )
+        temp = utils.tempdir()
+        lib.export_library(temp.relpath("graphlib_network_{}.tar".format(network_id)))
+        remote.upload(temp.relpath("graphlib_network_{}.tar".format(network_id)))
+        lib = remote.load_module("graphlib_network_{}.tar".format(network_id))
 
-    temp = utils.tempdir()
-    lib.export_library(temp.relpath("graphlib_network_{}.tar".format(network_id)))
-    remote.upload(temp.relpath("graphlib_network_{}.tar".format(network_id)))
-    lib = remote.load_module("graphlib_network_{}.tar".format(network_id))
+        ctx = remote.ext_dev(0)
+        m = graph_runtime.create(graph, lib, ctx)
 
-    ctx = remote.ext_dev(0)
-    m = graph_runtime.create(graph, lib, ctx)
+        result_dict = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, "total_samples": 0}
 
-    result_dict = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, "total_samples": 0}
+        # with open("/home/srchand/Desktop/research/TVM/tvm/vta/sri_trial/logs/conv_profiling_results.txt", 'a') as myfile:
+        # myfile.write("\n")
+        # myfile.write(str(wl))
+        m.set_input(**params)
+        m.set_input(input_name, input_data)
 
-    # with open("/home/srchand/Desktop/research/TVM/tvm/vta/sri_trial/logs/conv_profiling_results.txt", 'a') as myfile:
-    # myfile.write("\n")
-    # myfile.write(str(wl))
-    m.set_input(**params)
-    m.set_input(input_name, input_data)
+        results_list = []
+        for i in range(samples):
+            print("Sample measurement #{}".format(i))
+            total_samples = 0
+            result_dict = {"multi_exec": [], "single_exec": []}
 
-    results_list = []
-    for i in range(samples):
-        print("Sample measurement #{}".format(i))
-        total_samples = 0
-        result_dict = {"multi_exec": [], "single_exec": []}
+            reset_serial_port(port=port, baud=baud)
 
-        reset_serial_port(port=port, baud=baud)
+            if i == 0 and network_id == 0:
+                print('SETTING SAMPLING RATE!!')
+                send_sampling_rate(port=port, baud=baud, sampling_rate=ht_sampling_rate)
 
-        if i == 0 and network_id == 0:
-            print('SETTING SAMPLING RATE!!')
-            send_sampling_rate(port=port, baud=baud, sampling_rate=ht_sampling_rate)
+            serial_read_process = multiprocessing.Process(target=poll_serial_port, args=(port, baud,
+                                                                                         os.path.join(sca_log_dir,
+                                                                                                      'network_{}_sample{}.log'
+                                                                                                      .format(network_id,
+                                                                                                              i))))
 
-        serial_read_process = multiprocessing.Process(target=poll_serial_port, args=(port, baud,
-                                                                                     os.path.join(sca_log_dir,
-                                                                                                  'network_{}_sample{}.log'
-                                                                                                  .format(network_id,
-                                                                                                          i))))
+            serial_read_process.start()
+            time.sleep(5)
 
-        serial_read_process.start()
-        time.sleep(5)
+            print("starting polling subprocess for single exec")
 
-        print("starting polling subprocess for single exec")
+            m.run()
 
-        m.run()
+            time.sleep(5)
+            print("Exiting polling process...")
 
-        time.sleep(5)
-        print("Exiting polling process...")
+            serial_read_process.join(10)
+            if serial_read_process.is_alive():
+                serial_read_process.terminate()
+                empty_networks.append("network_{}".format(network_id))
 
-        serial_read_process.join(10)
-        if serial_read_process.is_alive():
-            serial_read_process.terminate()
-            empty_networks.append("network_{}".format(network_id))
+            reset_serial_port(port=port, baud=baud)
 
-        reset_serial_port(port=port, baud=baud)
+            # results_list.append(result_dict)
 
-        # results_list.append(result_dict)
-
-        results_list.append(result_dict)
-    print("Ran network_{} successfully!!".format(network_id))
-    with open(log_file_path, 'r+') as myfile:
-        file_data = json.load(myfile)
-        file_data["results"] = results_list
-        file_data["layer_sequence"] = layer_seq
-        myfile.seek(0)
-        json.dump(file_data, myfile, indent=4)
+            results_list.append(result_dict)
+        print("Ran network_{} successfully!!".format(network_id))
+        with open(log_file_path, 'r+') as myfile:
+            file_data = json.load(myfile)
+            file_data["results"] = results_list
+            file_data["layer_sequence"] = layer_seq
+            myfile.seek(0)
+            json.dump(file_data, myfile, indent=4)
+    except Exception as e:
+        print("Error running network_{}...".format(network_id), e)
+        empty_networks.append("network_{}".format(network_id))
 
 
 def connect_and_run(device, networks, log_file_dir="profiling_results/random_graphs/", host_ip='192.168.2.99',
@@ -484,7 +487,7 @@ if __name__ == "__main__":
     #                     help='output log file path')
     parser.add_argument('--host_ip', type=str, default='10.42.0.188',
                         help='pynq board IP')
-    parser.add_argument('--num_graphs', type=int, default=200,
+    parser.add_argument('--num_graphs', type=int, default=400,
                         help='number of random graphs to generate')
     parser.add_argument('--min_depth', type=int, default=2,
                         help='minimum depth of network')
@@ -519,20 +522,20 @@ if __name__ == "__main__":
     parser.add_argument('--wkl_list', type=str, default='all',
                         help='wkl list to pick convolutions from. Options - pre, man, incep, all, working')
     parser.add_argument("--log_file_dir", type=str,
-                        default='profiling_results/uart_sniffer/asp_dac/rcg/1x16x16_35k_dconv2d/',
+                        default='profiling_results/uart_sniffer/neurob/rcg/1x16x16_50k_set3/',
                         help="path to json file to store profiling data")
     parser.add_argument("--sca_log_dir", type=str,
-                        default='uart_sniffer_data/asp_dac/rcg/1x16x16_35k_dconv2d/',
+                        default='uart_sniffer_data/neurob/rcg/1x16x16_50k_set3/',
                         help="path to json file to store profiling data")
-    parser.add_argument('--samples', type=int, default=5,
+    parser.add_argument('--samples', type=int, default=3,
                         help='number of times to run each network')
-    parser.add_argument('--data_file_prefix', type=str, default="axi_uart_sniffer_asp_dac_1x16x16_35k_dconv2d",
+    parser.add_argument('--data_file_prefix', type=str, default="neurob_uart_sniffer_1x16x16_50k_set3",
                         help='prefix of conv uart data files')
     parser.add_argument('--serial_port', type=str, default="/dev/ttyUSB3",
                         help='serial port name')
     parser.add_argument('--baud', type=int, default=921600,
                         help='serial port baud rate')
-    parser.add_argument('--ht_sampling_rate', type=int, default=100000,
+    parser.add_argument('--ht_sampling_rate', type=int, default=50000,
                         help='hardware trojan sampling rate')
     parser.add_argument('--schedule_log_files_path', type=str, default='logs/tuning_logs/vta_1x16x16/*.log',
                         help='path to schedule log files')
