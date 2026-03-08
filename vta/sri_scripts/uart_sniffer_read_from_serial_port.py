@@ -62,7 +62,7 @@ print("Exiting polling process...")
 
 
 
-serial_read_process.join(20)
+serial_read_process.join(60)
 
 
 # reset_serial_port(port,baud)

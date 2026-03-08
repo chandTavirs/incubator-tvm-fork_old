@@ -100,8 +100,8 @@ TensorType ConcreteBroadcast(const TensorType& t1, const TensorType& t2, DataTyp
 bool BroadcastRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                   const TypeReporter& reporter) {
   ICHECK_EQ(types.size(), 3);
-  // DLOG(INFO) << "In1:" << types[0] << ",In2:" << types[1]
-  //                 << ",Out:" << types[2] << std::endl;
+  DLOG(INFO) << "BroadcastRel - In1:" << types[0] << ",In2:" << types[1]
+                  << ",Out:" << types[2] << std::endl;
   if (auto* t0 = types[0].as<TensorTypeNode>()) {
     if (auto* t1 = types[1].as<TensorTypeNode>()) {
       if (t0->dtype != t1->dtype) {
@@ -109,8 +109,15 @@ bool BroadcastRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                                     << "data types " << t0->dtype << " and " << t1->dtype
                                     << "do not match in BroadcastRel");
       }
-      reporter->Assign(
-          types[2], ConcreteBroadcast(GetRef<TensorType>(t0), GetRef<TensorType>(t1), t0->dtype));
+      try {
+        reporter->Assign(
+            types[2], ConcreteBroadcast(GetRef<TensorType>(t0), GetRef<TensorType>(t1), t0->dtype));
+      } catch (const Error& e) {
+        LOG(ERROR) << "Broadcast error: " << e.what();
+        LOG(ERROR) << "Input 1 shape: " << GetRef<TensorType>(t0);
+        LOG(ERROR) << "Input 2 shape: " << GetRef<TensorType>(t1);
+        throw;
+      }
       return true;
     }
   }

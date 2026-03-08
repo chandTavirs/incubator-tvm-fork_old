@@ -1,0 +1,191 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                 VTA CANDIDATE SET BENCHMARKING - QUICK START                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+✅ STATUS: SCRIPTS READY (DO NOT RUN YET PER USER REQUEST)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📁 FILES CREATED:
+
+1. benchmark_candidate_set_chunked.py      Main benchmarking script
+2. run_benchmark_chunks.sh                 Bash wrapper for running all chunks
+3. aggregate_benchmark_results.py          Aggregates results from all chunks
+4. BENCHMARK_CANDIDATE_SET_README.md       Comprehensive documentation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚙️  CONFIGURATION:
+
+• Chunk size: 10 models per chunk
+• Timing: number=4, repeat=3 (same as execute_candidate_set_refactored.py)
+• Filtering: Same exclusion logic as extract_workloads_chunked.py
+• Device: 10.42.0.188:9091 (configurable)
+• Output: Both JSON (JSONL) and CSV formats
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 USAGE:
+
+Method 1: Run all chunks automatically
+    ./run_benchmark_chunks.sh 0 50 10
+
+Method 2: Run individual chunks
+    python benchmark_candidate_set_chunked.py --chunk_id 0 --chunk_size 10
+    python benchmark_candidate_set_chunked.py --chunk_id 1 --chunk_size 10
+    ...
+
+Method 3: Resume from specific chunk
+    ./run_benchmark_chunks.sh 15 50 10    # Resume from chunk 15
+
+After all chunks complete:
+    python aggregate_benchmark_results.py --input_dir benchmark_results
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 OUTPUT FILES:
+
+Per Chunk:
+  benchmark_results/benchmark_chunk_0.jsonl     JSONL format (like transfer_meta.jsonl)
+  benchmark_results/benchmark_chunk_0.csv       CSV format
+  benchmark_results/errors_chunk_0.log          Error details (if any failures)
+  benchmark_results/logs/chunk_0.log            Full console output
+
+Aggregated (after running aggregate_benchmark_results.py):
+  benchmark_results/benchmark_results_all.jsonl All models combined (JSONL)
+  benchmark_results/benchmark_results_all.csv   All models combined (CSV)
+  benchmark_results/benchmark_successful.jsonl  Successful only
+  benchmark_results/benchmark_failed.jsonl      Failed only
+  benchmark_results/benchmark_statistics.json   Statistics summary
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 OUTPUT FORMAT:
+
+JSONL (per line):
+{
+  "model_id": "model_123",
+  "mean_exec_time_ms": 45.23,
+  "std_exec_time_ms": 2.15,
+  "compile_time_s": 12.34,
+  "success": true
+}
+
+CSV:
+model_id,mean_exec_time_ms,std_exec_time_ms,compile_time_s,success,error
+model_123,45.2300,2.1500,12.34,True,
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏱️  PERFORMANCE ESTIMATES:
+
+Per Model:
+  • Compile: 8-18 seconds
+  • Upload: 1-2 seconds
+  • Benchmark: 5-10 seconds
+  • Total: ~15-30 seconds
+
+Per Chunk (10 models):
+  • Average: 3-5 minutes
+
+Full Run (500 models, 50 chunks):
+  • Total time: 2.5-4 hours
+  • Compile: ~1.5-2 hours
+  • Benchmark: ~1 hour
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 KEY FEATURES:
+
+✅ Chunked processing (10 models/chunk)
+✅ Resume from any chunk (--chunk_id)
+✅ Same filtering as extract_workloads_chunked.py
+✅ Uses execute_candidate_set_refactored.py functions
+✅ Precise timing (number=4, repeat=3)
+✅ Dual output (JSONL + CSV)
+✅ Per-chunk error logging
+✅ Automatic progress saving
+✅ Statistics generation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 WHAT IT DOES:
+
+For each model in arch_config:
+  1. Filter out unsupported patterns (same as extract_workloads_chunked.py)
+  2. Load model from OFA checkpoint
+  3. Convert PyTorch → Relay
+  4. Quantize and graph pack for VTA
+  5. Compile with schedule logs
+  6. Upload to VTA device
+  7. Create runtime and load parameters
+  8. Run timer() with number=4, repeat=3
+  9. Calculate mean and std execution time
+  10. Save results to JSONL and CSV
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 EXAMPLE COMMANDS:
+
+# Test single chunk first
+python benchmark_candidate_set_chunked.py --chunk_id 0 --chunk_size 10
+
+# Run chunk range
+./run_benchmark_chunks.sh 0 10 10  # Chunks 0-9
+
+# Resume from chunk 5
+./run_benchmark_chunks.sh 5 50 10
+
+# Custom device
+python benchmark_candidate_set_chunked.py \
+    --chunk_id 0 \
+    --device_host 192.168.1.100 \
+    --device_port 9090
+
+# Aggregate when done
+python aggregate_benchmark_results.py --input_dir benchmark_results
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 COMPARISON:
+
+┌────────────────────────┬──────────────────────┬────────────────────────┐
+│ Feature                │ extract_workloads... │ benchmark_candidate... │
+├────────────────────────┼──────────────────────┼────────────────────────┤
+│ Purpose                │ Extract workloads    │ Measure exec time      │
+│ Execution              │ PyTorch only         │ Full VTA execution     │
+│ Output                 │ Workload specs       │ Timing (mean/std)      │
+│ Per model time         │ <1 second            │ ~20 seconds            │
+│ Model filtering        │ Yes                  │ Yes (same logic)       │
+│ Chunking               │ Yes                  │ Yes                    │
+│ Resume capability      │ Yes                  │ Yes                    │
+│ Error handling         │ Yes                  │ Yes                    │
+└────────────────────────┴──────────────────────┴────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 TIPS:
+
+• Test with chunk_id=0 first to verify everything works
+• Monitor progress: tail -f benchmark_results/logs/chunk_X.log
+• If chunk fails, check: benchmark_results/errors_chunk_X.log
+• Reduce chunk_size to 5 if memory issues occur
+• Can run multiple non-overlapping chunks in parallel (different chunk_ids)
+• Aggregation is idempotent (can run multiple times)
+• Results saved after each model (no loss on failure)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📚 DOCUMENTATION:
+
+Full details: BENCHMARK_CANDIDATE_SET_README.md
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ READY TO USE WHEN YOU ARE!
+
+Note: Scripts created but not executed per user request.
+      User is currently running something else.
+
+Created: March 1, 2026
+

@@ -740,9 +740,23 @@ class ExprPack(ExprMutator):
                     data = _pack_batch_channel(data, input_types[0].shape,
                                                self.bfactor, self.blockout, self.typetrack)
 
+                # Original indices in NCHW format
+                orig_begin = call.attrs.begin
+                orig_end = call.attrs.end
 
-                begin = [call.attrs.begin[0] // self.bfactor, call.attrs.begin[1] // self.blockout, call.attrs.begin[2], call.attrs.begin[3], 0, 0]
-                end = [call.attrs.end[0] // self.bfactor, call.attrs.end[1] // self.blockout, call.attrs.end[2], call.attrs.end[3], self.bfactor, self.blockout]
+                # Packed format is [N//bfactor, C//block, H, W, bfactor, block]
+                # Calculate the block indices for begin and end
+                begin_batch_block = orig_begin[0] // self.bfactor
+                begin_channel_block = orig_begin[1] // self.blockout
+
+                # For end indices, we need to use ceiling division to capture partial blocks
+                # If end is 16 and blockout is 16, we want 1 block (indices 0 to 1)
+                # If end is 17 and blockout is 16, we want 2 blocks (indices 0 to 2) to capture channels 0-16
+                end_batch_block = (orig_end[0] + self.bfactor - 1) // self.bfactor
+                end_channel_block = (orig_end[1] + self.blockout - 1) // self.blockout
+
+                begin = [begin_batch_block, begin_channel_block, orig_begin[2], orig_begin[3], 0, 0]
+                end = [end_batch_block, end_channel_block, orig_end[2], orig_end[3], self.bfactor, self.blockout]
                 strides = [1, 1, 1, 1, 1, 1]
 
                 # end = [0] * 6

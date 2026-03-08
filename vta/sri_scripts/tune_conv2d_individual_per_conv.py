@@ -20,6 +20,7 @@ import torch
 from vta.top import graph_pack
 from Wkls import ALL_TUNED_WKLS as pynq_wkls
 from Wkls import MOBILENET_V2 as mnet_wkls
+from Wkls import candidate_set_wkls, candidate_set_extra, candidate_set_all
 Workload = namedtuple(
     "Conv2DWorkload",
     [
@@ -180,7 +181,7 @@ def construct_tasks(env, wl, task_name='conv2d_packed.vta'):
     return extracted_tasks[0]
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='AXI Performance Monitor Convolution Benchmark')
+    parser = argparse.ArgumentParser(description='Convolution Workload Tuner')
     parser.add_argument('--model', type=str, default="mobilenet_v2",
                         help='output log file path')
 
@@ -195,14 +196,22 @@ if __name__ == "__main__":
         wkls_to_tune = mnet_wkls
     elif args.model == "all_wkls":
         wkls_to_tune = pynq_wkls
+    elif args.model == "candidate_set":
+        wkls_to_tune = candidate_set_wkls
+    elif args.model == "candidate_set_extra":
+        wkls_to_tune = candidate_set_extra
+    elif args.model == "candidate_set_all":
+        wkls_to_tune = candidate_set_all
     else:
-        wkls_to_tune = pynq_wkls
+        # exit
+        print(f"Invalid model name: {args.model}")
+        exit(1)
 
     for wkl_name, wl in wkls_to_tune:
         #tasks.append(construct_tasks(env, wl))
 
         device = "vta"
-        log_file = "logs/tuning_logs/vta_1x8x32/%s.%s.%s.log" % (device, args.model, wkl_name)
+        log_file = "logs/tuning_logs/vta_1x16x16/candidate_set/%s.%s.%s.log" % (device, args.model, wkl_name)
         tuning_option = {
             "log_filename": log_file,
             "tuner": "random",
