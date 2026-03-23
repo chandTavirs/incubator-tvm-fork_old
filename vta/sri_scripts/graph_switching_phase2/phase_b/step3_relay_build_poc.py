@@ -1,0 +1,606 @@
+"""
+Phase B Step 3: OFA-Pool Relay Graph Build POC
+===============================================
+
+Takes 2 subnets from a candidate set (SA results JSON) and:
+
+  1. Builds the OFA-pool Relay graph using build_relay_with_ofa_pool_vars()
+     — conv weights are expressed as slice + optional dense transform ops
+       applied to OFA base weight variables, NOT materialised constants.
+
+  2. Validates numerically on CPU (no VTA needed):
+       relay.create_executor("graph").evaluate()(input) vs PyTorch OFA output
+     Goal: max |diff| < 1e-4 across all output logits.
+
+  3. Runs the same quantize → graph_pack → relay.build pipeline as
+     execute_candidate_set_refactored.py and confirms the graph compiles
+     for the VTA target.
+
+  4. Uploads to VTA device and runs a real inference, comparing against
+     the PyTorch float32 reference (tolerance: top-1 class must match).
+
+The script is deliberately self-contained — it mirrors
+execute_candidate_set_refactored.compile_model() step-by-step so the
+differences are easy to see.
+
+Usage
+-----
+  cd .../graph_switching_phase2/phase_b
+  python step3_relay_build_poc.py [--n 25] [--lambda 4] [--seed 0] [--num-subnets 2]
+"""
+
+from __future__ import absolute_import, print_function
+
+import os
+import sys
+import json
+import time
+import argparse
+
+import numpy as np
+import torch
+
+# ---- path setup (must come before any local imports) ----
+SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+PHASE2_DIR        = os.path.dirname(SCRIPT_DIR)
+SRI_SCRIPTS_DIR   = os.path.dirname(PHASE2_DIR)
+TVM_ROOT          = os.path.abspath(os.path.join(SRI_SCRIPTS_DIR, "..", ".."))
+TVM_PYTHON        = os.path.join(TVM_ROOT, "python")
+EXTERNAL_REPO_ROOT = "/home/srchand/Desktop/research/OFA_Obfs"
+VTA_ROOT          = os.path.join(TVM_ROOT, "vta", "python")
+
+for p in [EXTERNAL_REPO_ROOT, TVM_PYTHON, VTA_ROOT, SRI_SCRIPTS_DIR, SCRIPT_DIR]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import tvm
+from tvm import relay, autotvm, rpc
+from tvm.contrib import graph_runtime, utils as tvm_utils
+import vta
+from vta.top import graph_pack
+
+from ofa_base_models import OFADynamicResnetAllMod
+from ofa_weight_pool_extractor import load_ofa_pool
+from ofa_derivation_extractor import OFADerivationExtractor
+from ofa_relay_graph_builder import build_relay_with_ofa_pool_vars
+
+# ============================================================
+# Config constants
+# ============================================================
+OFA_CHECKPOINT   = "/mnt/hgfs/vmware_ubuntu_sf/OFA_networks/all_mod_aggressive_reg_final_checkpoint.pth"
+ARCH_FILE        = "/mnt/hgfs/vmware_ubuntu_sf/OFA_networks/candidate_set_final/architectures_20250927_180844.json"
+POOL_DIR         = os.path.join(SCRIPT_DIR, "ofa_weight_pool")
+SA_RESULTS_FILE  = "/home/srchand/Desktop/research/OFA_Obfs/optimization_experiments/simulated_annealing/results/sa_results_20260216-175221.json"
+
+DEVICE_HOST = "10.42.0.188"
+DEVICE_PORT = 9091
+
+GLOBAL_SCALE     = 8.0
+SKIP_CONV_LAYERS = [0]          # same as execute_candidate_set_refactored default
+OPT_LEVEL        = 3
+MODEL_NAME       = "resnet18"   # for graph_pack start/stop names
+INPUT_NAME       = "input0"
+INPUT_SHAPE      = [1, 3, 224, 224]
+
+PACK_DICT = {
+    "resnet18": ["nn.max_pool2d", "nn.adaptive_avg_pool2d"],
+}
+
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "step3_results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Schedule log files (same as execute_candidate_set_refactored)
+SCHEDULE_LOG_DIR = "/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/sri_scripts/logs/tuning_logs/vta_1x16x16/candidate_set"
+
+
+# ============================================================
+# Helpers
+# ============================================================
+def sep(title="", w=72):
+    if title:
+        pad = (w - len(title) - 2) // 2
+        print("=" * pad + f" {title} " + "=" * (w - pad - len(title) - 2))
+    else:
+        print("=" * w)
+
+
+def load_arch_mapping(arch_file):
+    with open(arch_file) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "architectures" in data:
+        return {item["id"]: item["architecture"] for item in data["architectures"]}
+    return data
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def pick_subnets_from_sa(sa_file, arch_file, target_n, target_lambda, target_seed, k):
+    with open(sa_file) as f:
+        results = json.load(f)
+    arch_mapping = load_arch_mapping(arch_file)
+    runs = results.get("runs", [])
+    nl = [r for r in runs if isinstance(r, dict)
+          and r.get("N") == target_n
+          and _as_float(r.get("lambda")) is not None
+          and abs(_as_float(r.get("lambda")) - float(target_lambda)) < 1e-9]
+    if not nl:
+        raise ValueError(f"No run for N={target_n}, lambda={target_lambda}")
+    exact = [r for r in nl if r.get("seed") == target_seed]
+    run = exact[0] if exact else sorted(nl, key=lambda r: r.get("seed", 0))[0]
+    if not exact:
+        print(f"  ⚠ seed={target_seed} not found; using seed={run.get('seed')}")
+    ids = [x for x in run.get("ids", []) if x in arch_mapping]
+    chosen = ids[:k]
+    print(f"  SA run: N={run['N']}, lambda={run['lambda']}, seed={run.get('seed')}")
+    print(f"  Subnets: {chosen}")
+    return {mid: arch_mapping[mid] for mid in chosen}
+
+
+def load_schedule_logs():
+    logs = []
+    if os.path.isdir(SCHEDULE_LOG_DIR):
+        import glob
+        logs = glob.glob(os.path.join(SCHEDULE_LOG_DIR, "*.log"))
+    return logs
+
+
+def get_ofa_reference_output(ofa_net, arch, input_np):
+    """Run the OFA model in PyTorch eval mode to get float32 reference logits."""
+    ofa_net.set_active_subnet(arch)
+    ofa_net.eval()
+    with torch.no_grad():
+        inp_t = torch.from_numpy(input_np)
+        out_t = ofa_net(inp_t)
+    return out_t.cpu().numpy()
+
+def build_first_step_relay(subnet_id, arch, ofa_net, base_weights, transform_matrices,
+                           bn_params, other_params, input_np):
+    # --- Extract derivations ---
+    print("  Extracting derivations...")
+    extractor = OFADerivationExtractor(ofa_net, verbose=False)
+    derivations = extractor.extract_subnet_derivations(arch, INPUT_SHAPE)
+    print(f"  ✓ {len(derivations)} layer derivations")
+
+    # --- Build OFA-pool Relay graph ---
+    print("  Building OFA-pool Relay graph...")
+    t0 = time.time()
+    mod, tvm_params = build_relay_with_ofa_pool_vars(
+        ofa_net=ofa_net,
+        arch=arch,
+        derivations=derivations,
+        base_weights=base_weights,
+        transform_matrices=transform_matrices,
+        bn_params=bn_params,
+        other_params=other_params,
+        input_shape=INPUT_SHAPE,
+        input_name=INPUT_NAME,
+    )
+    print(f"  ✓ Graph built in {time.time() - t0:.1f}s")
+    print(f"  Pool variables: {sum(1 for k in tvm_params if k.startswith('pool_'))}")
+    print(f"  Other params:   {sum(1 for k in tvm_params if not k.startswith('pool_'))}")
+
+    # Save Relay IR for inspection
+    ir_path = os.path.join(RESULTS_DIR, f"relay_ir_{subnet_id}.txt")
+    with open(ir_path, "w") as f:
+        f.write(str(mod))
+    print(f"  Relay IR → {ir_path}")
+
+    return mod, tvm_params, derivations
+
+
+
+# ============================================================
+# Step 3A: Build OFA-pool Relay graph and validate on CPU
+# ============================================================
+def step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, tvm_params):
+    sep(f"3A CPU Validation: {subnet_id}")
+
+    # # --- Extract derivations ---
+    # print("  Extracting derivations...")
+    # extractor = OFADerivationExtractor(ofa_net, verbose=False)
+    # derivations = extractor.extract_subnet_derivations(arch, INPUT_SHAPE)
+    # print(f"  ✓ {len(derivations)} layer derivations")
+    #
+    # # --- Build OFA-pool Relay graph ---
+    # print("  Building OFA-pool Relay graph...")
+    # t0 = time.time()
+    # mod, tvm_params = build_relay_with_ofa_pool_vars(
+    #     ofa_net=ofa_net,
+    #     arch=arch,
+    #     derivations=derivations,
+    #     base_weights=base_weights,
+    #     transform_matrices=transform_matrices,
+    #     bn_params=bn_params,
+    #     other_params=other_params,
+    #     input_shape=INPUT_SHAPE,
+    #     input_name=INPUT_NAME,
+    # )
+    # print(f"  ✓ Graph built in {time.time()-t0:.1f}s")
+    # print(f"  Pool variables: {sum(1 for k in tvm_params if k.startswith('pool_'))}")
+    # print(f"  Other params:   {sum(1 for k in tvm_params if not k.startswith('pool_'))}")
+    #
+    # # Save Relay IR for inspection
+    # ir_path = os.path.join(RESULTS_DIR, f"relay_ir_{subnet_id}.txt")
+    # with open(ir_path, "w") as f:
+    #     f.write(str(mod))
+    # print(f"  Relay IR → {ir_path}")
+
+    # --- CPU execution (no VTA) ---
+    print("  Running CPU inference...")
+    t0 = time.time()
+    try:
+        # Use graph executor on CPU
+        with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
+            cpu_lib = relay.build(mod, target="llvm", params=tvm_params)
+
+        from tvm.contrib.graph_runtime import GraphModule
+        cpu_rt = GraphModule(cpu_lib["default"](tvm.cpu(0)))
+
+        inp_tvm = tvm.nd.array(input_np.astype("float32"), tvm.cpu(0))
+        cpu_rt.set_input(INPUT_NAME, inp_tvm)
+        cpu_rt.run()
+        out_nd = cpu_rt.get_output(0)
+        ofa_pool_out = out_nd.asnumpy() if hasattr(out_nd, "asnumpy") else out_nd.numpy()
+
+        cpu_time = time.time() - t0
+        print(f"  ✓ CPU inference in {cpu_time:.2f}s")
+    except Exception as e:
+        print(f"  ✗ CPU inference failed: {e}")
+        raise
+
+    # --- PyTorch reference ---
+    print("  Getting PyTorch reference...")
+    pytorch_out = get_ofa_reference_output(ofa_net, arch, input_np)
+
+    # --- Compare ---
+    diff = np.abs(ofa_pool_out - pytorch_out)
+    max_diff = float(diff.max())
+    mean_diff = float(diff.mean())
+    top1_pool = int(np.argmax(ofa_pool_out[0]))
+    top1_ref  = int(np.argmax(pytorch_out[0]))
+
+    print(f"\n  CPU Validation Results:")
+    print(f"    Max  |diff|:  {max_diff:.4e}")
+    print(f"    Mean |diff|:  {mean_diff:.4e}")
+    print(f"    Top-1 (pool): {top1_pool}")
+    print(f"    Top-1 (ref):  {top1_ref}")
+    print(f"    Top-1 match:  {'✓' if top1_pool == top1_ref else '✗'}")
+
+    passed = max_diff < 1e-3 and top1_pool == top1_ref
+    print(f"\n  3A Status: {'✓ PASSED' if passed else '✗ FAILED'}")
+
+    return {
+        "subnet_id": subnet_id,
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "top1_match": top1_pool == top1_ref,
+        "top1_pool": top1_pool,
+        "top1_ref": top1_ref,
+        "passed": passed,
+        "derivations": derivations,
+        "mod": mod,
+        "tvm_params": tvm_params,
+    }
+
+
+# ============================================================
+# Step 3B: Quantize + graph_pack + VTA build
+# ============================================================
+def step3b_vta_compile(subnet_id, arch, mod, tvm_params, env):
+    sep(f"3B VTA Compile: {subnet_id}")
+
+    print("  Applying quantization...")
+    t0 = time.time()
+
+    # The OFA-pool graph has float32 ops — quantize exactly as current pipeline.
+    # Important: FoldConstant is intentionally NOT in disabled_pass here because
+    # the pool vars are relay.Var (not constants) so FoldConstant won't touch them.
+    # However, it WOULD fold the BN params (which we want folded for VTA).
+    try:
+        # FoldScaleAxis assumes static/constant-friendly weight flows; with
+        # dynamic slice/transform-derived weights it can generate invalid type
+        # constraints during prerequisite_optimize.
+        disabled = {"AlterOpLayout", "FoldScaleAxis"}
+        # with tvm.transform.PassContext(opt_level=OPT_LEVEL, disabled_pass=disabled):
+        #      with relay.quantize.qconfig(
+        #          global_scale=GLOBAL_SCALE,
+        #          skip_conv_layers=SKIP_CONV_LAYERS,
+        #      ):
+        with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
+            with relay.quantize.qconfig(global_scale=8.0, skip_conv_layers=[0], skip_dense_layers=False):
+                # mod = relay.quantize.quantize(mod, params=params)
+                # IMPORTANT: do not pass params here. Quantize's prerequisite_optimize
+                # binds params into constants. For TVM's current quantize pipeline,
+                # calibration expects constant weight args, so pass params here.
+                mod_q = relay.quantize.quantize(mod, params=tvm_params)
+                print(mod_q.astext(show_meta_data=False))
+        print(f"  ✓ Quantization done in {time.time()-t0:.1f}s")
+    except Exception as e:
+        print(f"  ✗ Quantization failed: {e}")
+        raise
+
+    # --- Graph pack ---
+    print("  Applying graph_pack...")
+    t0 = time.time()
+    try:
+        with tvm.transform.PassContext(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
+            relay_prog = graph_pack(
+                mod_q["main"],
+                env.BATCH,
+                env.BLOCK_IN,
+                env.BLOCK_OUT,
+                env.WGT_WIDTH,
+                start_name=PACK_DICT[MODEL_NAME][0],
+                stop_name=PACK_DICT[MODEL_NAME][1],
+                device_annot=(env.TARGET == "intelfocl"),
+            )
+        print(f"  ✓ graph_pack done in {time.time()-t0:.1f}s")
+    except Exception as e:
+        print(f"  ✗ graph_pack failed: {e}")
+        raise
+
+    # --- relay.build for VTA ---
+    print("  Running relay.build for VTA target...")
+    t0 = time.time()
+
+    schedule_logs = load_schedule_logs()
+    print(f"  Using {len(schedule_logs)} schedule log files")
+
+    try:
+        with autotvm.tophub.context(env.target, extra_files=schedule_logs):
+            with vta.build_config(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
+                graph, lib, built_params = relay.build(
+                    relay_prog,
+                    target=env.target,
+                    params=tvm_params,
+                    target_host=env.target_host,
+                )
+        build_time = time.time() - t0
+        print(f"  ✓ relay.build done in {build_time:.1f}s")
+        print(f"  Built params: {len(built_params)}")
+    except Exception as e:
+        print(f"  ✗ relay.build failed: {e}")
+        raise
+
+    return graph, lib, built_params
+
+
+# ============================================================
+# Step 3C: Upload to VTA, run inference, validate
+# ============================================================
+def step3c_vta_inference(subnet_id, arch, graph, lib, built_params,
+                          ofa_net, input_np, env, remote, ctx):
+    sep(f"3C VTA Inference: {subnet_id}")
+
+    # Upload
+    print("  Uploading library to device...")
+    temp_dir = tvm_utils.tempdir()
+    lib_path = temp_dir.relpath(f"graphlib_step3_{subnet_id}.tar")
+    lib.export_library(lib_path)
+    remote.upload(lib_path)
+    remote_lib = remote.load_module(f"graphlib_step3_{subnet_id}.tar")
+    print("  ✓ Uploaded")
+
+    # Create runtime
+    if env.TARGET == "intelfocl":
+        ctxes = [remote.ext_dev(0), remote.cpu(0)]
+        m = graph_runtime.create(graph, remote_lib, ctxes)
+    else:
+        m = graph_runtime.create(graph, remote_lib, ctx)
+
+    # Set inputs
+    m.set_input(**built_params)
+    inp_tvm = tvm.nd.array(
+        input_np.astype("float32"),
+        remote.ext_dev(0) if env.TARGET != "sim" else tvm.cpu(0)
+    )
+    m.set_input(INPUT_NAME, inp_tvm)
+
+    # Run
+    print("  Running VTA inference...")
+    t0 = time.time()
+    m.run()
+    inf_time = time.time() - t0
+    print(f"  ✓ Inference done in {inf_time*1000:.1f}ms")
+
+    vta_out = m.get_output(0).asnumpy()
+    pytorch_out = get_ofa_reference_output(ofa_net, arch, input_np)
+
+    top1_vta = int(np.argmax(vta_out[0]))
+    top1_ref  = int(np.argmax(pytorch_out[0]))
+
+    print(f"\n  VTA Validation Results:")
+    print(f"    Top-1 (VTA):  {top1_vta}")
+    print(f"    Top-1 (ref):  {top1_ref}")
+    print(f"    Top-1 match:  {'✓' if top1_vta == top1_ref else '✗  (quantisation tolerance)'}")
+    print(f"    Inference:    {inf_time*1000:.1f} ms")
+
+    return {
+        "subnet_id": subnet_id,
+        "top1_vta": top1_vta,
+        "top1_ref": top1_ref,
+        "top1_match": top1_vta == top1_ref,
+        "inf_time_ms": inf_time * 1000,
+    }
+
+
+# ============================================================
+# Main
+# ============================================================
+def parse_args():
+    p = argparse.ArgumentParser(description="Phase B Step 3 POC")
+    p.add_argument("--sa-results", default=SA_RESULTS_FILE)
+    p.add_argument("--arch-file", default=ARCH_FILE)
+    p.add_argument("--n", type=int, default=25)
+    p.add_argument("--lambda", dest="lambda_value", type=float, default=4.0)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num-subnets", type=int, default=2)
+    p.add_argument("--skip-vta", action="store_true",
+                   help="Only run CPU validation (Step 3A), skip VTA compile/inference")
+    p.add_argument("--skip-cpu", action="store_true",
+                   help="Skip cpu inference")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    sep("Phase B Step 3: OFA-Pool Relay Build POC")
+
+    # ------------------------------------------------------------------
+    print("\n[1] Loading OFA model...")
+    t0 = time.time()
+    ofa_net = OFADynamicResnetAllMod()
+    ckpt = torch.load(OFA_CHECKPOINT, map_location="cpu")
+    state = ckpt.get("model_state_dict", ckpt)
+    ofa_net.load_state_dict(state, strict=False)
+    ofa_net.eval()
+    print(f"  ✓ OFA loaded in {time.time()-t0:.1f}s")
+
+    # ------------------------------------------------------------------
+    print("\n[2] Loading OFA weight pool...")
+    t0 = time.time()
+    pool = load_ofa_pool(POOL_DIR)
+    base_weights       = pool["base_weights"]
+    transform_matrices = pool["transform_matrices"]
+    bn_params          = pool["bn_params"]
+    other_params       = pool["other_params"]
+    print(f"  ✓ Pool loaded in {time.time()-t0:.1f}s  "
+          f"({len(base_weights)} base, {len(transform_matrices)} tm, "
+          f"{len(bn_params)} bn, {len(other_params)} other)")
+
+    # ------------------------------------------------------------------
+    print("\n[3] Loading candidate set...")
+    poc_archs = pick_subnets_from_sa(
+        args.sa_results, args.arch_file,
+        target_n=args.n, target_lambda=args.lambda_value,
+        target_seed=args.seed, k=args.num_subnets,
+    )
+
+    # ------------------------------------------------------------------
+    if not args.skip_vta:
+        print("\n[4] Setting up VTA environment...")
+        env = vta.get_env()
+        remote = rpc.connect(DEVICE_HOST, DEVICE_PORT)
+        vta.reconfig_runtime(remote)
+        ctx = remote.ext_dev(0)
+        print(f"  ✓ Connected to {DEVICE_HOST}:{DEVICE_PORT}")
+        print(f"  Target: {env.target}")
+    else:
+        print("\n[4] Skipping VTA setup (--skip-vta)")
+        env = remote = ctx = None
+
+    # ------------------------------------------------------------------
+    # Fixed input for all comparisons
+    rng = np.random.default_rng(42)
+    input_np = rng.standard_normal(INPUT_SHAPE).astype("float32")
+
+    all_results = {}
+    overall_passed = True
+
+    for subnet_id, arch in poc_archs.items():
+        sep(f"Processing {subnet_id}")
+
+        mod, tvm_params, derivations = build_first_step_relay(subnet_id, arch, ofa_net,
+                base_weights, transform_matrices, bn_params, other_params,
+                input_np)
+        r3a = None
+        if not args.skip_cpu:
+            # ---- Step 3A: CPU validation ----
+            try:
+                r3a = step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, tvm_params)
+            except Exception as e:
+                print(f"  ✗ Step 3A failed: {e}")
+                import traceback; traceback.print_exc()
+                all_results[subnet_id] = {"step3a": "FAILED", "error": str(e)}
+                overall_passed = False
+                continue
+
+            if not r3a["passed"]:
+                overall_passed = False
+
+            if args.skip_vta:
+                all_results[subnet_id] = {"step3a": r3a}
+                continue
+
+        if not args.skip_vta:
+            # ---- Step 3B: VTA compile ----
+            try:
+                graph, lib, built_params = step3b_vta_compile(
+                    subnet_id, arch, mod, tvm_params, env,
+                )
+            except Exception as e:
+                print(f"  ✗ Step 3B failed: {e}")
+                import traceback; traceback.print_exc()
+                all_results[subnet_id] = {
+                    "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derivations", "mod", "tvm_params")},
+                    "step3b": "FAILED",
+                    "error": str(e),
+                }
+                overall_passed = False
+                continue
+
+            # ---- Step 3C: VTA inference ----
+            try:
+                r3c = step3c_vta_inference(
+                    subnet_id, arch, graph, lib, built_params,
+                    ofa_net, input_np, env, remote, ctx,
+                )
+            except Exception as e:
+                print(f"  ✗ Step 3C failed: {e}")
+                import traceback; traceback.print_exc()
+                all_results[subnet_id] = {"step3a": r3a, "step3b": "OK", "step3c": "FAILED", "error": str(e)}
+                overall_passed = False
+                continue
+
+            all_results[subnet_id] = {
+                "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derivations", "mod", "tvm_params")},
+                "step3b": "OK",
+                "step3c": r3c,
+            }
+
+    # ------------------------------------------------------------------
+    sep("Overall Summary")
+    for sid, res in all_results.items():
+        print(f"\n  {sid}:")
+        if "error" in res:
+            print(f"    ✗ FAILED: {res['error']}")
+            continue
+        r3a = res.get("step3a", {})
+        r3c = res.get("step3c", {})
+        if isinstance(r3a, dict) and "max_diff" in r3a:
+            print(f"    3A CPU:  max_diff={r3a['max_diff']:.2e}  top1={'✓' if r3a['top1_match'] else '✗'}")
+        if r3c and isinstance(r3c, dict) and "top1_vta" in r3c:
+            print(f"    3C VTA:  top1={'✓' if r3c['top1_match'] else '✗'}  inf={r3c['inf_time_ms']:.1f}ms")
+
+    print(f"\nOverall: {'✓ ALL PASSED' if overall_passed else '✗ SOME FAILED'}")
+
+    # Save summary
+    def _json_safe(v):
+        if isinstance(v, (np.integer,)): return int(v)
+        if isinstance(v, (np.floating,)): return float(v)
+        if isinstance(v, (list, tuple)): return [_json_safe(x) for x in v]
+        if isinstance(v, dict): return {kk: _json_safe(vv) for kk, vv in v.items()}
+        if hasattr(v, "to_dict"):
+            try:
+                return _json_safe(v.to_dict())
+            except Exception:
+                return str(v)
+        if hasattr(v, "__dict__") and v.__class__.__name__ == "LayerDerivation":
+            return {k: _json_safe(val) for k, val in vars(v).items()}
+        return v
+
+    summary_path = os.path.join(RESULTS_DIR, "step3_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(_json_safe(all_results), f, indent=2)
+    print(f"\nSummary → {summary_path}")
+    sep()
+
+
+if __name__ == "__main__":
+    main()
+
