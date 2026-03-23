@@ -46,6 +46,7 @@ import torch.nn as nn
 import tvm
 from tvm import relay
 from tvm.relay import transform as relay_transform
+from tvm.relay.expr_functor import ExprVisitor, ExprMutator
 
 EXTERNAL_REPO_ROOT = "/home/srchand/Desktop/research/OFA_Obfs"
 if EXTERNAL_REPO_ROOT not in sys.path:
@@ -684,4 +685,91 @@ def _slice_nchw_channels(x: relay.Expr, c_begin: int, c_end: int, h_end: int, w_
         end=[1, c_end, h_end, w_end],
         strides=[1, 1, 1, 1],
     )
+
+
+class _ConvWeightCollector(ExprVisitor):
+    """Collect conv2d weight expressions in deterministic traversal order."""
+
+    def __init__(self):
+        super().__init__()
+        self.weights: List[relay.Expr] = []
+
+    def visit_call(self, call):
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.conv2d":
+            self.weights.append(call.args[1])
+        super().visit_call(call)
+
+
+class _ConvWeightSplitter(ExprMutator):
+    """Replace each conv2d weight with a new var and record source exprs."""
+
+    def __init__(self, derived_prefix: str):
+        super().__init__()
+        self.derived_prefix = derived_prefix
+        self.weight_var_map: Dict[int, relay.Var] = {}
+        self.weight_exprs: List[relay.Expr] = []
+        self.weight_names: List[str] = []
+
+    def visit_call(self, call):
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.conv2d":
+            new_data = self.visit(call.args[0])
+            original_w = call.args[1]
+            key = id(original_w)
+            if key not in self.weight_var_map:
+                idx = len(self.weight_exprs)
+                name = f"{self.derived_prefix}_{idx}"
+                self.weight_var_map[key] = relay.var(name, type_annotation=original_w.checked_type)
+                self.weight_exprs.append(original_w)
+                self.weight_names.append(name)
+            new_w = self.weight_var_map[key]
+            return relay.Call(call.op, [new_data, new_w], call.attrs, call.type_args, call.span)
+        return super().visit_call(call)
+
+
+def split_derivation_and_inference_modules(
+    mod: tvm.ir.IRModule,
+    tvm_params: Dict[str, tvm.nd.NDArray],
+    derived_prefix: str = "derived_w",
+) -> Tuple[
+    tvm.ir.IRModule,
+    Dict[str, tvm.nd.NDArray],
+    tvm.ir.IRModule,
+    Dict[str, tvm.nd.NDArray],
+    List[str],
+]:
+    """
+    Split the full OFA graph into:
+      - mod_deriv: outputs all conv weights derived from pool variables
+      - mod_infer: takes derived weights as explicit inputs + subnet activations
+
+    Returns
+    -------
+    mod_deriv, deriv_params, mod_infer, infer_params, derived_weight_names
+    """
+    main = mod["main"]
+
+    splitter = _ConvWeightSplitter(derived_prefix)
+    infer_body = splitter.visit(main.body)
+    weight_exprs = splitter.weight_exprs
+    weight_names = splitter.weight_names
+
+    if not weight_exprs:
+        raise RuntimeError("No nn.conv2d weight expressions found to split")
+
+    # Derivation module: outputs tuple(derived_w_0, ..., derived_w_N)
+    deriv_body = relay.Tuple(weight_exprs)
+    deriv_func = relay.Function(relay.analysis.free_vars(deriv_body), deriv_body)
+    mod_deriv = tvm.IRModule.from_expr(deriv_func)
+    mod_deriv = relay_transform.InferType()(mod_deriv)
+
+    # Inference module: conv weights become explicit input vars
+    infer_func = relay.Function(relay.analysis.free_vars(infer_body), infer_body)
+    mod_infer = tvm.IRModule.from_expr(infer_func)
+    mod_infer = relay_transform.InferType()(mod_infer)
+
+    deriv_params = {k: v for k, v in tvm_params.items() if k.startswith("pool_")}
+    infer_params = {k: v for k, v in tvm_params.items() if not k.startswith("pool_")}
+
+    return mod_deriv, deriv_params, mod_infer, infer_params, weight_names
+
 

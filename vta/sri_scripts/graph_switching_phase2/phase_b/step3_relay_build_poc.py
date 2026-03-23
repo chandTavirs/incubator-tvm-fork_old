@@ -62,7 +62,10 @@ from vta.top import graph_pack
 from ofa_base_models import OFADynamicResnetAllMod
 from ofa_weight_pool_extractor import load_ofa_pool
 from ofa_derivation_extractor import OFADerivationExtractor
-from ofa_relay_graph_builder import build_relay_with_ofa_pool_vars
+from ofa_relay_graph_builder import (
+    build_relay_with_ofa_pool_vars,
+    split_derivation_and_inference_modules,
+)
 
 # ============================================================
 # Config constants
@@ -169,7 +172,7 @@ def build_first_step_relay(subnet_id, arch, ofa_net, base_weights, transform_mat
     # --- Build OFA-pool Relay graph ---
     print("  Building OFA-pool Relay graph...")
     t0 = time.time()
-    mod, tvm_params = build_relay_with_ofa_pool_vars(
+    mod_full, tvm_params_full = build_relay_with_ofa_pool_vars(
         ofa_net=ofa_net,
         arch=arch,
         derivations=derivations,
@@ -180,24 +183,56 @@ def build_first_step_relay(subnet_id, arch, ofa_net, base_weights, transform_mat
         input_shape=INPUT_SHAPE,
         input_name=INPUT_NAME,
     )
+
+    mod_deriv, deriv_params, mod_infer, infer_params, derived_weight_names = (
+        split_derivation_and_inference_modules(mod_full, tvm_params_full)
+    )
+
     print(f"  ✓ Graph built in {time.time() - t0:.1f}s")
-    print(f"  Pool variables: {sum(1 for k in tvm_params if k.startswith('pool_'))}")
-    print(f"  Other params:   {sum(1 for k in tvm_params if not k.startswith('pool_'))}")
+    print(f"  Pool variables: {len(deriv_params)}")
+    print(f"  Other params:   {len(infer_params)}")
+    print(f"  Derived weights: {len(derived_weight_names)}")
 
     # Save Relay IR for inspection
     ir_path = os.path.join(RESULTS_DIR, f"relay_ir_{subnet_id}.txt")
     with open(ir_path, "w") as f:
-        f.write(str(mod))
+        f.write(str(mod_full))
     print(f"  Relay IR → {ir_path}")
 
-    return mod, tvm_params, derivations
+    return {
+        "derivations": derivations,
+        "mod_full": mod_full,
+        "mod_deriv": mod_deriv,
+        "mod_infer": mod_infer,
+        "tvm_params_full": tvm_params_full,
+        "deriv_params": deriv_params,
+        "infer_params": infer_params,
+        "derived_weight_names": derived_weight_names,
+    }
+
+
+def materialize_derived_weights_cpu(mod_deriv, deriv_params, derived_weight_names):
+    """Run derivation module on CPU and return {derived_w_i: NDArray} for infer runtime/build."""
+    with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
+        deriv_lib = relay.build(mod_deriv, target="llvm", params=deriv_params)
+
+    from tvm.contrib.graph_runtime import GraphModule
+    rt = GraphModule(deriv_lib["default"](tvm.cpu(0)))
+    rt.run()
+
+    derived = {}
+    for idx, name in enumerate(derived_weight_names):
+        out = rt.get_output(idx)
+        out_np = out.asnumpy() if hasattr(out, "asnumpy") else out.numpy()
+        derived[name] = tvm.nd.array(out_np, tvm.cpu(0))
+    return derived
 
 
 
 # ============================================================
 # Step 3A: Build OFA-pool Relay graph and validate on CPU
 # ============================================================
-def step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, tvm_params):
+def step3a_cpu_validation(subnet_id, arch, ofa_net, input_np, split_artifacts):
     sep(f"3A CPU Validation: {subnet_id}")
 
     # # --- Extract derivations ---
@@ -231,17 +266,27 @@ def step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, 
     # print(f"  Relay IR → {ir_path}")
 
     # --- CPU execution (no VTA) ---
-    print("  Running CPU inference...")
+    print("  Running CPU derivation + inference...")
     t0 = time.time()
     try:
-        # Use graph executor on CPU
+        derived_weight_map = materialize_derived_weights_cpu(
+            split_artifacts["mod_deriv"],
+            split_artifacts["deriv_params"],
+            split_artifacts["derived_weight_names"],
+        )
+
         with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
-            cpu_lib = relay.build(mod, target="llvm", params=tvm_params)
+            cpu_lib = relay.build(
+                split_artifacts["mod_infer"],
+                target="llvm",
+                params=split_artifacts["infer_params"],
+            )
 
         from tvm.contrib.graph_runtime import GraphModule
         cpu_rt = GraphModule(cpu_lib["default"](tvm.cpu(0)))
 
         inp_tvm = tvm.nd.array(input_np.astype("float32"), tvm.cpu(0))
+        cpu_rt.set_input(**derived_weight_map)
         cpu_rt.set_input(INPUT_NAME, inp_tvm)
         cpu_rt.run()
         out_nd = cpu_rt.get_output(0)
@@ -282,16 +327,14 @@ def step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, 
         "top1_pool": top1_pool,
         "top1_ref": top1_ref,
         "passed": passed,
-        "derivations": derivations,
-        "mod": mod,
-        "tvm_params": tvm_params,
+        "derived_weight_map": derived_weight_map,
     }
 
 
 # ============================================================
 # Step 3B: Quantize + graph_pack + VTA build
 # ============================================================
-def step3b_vta_compile(subnet_id, arch, mod, tvm_params, env):
+def step3b_vta_compile(subnet_id, arch, split_artifacts, env):
     sep(f"3B VTA Compile: {subnet_id}")
 
     print("  Applying quantization...")
@@ -302,6 +345,16 @@ def step3b_vta_compile(subnet_id, arch, mod, tvm_params, env):
     # the pool vars are relay.Var (not constants) so FoldConstant won't touch them.
     # However, it WOULD fold the BN params (which we want folded for VTA).
     try:
+        # Materialize subnet-specific derived conv weights and bind them as params
+        # for the current quantization/build flow.
+        derived_weight_map = materialize_derived_weights_cpu(
+            split_artifacts["mod_deriv"],
+            split_artifacts["deriv_params"],
+            split_artifacts["derived_weight_names"],
+        )
+        quant_params = dict(split_artifacts["infer_params"])
+        quant_params.update(derived_weight_map)
+
         # FoldScaleAxis assumes static/constant-friendly weight flows; with
         # dynamic slice/transform-derived weights it can generate invalid type
         # constraints during prerequisite_optimize.
@@ -317,7 +370,7 @@ def step3b_vta_compile(subnet_id, arch, mod, tvm_params, env):
                 # IMPORTANT: do not pass params here. Quantize's prerequisite_optimize
                 # binds params into constants. For TVM's current quantize pipeline,
                 # calibration expects constant weight args, so pass params here.
-                mod_q = relay.quantize.quantize(mod, params=tvm_params)
+                mod_q = relay.quantize.quantize(split_artifacts["mod_infer"], params=quant_params)
                 print(mod_q.astext(show_meta_data=False))
         print(f"  ✓ Quantization done in {time.time()-t0:.1f}s")
     except Exception as e:
@@ -357,7 +410,7 @@ def step3b_vta_compile(subnet_id, arch, mod, tvm_params, env):
                 graph, lib, built_params = relay.build(
                     relay_prog,
                     target=env.target,
-                    params=tvm_params,
+                    params=quant_params,
                     target_host=env.target_host,
                 )
         build_time = time.time() - t0
@@ -505,14 +558,14 @@ def main():
     for subnet_id, arch in poc_archs.items():
         sep(f"Processing {subnet_id}")
 
-        mod, tvm_params, derivations = build_first_step_relay(subnet_id, arch, ofa_net,
+        split_artifacts = build_first_step_relay(subnet_id, arch, ofa_net,
                 base_weights, transform_matrices, bn_params, other_params,
                 input_np)
         r3a = None
         if not args.skip_cpu:
             # ---- Step 3A: CPU validation ----
             try:
-                r3a = step3a_cpu_validation(subnet_id, arch, ofa_net, derivations, input_np, mod, tvm_params)
+                r3a = step3a_cpu_validation(subnet_id, arch, ofa_net, input_np, split_artifacts)
             except Exception as e:
                 print(f"  ✗ Step 3A failed: {e}")
                 import traceback; traceback.print_exc()
@@ -524,20 +577,22 @@ def main():
                 overall_passed = False
 
             if args.skip_vta:
-                all_results[subnet_id] = {"step3a": r3a}
+                all_results[subnet_id] = {
+                    "step3a": {k: v for k, v in r3a.items() if k not in ("derived_weight_map",)}
+                }
                 continue
 
         if not args.skip_vta:
             # ---- Step 3B: VTA compile ----
             try:
                 graph, lib, built_params = step3b_vta_compile(
-                    subnet_id, arch, mod, tvm_params, env,
+                    subnet_id, arch, split_artifacts, env,
                 )
             except Exception as e:
                 print(f"  ✗ Step 3B failed: {e}")
                 import traceback; traceback.print_exc()
                 all_results[subnet_id] = {
-                    "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derivations", "mod", "tvm_params")},
+                    "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derived_weight_map",)},
                     "step3b": "FAILED",
                     "error": str(e),
                 }
@@ -558,7 +613,7 @@ def main():
                 continue
 
             all_results[subnet_id] = {
-                "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derivations", "mod", "tvm_params")},
+                "step3a": {} if r3a is None else {k: v for k, v in r3a.items() if k not in ("derived_weight_map",)},
                 "step3b": "OK",
                 "step3c": r3c,
             }
