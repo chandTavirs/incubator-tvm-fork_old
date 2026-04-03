@@ -19,6 +19,7 @@
 # Modified by contributors from Intel Labs
 
 """Internal module for registering attribute for annotation."""
+import os
 import warnings
 from tvm import topi
 import tvm._ffi
@@ -147,6 +148,39 @@ def attach_simulated_quantize(data, kind, sign=True, rounding="round"):
 tvm._ffi.register_func("relay.quantize.attach_simulated_quantize", attach_simulated_quantize)
 
 
+def _dynamic_dense_conv2d_fix_enabled():
+    """Feature gate for dynamic-weight dense->conv2d annotate compatibility."""
+    return os.environ.get("TVM_QTZ_DYNAMIC_DENSE_CONV2D_FIX", "0") == "1"
+
+
+def _expr_uses_dynamic_weight_var(expr):
+    """Heuristic: derivation dense uses pool/derived weight variables."""
+    dynamic_name_fragments = ("pool_", "derived_w", "_matrix")
+    found = [False]
+
+    def _visit(e):
+        if found[0]:
+            return
+        if isinstance(e, _expr.Var):
+            name = e.name_hint or ""
+            if any(token in name for token in dynamic_name_fragments):
+                found[0] = True
+            return
+        if isinstance(e, _expr.Call):
+            for arg in e.args:
+                _visit(arg)
+            return
+        if isinstance(e, _expr.Tuple):
+            for field in e.fields:
+                _visit(field)
+            return
+        if isinstance(e, _expr.TupleGetItem):
+            _visit(e.tuple_value)
+
+    _visit(expr)
+    return found[0]
+
+
 @register_annotate_function("nn.contrib_conv2d_NCHWc")
 def conv2d_nchwc_rewrite(ref_call, new_args, ctx):
     warnings.warn(
@@ -170,7 +204,12 @@ def conv2d_rewrite(ref_call, new_args, ctx):
     if lhs_kind is None or lhs_kind == QAnnotateKind.ACTIVATION:
         lhs_expr = attach_simulated_quantize(lhs_expr, QAnnotateKind.INPUT)
 
-    assert rhs_kind is None
+    if rhs_kind is not None:
+        if not _dynamic_dense_conv2d_fix_enabled():
+            assert rhs_kind is None
+        # In dynamic-weight flows, derivation subgraphs may arrive annotated.
+        # Normalize rhs to WEIGHT to keep conv2d annotate stable.
+        rhs_kind = None
     rhs_expr = attach_simulated_quantize(rhs_expr, QAnnotateKind.WEIGHT)
 
     expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
@@ -222,6 +261,10 @@ def dense_rewrite(ref_call, new_args, ctx):
 
     expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
 
+    if _dynamic_dense_conv2d_fix_enabled() and _expr_uses_dynamic_weight_var(rhs_expr):
+        # Dense in OFA kernel-derivation path should behave like weight-producing op.
+        return QAnnotateExpr(expr, QAnnotateKind.WEIGHT)
+
     return QAnnotateExpr(expr, QAnnotateKind.ACTIVATION)
 
 
@@ -247,6 +290,28 @@ def multiply_rewrite(ref_call, new_args, ctx):
             rhs_expr = attach_simulated_quantize(rhs_expr, QAnnotateKind.INPUT)
         expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
         return QAnnotateExpr(expr, QAnnotateKind.ACTIVATION)
+
+    if _dynamic_dense_conv2d_fix_enabled():
+        # Dynamic derivation path may carry WEIGHT-kind tensors through multiply.
+        if lhs_kind == QAnnotateKind.WEIGHT and rhs_kind is None:
+            rhs_expr = attach_simulated_quantize(
+                rhs_expr,
+                QAnnotateKind.WEIGHT if _analysis.check_constant(rhs_expr) else QAnnotateKind.INPUT,
+            )
+            expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
+            return QAnnotateExpr(expr, QAnnotateKind.WEIGHT)
+
+        if rhs_kind == QAnnotateKind.WEIGHT and lhs_kind is None:
+            lhs_expr = attach_simulated_quantize(
+                lhs_expr,
+                QAnnotateKind.WEIGHT if _analysis.check_constant(lhs_expr) else QAnnotateKind.INPUT,
+            )
+            expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
+            return QAnnotateExpr(expr, QAnnotateKind.WEIGHT)
+
+        if lhs_kind == QAnnotateKind.WEIGHT and rhs_kind == QAnnotateKind.WEIGHT:
+            expr = _forward_op(ref_call, [lhs_expr, rhs_expr])
+            return QAnnotateExpr(expr, QAnnotateKind.WEIGHT)
 
     raise ValueError
 

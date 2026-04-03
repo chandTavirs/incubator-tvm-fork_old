@@ -32,6 +32,7 @@ def run_opt_pass(expr, opt_pass):
     assert isinstance(opt_pass, tvm.transform.Pass)
     mod = tvm.IRModule.from_expr(expr)
     mod = opt_pass(mod)
+    # print(mod.astext(show_meta_data=False))
     entry = mod["main"]
     return entry if isinstance(expr, relay.Function) else entry.body
 
@@ -148,6 +149,9 @@ def _weight_shape_match_dense(data, dshape, units, blockout, blockin):
         Pad the weight if the shape[1] not divisible by blockin
     """
     assert len(dshape) == 2
+    if units is None:
+        # Relay allows nn.dense(..., units=None); infer from weight rows [units, in_dim].
+        units = int(dshape[0])
     pad_width = int(dshape[0]) % blockout
     units_pad = int(units) % blockout
     in_feat_width = int(dshape[1]) % blockin
@@ -420,6 +424,40 @@ class ExprPack(ExprMutator):
         self.number_of_conv2d = 0
         super().__init__()
 
+    def _resolve_effective_rank(self, data):
+        """Best-effort rank inference for visited expressions.
+
+        Returns an int rank when it can be proven, otherwise None so callers
+        can conservatively keep the op unchanged.
+        """
+        try:
+            shape = _get_tensor_shape(data)
+            if shape:
+                return len(shape)
+        except ValueError:
+            pass
+
+        probe = data
+        for _ in range(8):
+            if not isinstance(probe, relay.Call) or not isinstance(probe.op, tvm.ir.Op):
+                break
+            op_name = probe.op.name
+            if op_name == "annotation.stop_fusion" and len(probe.args) == 1:
+                probe = probe.args[0]
+                continue
+            if op_name in ("copy", "cast", "clip", "round") and len(probe.args) == 1:
+                probe = probe.args[0]
+                continue
+            if op_name == "transpose":
+                return len(probe.attrs.axes)
+            if op_name == "reshape":
+                return len(probe.attrs.newshape)
+            if op_name == "strided_slice":
+                return len(probe.attrs.end)
+            break
+
+        return None
+
     def visit_call(self, call):
         """ Visit the children. """
         # First visit the children.
@@ -684,6 +722,12 @@ class ExprPack(ExprMutator):
                 return relay.annotation.stop_fusion(dcast2) # not fuse any subsequent ops
             elif call.op == self.dense and odtype == "int32":
                 data, weight = args
+                # Dynamic weight-transform dense ops use units=None (e.g. 25x25, 9x9
+                # OFA kernels). Packing them here introduces padded inner-block outputs
+                # that break subsequent fixed-size reshapes in the transform pipeline.
+                if call.attrs.units is None:
+                    return relay.Call(self.dense, [data, weight], call.attrs)
+
                 data_shape = _to_shape(input_types[0].shape)
                 kernel_shape = _to_shape(input_types[1].shape)
                 units = call.attrs.units
@@ -724,59 +768,50 @@ class ExprPack(ExprMutator):
                 return op.nn.upsampling(data, scale_h, scale_w, data_layout, method, align_corners)
             elif call.op == self.reshape and len(input_types[0].shape) == 4:
                 (data,) = args
+                data_rank = self._resolve_effective_rank(data)
+                if data_rank != 6:
+                    return relay.Call(self.reshape, [data], call.attrs)
                 data = op.transpose(data, axes=(0, 4, 1, 5, 2, 3))
                 return op.reshape(data, [int(x) for x in input_types[0].shape])
             # elif call.op.name == "concatenate":
             #     concat = True
             elif call.op == self.strided_slice:
-                # print input shape
-                # data = args[0]
-                # data_shape = _get_tensor_shape(data)
                 (data,) = args
-                data_shape = _to_shape(input_types[0].shape)
-                if data_shape[-1] != self.blockout:
-                    data = _unpack_batch_channel(data, input_types[0].shape,
-                                                 self.blockout, self.typetrack)
-                    data = _pack_batch_channel(data, input_types[0].shape,
-                                               self.bfactor, self.blockout, self.typetrack)
-
-                # Original indices in NCHW format
                 orig_begin = call.attrs.begin
                 orig_end = call.attrs.end
+
+                # Rewrite to packed indices only when the effective slice input is rank-6.
+                # Keep rank-4 weight-transform slices untouched.
+                data_rank = self._resolve_effective_rank(data)
+
+                # If rank info is stale (common around stop_fusion), recover packed activation
+                # slices from pack-state plus N-axis slice bounds, while leaving weight slices 4D.
+                if data_rank != 6 and len(orig_begin) == 4 and len(orig_end) == 4:
+                    looks_like_activation_batch_slice = (
+                        int(orig_begin[0]) >= 0 and int(orig_end[0]) <= self.bfactor
+                    )
+                    if self.is_packed and looks_like_activation_batch_slice:
+                        data_rank = 6
+
+                if data_rank != 6:
+                    return relay.Call(self.strided_slice, [data], call.attrs)
+
+                # Original indices in NCHW format
+                if len(orig_begin) != 4 or len(orig_end) != 4:
+                    return relay.Call(self.strided_slice, [data], call.attrs)
 
                 # Packed format is [N//bfactor, C//block, H, W, bfactor, block]
                 # Calculate the block indices for begin and end
                 begin_batch_block = orig_begin[0] // self.bfactor
                 begin_channel_block = orig_begin[1] // self.blockout
 
-                # For end indices, we need to use ceiling division to capture partial blocks
-                # If end is 16 and blockout is 16, we want 1 block (indices 0 to 1)
-                # If end is 17 and blockout is 16, we want 2 blocks (indices 0 to 2) to capture channels 0-16
+                # Ceil-div for end indices to capture partial blocks.
                 end_batch_block = (orig_end[0] + self.bfactor - 1) // self.bfactor
                 end_channel_block = (orig_end[1] + self.blockout - 1) // self.blockout
 
                 begin = [begin_batch_block, begin_channel_block, orig_begin[2], orig_begin[3], 0, 0]
                 end = [end_batch_block, end_channel_block, orig_end[2], orig_end[3], self.bfactor, self.blockout]
                 strides = [1, 1, 1, 1, 1, 1]
-
-                # end = [0] * 6
-                # end[1] = call.attrs.end[1] // self.blockout
-                #
-                # strides = [1] * 6
-
-                # axes = [0,1,0,0,0,0]
-
-                # print strided slice arguments
-                # print("Strided slice shape:: ",data_shape)
-                # print("slice indices:: ",begin, end, strides)
-
-                # alter end to match the new shape
-
-
-                # print("Strided slice shape:: ",data_shape)
-                # print("slice indices:: ",call.attrs.begin, call.attrs.end, call.attrs.strides)
-                # print("slice axes:: ",call.attrs.axes)
-                # data = op.transpose(data, axes=(0, 2, 1, 3))
                 return op.strided_slice(data, begin, end, strides)
 
         callnode = relay.Call(self.visit(call.op), args, call.attrs)
@@ -941,3 +976,103 @@ def graph_pack(
         return run_opt_pass(expr, transform.InferType())
 
     return expr
+
+
+def _collect_op_sequence(expr, count_meta=False):
+    """Collect (op_name, op_idx) from ANF using graph_pack indexing semantics."""
+    anf = run_opt_pass(expr, transform.ToANormalForm())
+    operator_current_idx = 0
+    op_seq = []
+
+    def _recursion(node, current_idx):
+        if isinstance(node, relay.Function):
+            return _recursion(node.body, current_idx)
+        if isinstance(node, relay.expr.Let):
+            value = node.value
+            if isinstance(value, relay.expr.Call) and isinstance(value.op, tvm.ir.Op):
+                op_seq.append((value.op.name, current_idx))
+            current_idx = _operator_idx_inc(value, count_meta, current_idx)
+            return _recursion(node.body, current_idx)
+        return current_idx
+
+    _recursion(anf, operator_current_idx)
+    return op_seq
+
+
+def graph_pack_dynamic_weights(
+    expr,
+    bfactor,
+    blockin,
+    blockout,
+    weight_bits,
+    start_name="nn.max_pool2d",
+    stop_name="nn.global_avg_pool2d",
+    start_name_idx=None,
+    stop_name_idx=None,
+    count_meta=False,
+    device_annot=False,
+    annot_start_name="nn.conv2d",
+    annot_end_name="annotation.stop_fusion",
+    pack_all=True,
+    allow_fallback=True,
+    return_status=False,
+):
+    """Dynamic-weight-aware graph packing wrapper.
+
+    This API keeps legacy graph_pack behavior by default, but can auto-select a
+    full-graph packing range (first op -> last op) for dynamic-weight quantized
+    modules where weight-derivation subgraphs (e.g. dense/reshape/slice) must be
+    included in the same packed region.
+
+    Parameters mirror graph_pack plus:
+    - pack_all: discover start/stop op indices from ANF and pack full graph.
+    - allow_fallback: on known dynamic graph_pack shape mismatch, return unpacked expr.
+    - return_status: if True, return (expr, used_graph_pack, fallback_reason).
+    """
+    assert isinstance(expr, relay.Function)
+
+    dyn_start_name = start_name
+    dyn_stop_name = stop_name
+    dyn_start_idx = start_name_idx
+    dyn_stop_idx = stop_name_idx
+
+    if pack_all:
+        op_seq = _collect_op_sequence(expr, count_meta=count_meta)
+        if not op_seq:
+            if return_status:
+                return expr, False, "No operator sequence found to pack"
+            return expr
+        dyn_start_name, dyn_start_idx = op_seq[0]
+        dyn_stop_name, dyn_stop_idx = op_seq[-1]
+
+    used_graph_pack = True
+    fallback_reason = None
+    try:
+        packed = graph_pack(
+            expr,
+            bfactor,
+            blockin,
+            blockout,
+            weight_bits,
+            start_name=dyn_start_name,
+            stop_name=dyn_stop_name,
+            start_name_idx=dyn_start_idx,
+            stop_name_idx=dyn_stop_idx,
+            count_meta=count_meta,
+            device_annot=device_annot,
+            annot_start_name=annot_start_name,
+            annot_end_name=annot_end_name,
+        )
+    except Exception as err:
+        msg = str(err)
+        if allow_fallback and "axes has 6 elements" in msg and "data.ndim = 4" in msg:
+            packed = expr
+            used_graph_pack = False
+            fallback_reason = "graph_pack transpose rank mismatch on dynamic graph"
+        else:
+            raise
+
+    if return_status:
+        return packed, used_graph_pack, fallback_reason
+    return packed
+
