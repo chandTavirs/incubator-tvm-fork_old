@@ -762,14 +762,34 @@ llvm::Value* CodeGenLLVM::CreateCallExtern(Type ret_type, String global_symbol,
     arg_value.push_back(MakeValue(args[i]));
     arg_type.push_back(arg_value.back()->getType());
   }
+
+  // VTABufferCPUPtr is semantically (handle, handle) -> handle. Under typed-pointer
+  // LLVM, calls can arrive with different pointee types per use-site; canonicalize to
+  // i8* to keep a single valid declaration across all calls.
+  if (global_symbol == "VTABufferCPUPtr" && arg_value.size() == 2) {
+    for (size_t i = 0; i < 2; ++i) {
+      if (arg_value[i]->getType() != t_void_p_) {
+        arg_value[i] = builder_->CreatePointerCast(arg_value[i], t_void_p_);
+      }
+      arg_type[i] = t_void_p_;
+    }
+  }
+
   llvm::FunctionType* ftype = llvm::FunctionType::get(GetLLVMType(ret_type), arg_type, false);
   llvm::Function* f = module_->getFunction(global_symbol);
   if (f == nullptr) {
     f = llvm::Function::Create(ftype, llvm::Function::ExternalLinkage,
                                global_symbol.operator llvm::StringRef(), module_.get());
   }
-  llvm::CallInst* call = builder_->CreateCall(f, arg_value);
-  return call;
+
+  if (f->getFunctionType() == ftype) {
+    return builder_->CreateCall(f, arg_value);
+  }
+
+  // If a declaration with different typed-pointer signature already exists, call through
+  // a bitcasted callee to the canonical function type.
+  llvm::Value* casted = builder_->CreateBitCast(f, ftype->getPointerTo());
+  return builder_->CreateCall(ftype, casted, arg_value);
 }
 
 llvm::Function* CodeGenLLVM::GetIntrinsicDecl(llvm::Intrinsic::ID id, llvm::Type* ret_type,

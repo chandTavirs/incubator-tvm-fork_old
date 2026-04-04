@@ -172,7 +172,10 @@ def CPUAccessRewrite():
                 let_stmt = tvm.tir.LetStmt(
                     new_var,
                     tvm.tir.call_extern(
-                        "handle", "VTABufferCPUPtr", env.dev.command_handle, buffer_var
+                        "handle",
+                        "VTABufferCPUPtr",
+                        env.dev.command_handle,
+                        tvm.tir.call_intrin("handle", "tir.reinterpret", buffer_var),
                     ),
                     op.body,
                 )
@@ -202,7 +205,10 @@ def CPUAccessRewrite():
             stmt = tvm.tir.LetStmt(
                 new_var,
                 tvm.tir.call_extern(
-                    "handle", "VTABufferCPUPtr", env.dev.command_handle, buffer_var
+                    "handle",
+                    "VTABufferCPUPtr",
+                    env.dev.command_handle,
+                    tvm.tir.call_intrin("handle", "tir.reinterpret", buffer_var),
                 ),
                 stmt,
             )

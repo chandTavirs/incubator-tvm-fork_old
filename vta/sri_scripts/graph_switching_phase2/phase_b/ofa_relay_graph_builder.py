@@ -773,3 +773,101 @@ def split_derivation_and_inference_modules(
     return mod_deriv, deriv_params, mod_infer, infer_params, weight_names
 
 
+def split_derivation_and_inference_modules_quant_boundary(
+    mod: tvm.ir.IRModule,
+    tvm_params: Dict[str, tvm.nd.NDArray],
+    derived_prefix: str = "derived_w",
+    boundary_dtype: str = "int8",
+    boundary_scale: float = 8.0,
+) -> Tuple[
+    tvm.ir.IRModule,
+    Dict[str, tvm.nd.NDArray],
+    tvm.ir.IRModule,
+    Dict[str, tvm.nd.NDArray],
+    List[str],
+]:
+    """
+    Variant of split_derivation_and_inference_modules() with a configurable
+    deriv->infer boundary contract.
+
+    - boundary_dtype="float32": passthrough (original split behavior)
+    - boundary_dtype="int8":
+        mod_deriv emits int8 tensors via round/clip(scale*x)
+        mod_infer accepts int8 inputs and dequantizes internally by /boundary_scale
+    """
+    mod_deriv, deriv_params, mod_infer, infer_params, weight_names = split_derivation_and_inference_modules(
+        mod, tvm_params, derived_prefix=derived_prefix
+    )
+
+    if boundary_dtype == "float32":
+        return mod_deriv, deriv_params, mod_infer, infer_params, weight_names
+
+    if boundary_dtype != "int8":
+        raise ValueError("Unsupported boundary_dtype: %s (expected int8 or float32)" % boundary_dtype)
+    if boundary_scale <= 0:
+        raise ValueError("boundary_scale must be > 0, got %s" % boundary_scale)
+
+    deriv_main = mod_deriv["main"]
+    infer_main = mod_infer["main"]
+
+    if not isinstance(deriv_main.body, relay.Tuple):
+        raise RuntimeError("Expected derivation body to be a tuple of derived weights")
+
+    scale_const = relay.const(float(boundary_scale), "float32")
+
+    def _quantize_expr_to_int8(expr: relay.Expr) -> relay.Expr:
+        scaled = relay.multiply(expr, scale_const)
+        rounded = relay.round(scaled)
+        clipped = relay.clip(rounded, a_min=-128.0, a_max=127.0)
+        return relay.cast(clipped, "int8")
+
+    quant_fields = [_quantize_expr_to_int8(f) for f in deriv_main.body.fields]
+    deriv_func_q = relay.Function(
+        deriv_main.params,
+        relay.Tuple(quant_fields),
+        None,
+        deriv_main.type_params,
+        deriv_main.attrs,
+    )
+    mod_deriv_q = tvm.IRModule.from_expr(deriv_func_q)
+    mod_deriv_q = relay_transform.InferType()(mod_deriv_q)
+
+    derived_name_set = set(weight_names)
+
+    # Rewrite infer signature so derived inputs are int8 and dequantize them
+    # at the module boundary before the original infer body consumes them.
+    new_params: List[relay.Var] = []
+    bind_map = {}
+
+    for p in infer_main.params:
+        if p.name_hint not in derived_name_set:
+            new_params.append(p)
+            continue
+
+        checked = p.checked_type if hasattr(p, "checked_type") else None
+        if isinstance(checked, tvm.ir.TensorType):
+            new_ttype = relay.TensorType(checked.shape, boundary_dtype)
+            p_new = relay.var(p.name_hint, type_annotation=new_ttype)
+        elif isinstance(p.type_annotation, tvm.ir.TensorType):
+            new_ttype = relay.TensorType(p.type_annotation.shape, boundary_dtype)
+            p_new = relay.var(p.name_hint, type_annotation=new_ttype)
+        else:
+            p_new = relay.var(p.name_hint, dtype=boundary_dtype)
+
+        new_params.append(p_new)
+        deq_expr = relay.divide(relay.cast(p_new, "float32"), scale_const)
+        bind_map[p] = deq_expr
+
+    infer_body_q = relay.bind(infer_main.body, bind_map) if bind_map else infer_main.body
+
+    infer_func_q = relay.Function(
+        new_params,
+        infer_body_q,
+        None,
+        infer_main.type_params,
+        infer_main.attrs,
+    )
+    mod_infer_q = tvm.IRModule.from_expr(infer_func_q)
+    mod_infer_q = relay_transform.InferType()(mod_infer_q)
+
+    return mod_deriv_q, deriv_params, mod_infer_q, infer_params, weight_names

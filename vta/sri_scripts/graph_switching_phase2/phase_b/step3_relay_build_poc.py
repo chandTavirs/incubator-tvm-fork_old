@@ -68,7 +68,6 @@ from ofa_relay_graph_builder import (
 )
 from quantize_dynamic_weights import (
     quantize_with_dynamic_weights,
-    merge_derivation_and_inference_modules,
 )
 
 # ============================================================
@@ -214,6 +213,20 @@ def summarize_graph_storage(graph_json):
         }
     except Exception:
         return None
+
+
+def summarize_graph_devices(graph_json):
+    """Return node count per device_index from graph JSON attrs."""
+    try:
+        g = json.loads(graph_json)
+        devs = g.get("attrs", {}).get("device_index", [None, []])[1]
+        out = {}
+        for d in devs:
+            d = int(d)
+            out[d] = out.get(d, 0) + 1
+        return out
+    except Exception:
+        return {}
 
 
 def get_ofa_reference_output(ofa_net, arch, input_np):
@@ -387,7 +400,7 @@ def step3b_vta_compile(
     env,
     experimental_routing=False,
     enable_dynamic_dense_quant=False,
-    bind_all_params_at_build=False,
+    static_debug_mode=False,
 ):
     sep(f"3B VTA Compile: {subnet_id}")
 
@@ -395,8 +408,8 @@ def step3b_vta_compile(
     t0 = time.time()
 
     try:
-        # Use the new quantize_with_dynamic_weights API that preserves weight vars
-        # as inputs rather than folding them as constants
+        # Use the new quantize_with_dynamic_weights API that preserves derived weight vars
+        # as inputs rather than folding them as constants.
         with tvm.transform.PassContext(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
             prev_dense_fix_env = os.environ.get("TVM_QTZ_DYNAMIC_DENSE_CONV2D_FIX")
             try:
@@ -412,29 +425,28 @@ def step3b_vta_compile(
                     skip_dense_layer=(not enable_dynamic_dense_quant),
                 ):
                     mod_q = quantize_with_dynamic_weights(
-                        # split_artifacts["mod_full"],
-                        # split_artifacts["tvm_params_full"],
                         split_artifacts["mod_infer"],
                         split_artifacts["infer_params"],
-                        dynamic_weight_var_names=split_artifacts["dynamic_weight_var_names"],
+                        dynamic_weight_var_names=split_artifacts["derived_weight_names"],
                     )
             finally:
                 if prev_dense_fix_env is None:
                     os.environ.pop("TVM_QTZ_DYNAMIC_DENSE_CONV2D_FIX", None)
                 else:
                     os.environ["TVM_QTZ_DYNAMIC_DENSE_CONV2D_FIX"] = prev_dense_fix_env
-        
+
         print(f"  ✓ Quantization done in {time.time()-t0:.1f}s")
         print(f"  Quantized module:\n{mod_q.astext(show_meta_data=False)[:500]}...")
-        
+
         q_main_vars = {v.name_hint for v in relay.analysis.free_vars(mod_q["main"].body)}
-        kept = sorted(q_main_vars.intersection(set(split_artifacts["dynamic_weight_var_names"])))
+        kept = sorted(q_main_vars.intersection(set(split_artifacts["derived_weight_names"])))
         print(f"  Quantized dynamic vars kept: {len(kept)}")
 
     except Exception as e:
         print(f"  ✗ Quantization failed: {e}")
         import traceback; traceback.print_exc()
         raise
+
 
     # --- Graph pack ---
     print("  Applying graph_pack...")
@@ -449,10 +461,7 @@ def step3b_vta_compile(
             env.WGT_WIDTH,
             start_name=PACK_DICT[MODEL_NAME][0],
             stop_name=PACK_DICT[MODEL_NAME][1],
-            # Keep legacy-safe routing by default; broader annotation can
-            # trigger LLVM verifier issues on dynamic-weight graphs.
-            device_annot=(env.TARGET == "intelfocl") if not experimental_routing
-            else (env.TARGET not in ("sim", "tsim")),
+            device_annot=False if not experimental_routing else (env.TARGET not in ("sim", "tsim")),
             pack_all=False,
             allow_fallback=False,
             return_status=True,
@@ -464,54 +473,48 @@ def step3b_vta_compile(
             "  ⚠ graph_pack_dynamic_weights fallback used: "
             f"{pack_reason if pack_reason else 'unknown reason'}"
         )
-    # except Exception as e:
-    #     print(f"  ✗ graph_pack failed: {e}")
-    #     import traceback; traceback.print_exc()
-    #     raise
 
-
-    # --- relay.build for VTA ---
-    print("  Running relay.build for VTA target...")
+    # --- relay.build for VTA inference module ---
+    print("  Running relay.build for VTA inference module...")
     t0 = time.time()
 
-    params_for_build = (
+    params_for_infer_build = (
         split_artifacts["tvm_params_full"]
-        if bind_all_params_at_build
+        if static_debug_mode
         else split_artifacts["infer_params"]
     )
-    if bind_all_params_at_build:
-        print("  Build param mode: ALL params bound at build time")
+    if static_debug_mode:
+        print("  Infer build mode: STATIC DEBUG (bind all params)")
     else:
-        print("  Build param mode: infer params only (dynamic weights set at runtime)")
+        print("  Infer build mode: DYNAMIC (bind infer params only)")
 
     schedule_logs = load_schedule_logs()
     print(f"  Using {len(schedule_logs)} schedule log files")
 
     try:
         with autotvm.tophub.context(env.target, extra_files=schedule_logs):
-            build_target = env.target
-            # Default path mirrors known-good script behavior. Experimental
-            # hetero routing is opt-in for diagnosis.
-            if experimental_routing and hasattr(env, "target_vta_cpu") and env.TARGET not in ("sim", "tsim"):
-                build_target = {"ext_dev": env.target, "cpu": env.target_vta_cpu}
             with vta.build_config(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
-                graph, lib, built_params = relay.build(
+                infer_graph, infer_lib, infer_built_params = relay.build(
                     relay_prog,
-                    target=build_target,
-                    params=params_for_build,
+                    target=env.target,
+                    params=params_for_infer_build,
                     target_host=env.target_host,
                 )
         build_time = time.time() - t0
-        print(f"  ✓ relay.build done in {build_time:.1f}s")
-        print(f"  Built params: {len(built_params)}")
+        print(f"  ✓ infer relay.build done in {build_time:.1f}s")
+        print(f"  Infer built params: {len(infer_built_params)}")
         print(f"  Build mode: {'graph_pack' if used_graph_pack else 'unpacked_fallback'}")
 
-        graph_path = os.path.join(RESULTS_DIR, f"graph_{subnet_id}.json")
-        with open(graph_path, "w") as f:
-            f.write(graph)
-        print(f"  Graph JSON -> {graph_path}")
+        infer_graph_path = os.path.join(RESULTS_DIR, f"infer_graph_{subnet_id}.json")
+        with open(infer_graph_path, "w") as f:
+            f.write(infer_graph)
+        print(f"  Infer graph JSON -> {infer_graph_path}")
 
-        storage_summary = summarize_graph_storage(graph)
+        dev_counts = summarize_graph_devices(infer_graph)
+        if dev_counts:
+            print("  Infer device_index node counts: " + ", ".join(f"dev{k}={v}" for k, v in sorted(dev_counts.items())))
+
+        storage_summary = summarize_graph_storage(infer_graph)
         if storage_summary is not None:
             bpd = storage_summary["bytes_per_device_index"]
             dev_desc = ", ".join(
@@ -529,62 +532,121 @@ def step3b_vta_compile(
             print(f"  Build-fail Relay IR -> {fail_relay_path}")
         except Exception:
             pass
-        print(f"  ✗ relay.build failed: {e}")
+        print(f"  ✗ infer relay.build failed: {e}")
         import traceback; traceback.print_exc()
         raise
 
-    dynamic_runtime_params = {} if bind_all_params_at_build else split_artifacts["deriv_params"]
-    return graph, lib, built_params, dynamic_runtime_params, bind_all_params_at_build
+    print("  Host-CPU derivation build skipped in Step 3B (done at runtime in Step 3C POC mode)")
+
+    # Host-side derivation is executed in Step 3C for POC; only infer artifacts are built here.
+    return {
+        "infer_graph": infer_graph,
+        "infer_lib": infer_lib,
+        "infer_built_params": infer_built_params,
+        "static_debug_mode": static_debug_mode,
+    }
 
 
 # ============================================================
 # Step 3C: Upload to VTA, run inference, validate
 # ============================================================
-def step3c_vta_inference(subnet_id, arch, graph, lib, built_params, dynamic_runtime_params,
-                          ofa_net, input_np, env, remote, ctx, params_bound_at_build=False):
+def step3c_vta_inference(
+    subnet_id,
+    arch,
+    compile_artifacts,
+    split_artifacts,
+    deriv_weight_cache,
+    ofa_net,
+    input_np,
+    env,
+    remote,
+    ctx,
+):
     sep(f"3C VTA Inference: {subnet_id}")
 
-    # Upload
-    print("  Uploading library to device...")
+    # Upload inference library
+    print("  Uploading inference library to device...")
     temp_dir = tvm_utils.tempdir()
-    lib_path = temp_dir.relpath(f"graphlib_step3_{subnet_id}.tar")
-    lib.export_library(lib_path)
-    remote.upload(lib_path)
-    remote_lib = remote.load_module(f"graphlib_step3_{subnet_id}.tar")
-    print("  ✓ Uploaded")
+    infer_lib_path = temp_dir.relpath(f"graphlib_step3_infer_{subnet_id}.tar")
+    compile_artifacts["infer_lib"].export_library(infer_lib_path)
+    remote.upload(infer_lib_path)
+    infer_remote_lib = remote.load_module(f"graphlib_step3_infer_{subnet_id}.tar")
+    print("  ✓ Inference library uploaded")
 
-    # Create runtime
-    if env.TARGET == "intelfocl":
-        ctxes = [remote.ext_dev(0), remote.cpu(0)]
-        m = graph_runtime.create(graph, remote_lib, ctxes)
-    else:
-        m = graph_runtime.create(graph, remote_lib, ctx)
+    # Create inference runtime only; derivation runs on host CPU in this POC.
+    m_infer = graph_runtime.create(compile_artifacts["infer_graph"], infer_remote_lib, ctx)
 
-    # Set inputs
-    m.set_input(**built_params)
-    if params_bound_at_build:
-        print("  Dynamic runtime params: skipped (bound at build time)")
+    # Load build-time inference params.
+    m_infer.set_input(**compile_artifacts["infer_built_params"])
+
+    # Dynamic mode: run derivation once per subnet on host CPU and cache host numpy tensors.
+    if compile_artifacts["static_debug_mode"]:
+        print("  Static debug mode: skipping runtime derivation and cache")
     else:
-        m.set_input(**dynamic_runtime_params)
-        print(f"  Dynamic runtime params: set {len(dynamic_runtime_params)} tensors")
+        cache_hit = subnet_id in deriv_weight_cache
+        if cache_hit:
+            print(f"  Derivation cache: HIT for {subnet_id}")
+            cached_host_np = deriv_weight_cache[subnet_id]
+        else:
+            print(f"  Derivation cache: MISS for {subnet_id}; running HOST CPU derivation")
+            host_derived = materialize_derived_weights_cpu(
+                split_artifacts["mod_deriv"],
+                split_artifacts["deriv_params"],
+                split_artifacts["derived_weight_names"],
+            )
+
+            expected = len(split_artifacts["derived_weight_names"])
+            if len(host_derived) != expected:
+                raise RuntimeError(
+                    f"Derived output count mismatch: expected {expected}, got {len(host_derived)}"
+                )
+
+            cached_host_np = {
+                name: (arr.asnumpy() if hasattr(arr, "asnumpy") else np.array(arr))
+                for name, arr in host_derived.items()
+            }
+            deriv_weight_cache[subnet_id] = cached_host_np
+            print(f"  Derivation cache: stored {len(cached_host_np)} host tensors")
+            del host_derived
+
+        # Stream uploads into runtime input buffers to avoid transient ext_dev allocations.
+        copied = 0
+        copied_bytes = 0
+        for name, w_np in sorted(cached_host_np.items(), key=lambda kv: kv[1].nbytes, reverse=True):
+            try:
+                slot = m_infer.get_input(name)
+            except Exception:
+                slot = None
+            if slot is None:
+                print(f"  Warning: runtime input not found for dynamic tensor '{name}', skipping")
+                continue
+            slot.copyfrom(w_np)
+            copied += 1
+            copied_bytes += int(w_np.nbytes)
+
+        print(
+            f"  Inference dynamic weights: uploaded {copied} tensors "
+            f"({copied_bytes / (1024 * 1024):.1f} MB)"
+        )
+
     inp_tvm = tvm.nd.array(
         input_np.astype("float32"),
         remote.ext_dev(0) if env.TARGET != "sim" else tvm.cpu(0)
     )
-    m.set_input(INPUT_NAME, inp_tvm)
+    m_infer.set_input(INPUT_NAME, inp_tvm)
 
     # Run
     print("  Running VTA inference...")
     t0 = time.time()
-    m.run()
+    m_infer.run()
     inf_time = time.time() - t0
     print(f"  ✓ Inference done in {inf_time*1000:.1f}ms")
 
-    vta_out = m.get_output(0).asnumpy()
+    vta_out = m_infer.get_output(0).asnumpy()
     pytorch_out = get_ofa_reference_output(ofa_net, arch, input_np)
 
     top1_vta = int(np.argmax(vta_out[0]))
-    top1_ref  = int(np.argmax(pytorch_out[0]))
+    top1_ref = int(np.argmax(pytorch_out[0]))
 
     print(f"\n  VTA Validation Results:")
     print(f"    Top-1 (VTA):  {top1_vta}")
@@ -627,9 +689,14 @@ def parse_args():
         help="Enable dense quantization for dynamic-weight graphs via annotate feature gate",
     )
     p.add_argument(
+        "--static-debug-mode",
+        action="store_true",
+        help="Bind all params at infer relay.build time and skip runtime derivation (explicit static diagnostic mode)",
+    )
+    p.add_argument(
         "--build-bind-all-params",
         action="store_true",
-        help="Bind all params at relay.build time (diagnostic mode for runtime input/buffer issues)",
+        help=argparse.SUPPRESS,
     )
     return p.parse_args()
 
@@ -637,6 +704,11 @@ def parse_args():
 def main():
     args = parse_args()
     sep("Phase B Step 3: OFA-Pool Relay Build POC")
+
+    static_debug_mode = args.static_debug_mode or args.build_bind_all_params
+    if args.build_bind_all_params:
+        print("  ⚠ --build-bind-all-params is deprecated; use --static-debug-mode")
+    print(f"  Runtime mode: {'STATIC DEBUG' if static_debug_mode else 'DYNAMIC (CPU derivation + VTA infer)'}")
 
     # ------------------------------------------------------------------
     print("\n[1] Loading OFA model...")
@@ -688,6 +760,7 @@ def main():
 
     all_results = {}
     overall_passed = True
+    deriv_weight_cache = {}
 
     for subnet_id, arch in poc_archs.items():
         sep(f"Processing {subnet_id}")
@@ -719,11 +792,11 @@ def main():
         if not args.skip_vta:
             # ---- Step 3B: VTA compile ----
             try:
-                graph, lib, built_params, dynamic_runtime_params, params_bound_at_build = step3b_vta_compile(
+                compile_artifacts = step3b_vta_compile(
                     subnet_id, arch, split_artifacts, env,
                     experimental_routing=args.diag_experimental_routing,
                     enable_dynamic_dense_quant=args.enable_dynamic_dense_quant,
-                    bind_all_params_at_build=args.build_bind_all_params,
+                    static_debug_mode=static_debug_mode,
                 )
             except Exception as e:
                 print(f"  ✗ Step 3B failed: {e}")
@@ -739,9 +812,16 @@ def main():
             # ---- Step 3C: VTA inference ----
             try:
                 r3c = step3c_vta_inference(
-                    subnet_id, arch, graph, lib, built_params, dynamic_runtime_params,
-                    ofa_net, input_np, env, remote, ctx,
-                    params_bound_at_build=params_bound_at_build,
+                    subnet_id,
+                    arch,
+                    compile_artifacts,
+                    split_artifacts,
+                    deriv_weight_cache,
+                    ofa_net,
+                    input_np,
+                    env,
+                    remote,
+                    ctx,
                 )
             except Exception as e:
                 print(f"  ✗ Step 3C failed: {e}")
