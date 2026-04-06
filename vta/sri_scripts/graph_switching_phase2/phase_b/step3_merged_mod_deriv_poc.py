@@ -39,8 +39,9 @@ for p in [EXTERNAL_REPO_ROOT, TVM_PYTHON, VTA_ROOT, SRI_SCRIPTS_DIR, SCRIPT_DIR]
 import tvm
 from tvm import autotvm, relay, rpc
 from tvm.contrib import graph_runtime, utils as tvm_utils
+from tvm.relay.expr_functor import ExprMutator
 import vta
-from vta.top import graph_pack_dynamic_weights
+from vta.top import graph_pack
 
 from ofa_base_models import OFADynamicResnetAllMod
 from ofa_derivation_extractor import OFADerivationExtractor
@@ -61,11 +62,15 @@ DEVICE_HOST = "10.42.0.188"
 DEVICE_PORT = 9091
 
 GLOBAL_SCALE = 8.0
+POOL_VAR_QUANT_SCALE = 16.0
 SKIP_CONV_LAYERS = [0]
 OPT_LEVEL = 3
 MODEL_NAME = "resnet18"
 INPUT_NAME = "input0"
 INPUT_SHAPE = [1, 3, 224, 224]
+FIRST_LAYER_FLOAT_POOL_VARS = {
+    "pool_first_layer_0_base_conv_weight",
+}
 
 PACK_DICT = {
     "resnet18": ["nn.max_pool2d", "nn.adaptive_avg_pool2d"],
@@ -194,6 +199,157 @@ def get_ofa_reference_output(ofa_net, arch, input_np):
     return out_t.cpu().numpy()
 
 
+def _quantize_np_to_int8(arr, scale=POOL_VAR_QUANT_SCALE):
+    x = np.asarray(arr, dtype="float32")
+    x = np.round(x * float(scale))
+    x = np.clip(x, -127.0, 127.0)
+    return x.astype("int8")
+
+
+def _is_scalar_const(expr):
+    if not isinstance(expr, relay.Constant):
+        return False
+    data = expr.data
+    arr = data.asnumpy() if hasattr(data, "asnumpy") else np.asarray(data)
+    return arr.size == 1
+
+
+class _PoolLadderStripper(ExprMutator):
+    """Replace pool-only float32->int8 quant ladders with direct int8 pool vars."""
+
+    def __init__(self, int8_pool_var_names):
+        super().__init__()
+        self.int8_pool_var_names = set(int8_pool_var_names)
+
+    def _is_pool_int8_var(self, expr):
+        return isinstance(expr, relay.Var) and expr.name_hint in self.int8_pool_var_names
+
+    def _is_int8_expr(self, expr):
+        return self._expr_dtype_no_checked_type(expr) == "int8"
+
+    def _is_float32_expr(self, expr):
+        return self._expr_dtype_no_checked_type(expr) == "float32"
+
+    def _strip_quant_ladder(self, call):
+        if not (isinstance(call.op, tvm.ir.Op) and call.op.name == "cast"):
+            return None
+        if call.attrs.dtype != "int8":
+            return None
+        clip = call.args[0]
+        if not (isinstance(clip, relay.Call) and isinstance(clip.op, tvm.ir.Op) and clip.op.name == "clip"):
+            return None
+        rnd = clip.args[0]
+        if not (isinstance(rnd, relay.Call) and isinstance(rnd.op, tvm.ir.Op) and rnd.op.name == "round"):
+            return None
+        mul = rnd.args[0]
+        if not (isinstance(mul, relay.Call) and isinstance(mul.op, tvm.ir.Op) and mul.op.name == "multiply"):
+            return None
+        lhs, rhs = mul.args
+        # After pool vars are rewritten to int8, quant ladders can sit on top of
+        # int8-preserving ops (slice/reshape/stop_fusion), not only raw vars.
+        if self._is_int8_expr(lhs) and _is_scalar_const(rhs):
+            return lhs
+        if self._is_int8_expr(rhs) and _is_scalar_const(lhs):
+            return rhs
+        return None
+
+    def _expr_dtype_no_checked_type(self, expr):
+        """Best-effort dtype probe that avoids expr.checked_type during mutation."""
+        if isinstance(expr, relay.Constant):
+            return str(expr.data.dtype)
+        if isinstance(expr, relay.Var) and isinstance(expr.type_annotation, tvm.ir.TensorType):
+            return str(expr.type_annotation.dtype)
+        if isinstance(expr, relay.Call) and isinstance(expr.op, tvm.ir.Op):
+            if expr.op.name == "cast":
+                return str(expr.attrs.dtype)
+            if expr.op.name == "clip":
+                return self._expr_dtype_no_checked_type(expr.args[0])
+            passthrough_ops = {
+                "strided_slice",
+                "reshape",
+                "annotation.stop_fusion",
+                "transpose",
+                "expand_dims",
+                "squeeze",
+            }
+            if expr.op.name in passthrough_ops and len(expr.args) >= 1:
+                return self._expr_dtype_no_checked_type(expr.args[0])
+        return None
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+
+        # Make mixed int8/float32 multiplies type-safe in rewritten paths.
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "multiply" and len(call.args) == 2:
+            lhs, rhs = call.args
+            if self._is_int8_expr(lhs) and self._is_float32_expr(rhs):
+                return relay.multiply(relay.cast(lhs, "float32"), rhs)
+            if self._is_int8_expr(rhs) and self._is_float32_expr(lhs):
+                return relay.multiply(lhs, relay.cast(rhs, "float32"))
+
+        stripped = self._strip_quant_ladder(call)
+        if stripped is not None:
+            return stripped
+
+        # Enforce int32 accumulation for int8 dense paths.
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.dense":
+            if len(call.args) != 2:
+                return call
+            data, weight = call.args
+            data_dtype = self._expr_dtype_no_checked_type(data)
+            weight_dtype = self._expr_dtype_no_checked_type(weight)
+            out_dtype = str(call.attrs.out_dtype) if hasattr(call.attrs, "out_dtype") else ""
+            if data_dtype == "int8" and weight_dtype == "int8" and out_dtype != "int32":
+                # Force int32 accumulation, then requantize to int8 for downstream ops.
+                units = call.attrs.units if hasattr(call.attrs, "units") else None
+                dense_i32 = relay.nn.dense(data, weight, units=units, out_dtype="int32")
+                dense_clipped = relay.clip(dense_i32, a_min=-127.0, a_max=127.0)
+                return relay.cast(dense_clipped, "int8")
+
+        return call
+
+
+def _materialize_int8_pool_constants(mod_q, tvm_params_full, pool_var_names):
+    """Rewrite module for int8 pool constants (except selected float32 runtime vars)."""
+    main = mod_q["main"]
+
+    int8_pool_vars = sorted([n for n in pool_var_names if n not in FIRST_LAYER_FLOAT_POOL_VARS])
+    runtime_float_pool_vars = sorted([n for n in pool_var_names if n in FIRST_LAYER_FLOAT_POOL_VARS])
+
+    param_map = {}
+    new_params = []
+    for p in main.params:
+        name = p.name_hint
+        if name in int8_pool_vars:
+            p_new = relay.var(name, shape=p.type_annotation.shape, dtype="int8")
+            new_params.append(p_new)
+            param_map[p] = p_new
+        else:
+            new_params.append(p)
+            param_map[p] = p
+
+    body = relay.expr.bind(main.body, param_map)
+    body = _PoolLadderStripper(set(int8_pool_vars)).visit(body)
+
+    new_main = relay.Function(new_params, body)
+    mod_i8 = tvm.IRModule.from_expr(new_main)
+    mod_i8 = relay.transform.InferType()(mod_i8)
+
+    int8_runtime_pool_params = {}
+    runtime_pool_params = {}
+    for name in int8_pool_vars:
+        arr = tvm_params_full[name]
+        if hasattr(arr, "asnumpy"):
+            arr = arr.asnumpy()
+        int8_runtime_pool_params[name] = _quantize_np_to_int8(arr)
+
+    for name in runtime_float_pool_vars:
+        arr = tvm_params_full[name]
+        runtime_pool_params[name] = arr.asnumpy() if hasattr(arr, "asnumpy") else np.asarray(arr)
+
+    return mod_i8, int8_runtime_pool_params, runtime_pool_params
+
+
 # ============================================================
 # Build / Compile / Run
 # ============================================================
@@ -242,7 +398,6 @@ def step3b_compile_merged(
     env,
     enable_dynamic_dense_quant=False,
     static_debug_mode=False,
-    enable_hetero_routing=True,
     enable_graph_pack=True,
 ):
     sep("3B Compile Merged: %s" % subnet_id)
@@ -283,68 +438,77 @@ def step3b_compile_merged(
     kept = sorted(q_main_vars.intersection(set(pool_var_names)))
     print("  Dynamic pool vars kept after quantize: %d" % len(kept))
 
-    # Dynamic mode keeps pool vars unbound at build.
-    params_for_build = tvm_params_full if static_debug_mode else {
-        k: v for k, v in tvm_params_full.items() if k not in set(pool_var_names)
-    }
-    print("  Build mode: %s" % ("STATIC DEBUG" if static_debug_mode else "DYNAMIC (pool vars runtime)"))
+    # Merged-flow fix: rewrite pool vars so non-first-layer pools become int8
+    # runtime inputs, while first-layer base weight stays float32 runtime input.
+    if static_debug_mode:
+        mod_compile = mod_q
+        int8_runtime_pool_params = {}
+        runtime_pool_params_np = {
+            name: (tvm_params_full[name].asnumpy() if hasattr(tvm_params_full[name], "asnumpy") else np.asarray(tvm_params_full[name]))
+            for name in pool_var_names
+        }
+    else:
+        print("  Rewriting merged graph for int8 runtime-pool materialization...")
+        mod_compile, int8_runtime_pool_params, runtime_pool_params_np = _materialize_int8_pool_constants(
+            mod_q,
+            tvm_params_full,
+            pool_var_names,
+        )
+        runtime_pool_params_np.update(int8_runtime_pool_params)
+        print("  Int8 runtime pool vars prepared: %d" % len(int8_runtime_pool_params))
+        print("  Float32 runtime pool vars kept: %d" % len(runtime_pool_params_np))
+
+    compile_main_vars = {v.name_hint for v in relay.analysis.free_vars(mod_compile["main"].body)}
+    if not static_debug_mode:
+        missing_pool_inputs = sorted(set(pool_var_names) - compile_main_vars)
+        if missing_pool_inputs:
+            raise RuntimeError(
+                "Expected all pool vars to remain runtime inputs after rewrite; missing: %s"
+                % missing_pool_inputs[:8]
+            )
+
+    # Build params: non-pool params only. Pool vars are uploaded at runtime.
+    if static_debug_mode:
+        params_for_build = tvm_params_full
+    else:
+        params_for_build = {
+            k: v for k, v in tvm_params_full.items() if k not in set(pool_var_names)
+        }
+    print("  Build mode: %s" % ("STATIC DEBUG" if static_debug_mode else "DYNAMIC (all pool vars runtime inputs)"))
 
     schedule_logs = load_schedule_logs()
     print("  Using %d schedule logs" % len(schedule_logs))
 
-    if not enable_hetero_routing:
-        raise RuntimeError("Hetero routing is required for this POC run")
-
     if enable_graph_pack:
         print("  Applying graph_pack...")
         with tvm.transform.PassContext(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
-            relay_prog, used_graph_pack, pack_reason = graph_pack_dynamic_weights(
-                mod_q["main"],
+            relay_prog = graph_pack(
+                mod_compile["main"],
                 env.BATCH,
                 env.BLOCK_IN,
                 env.BLOCK_OUT,
                 env.WGT_WIDTH,
                 start_name=PACK_DICT[MODEL_NAME][0],
                 stop_name=PACK_DICT[MODEL_NAME][1],
-                pack_all=False,
-                allow_fallback=True,
-                return_status=True,
-                device_annot=True,
-                annot_start_name="nn.conv2d",
-                annot_end_name="annotation.stop_fusion",
+                device_annot=(env.TARGET == "intelfocl"),
             )
-        if used_graph_pack:
-            print("  graph_pack: OK")
-        else:
-            print("  graph_pack fallback: %s" % (pack_reason if pack_reason else "unknown"))
+        print("  graph_pack: OK")
     else:
-        relay_prog = mod_q["main"]
+        relay_prog = mod_compile["main"]
         print("  graph_pack: SKIPPED")
 
-    build_target = {
-        "cpu": getattr(env, "target_vta_cpu", "llvm"),
-        "ext_dev": env.target,
-    }
-    print("  Build target: hetero(cpu+ext_dev)")
-
-    # Hetero codegen on arm target can hit LLVM verifier errors when vectorized stack
-    # buffers are passed into VTABufferCPUPtr. Disable TIR vectorization in this path.
-    hetero_pass_ctx = tvm.transform.PassContext(
-        opt_level=OPT_LEVEL,
-        disabled_pass={"AlterOpLayout"},
-        config={"tir.disable_vectorize": True},
-    )
+    build_target = env.target
+    print("  Build target: %s" % build_target)
 
     t0 = time.time()
     with autotvm.tophub.context(env.target, extra_files=schedule_logs):
-        with hetero_pass_ctx:
-            with vta.build_config(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
-                graph, lib, built_params = relay.build(
-                    relay_prog,
-                    target=build_target,
-                    params=params_for_build,
-                    target_host=env.target_host,
-                )
+        with vta.build_config(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
+            graph, lib, built_params = relay.build(
+                relay_prog,
+                target=build_target,
+                params=params_for_build,
+                target_host=env.target_host,
+            )
     print("  relay.build done in %.1fs" % (time.time() - t0))
     print("  Built params: %d" % len(built_params))
 
@@ -362,20 +526,16 @@ def step3b_compile_merged(
         if ext_dev_bytes > (450 * 1024 * 1024):
             print("  [warn] ext_dev storage is high (%.1fMB); runtime init may still fail" % (ext_dev_bytes / (1024 * 1024.0)))
 
-    pool_params_np = {
-        name: (tvm_params_full[name].asnumpy() if hasattr(tvm_params_full[name], "asnumpy") else np.array(tvm_params_full[name]))
-        for name in pool_var_names
-    }
+    runtime_pool_var_names = sorted(runtime_pool_params_np.keys())
 
     return {
         "graph": graph,
         "lib": lib,
         "built_params": built_params,
-        "pool_params_np": pool_params_np,
-        "pool_var_names": pool_var_names,
+        "runtime_pool_params_np": runtime_pool_params_np,
+        "runtime_pool_var_names": runtime_pool_var_names,
         "static_debug_mode": static_debug_mode,
-        "use_hetero_routing": True,
-        "compile_strategy": "hetero(cpu+ext_dev)",
+        "compile_strategy": "single-target(vta)",
     }
 
 
@@ -390,22 +550,14 @@ def step3c_run_merged(subnet_id, arch, compile_artifacts, ofa_net, input_np, env
     remote_lib = remote.load_module("graphlib_step3_merged_%s.tar" % subnet_id)
 
     print("  Compile strategy: %s" % compile_artifacts.get("compile_strategy", "unknown"))
-    if compile_artifacts.get("use_hetero_routing", False):
-        m = graph_runtime.create(
-            compile_artifacts["graph"],
-            remote_lib,
-            [remote.ext_dev(0), remote.cpu(0)],
-        )
-        print("  Runtime contexts: [ext_dev(0), cpu(0)]")
-    else:
-        m = graph_runtime.create(compile_artifacts["graph"], remote_lib, ctx)
-        print("  Runtime contexts: [ext_dev(0)]")
+    m = graph_runtime.create(compile_artifacts["graph"], remote_lib, ctx)
+    print("  Runtime context: ext_dev(0)")
     m.set_input(**compile_artifacts["built_params"])
 
     if not compile_artifacts["static_debug_mode"]:
         copied = 0
         copied_bytes = 0
-        for name, arr in sorted(compile_artifacts["pool_params_np"].items(), key=lambda kv: kv[1].nbytes, reverse=True):
+        for name, arr in sorted(compile_artifacts["runtime_pool_params_np"].items(), key=lambda kv: kv[1].nbytes, reverse=True):
             slot = m.get_input(name)
             if slot is None:
                 raise RuntimeError("Missing runtime input for pool var: %s" % name)
@@ -416,12 +568,16 @@ def step3c_run_merged(subnet_id, arch, compile_artifacts, ofa_net, input_np, env
     else:
         print("  Static debug mode: pool vars are build-bound")
 
-    input_slot = m.get_input(INPUT_NAME)
-    if input_slot is None:
-        raise RuntimeError("Missing graph input: %s" % INPUT_NAME)
-    # Let graph runtime own the destination context (cpu/ext_dev) for hetero safety.
-    input_slot.copyfrom(input_np.astype("float32"))
-
+    # input_slot = m.get_input(INPUT_NAME)
+    # if input_slot is None:
+    #     raise RuntimeError("Missing graph input: %s" % INPUT_NAME)
+    # Let graph runtime own the destination context.
+    # input_slot.copyfrom(input_np.astype("float32"))
+    inp_tvm = tvm.nd.array(
+        input_np.astype("float32"),
+        remote.ext_dev(0) if env.TARGET != "sim" else tvm.cpu(0)
+    )
+    m.set_input(INPUT_NAME, inp_tvm)
     print("  Running inference...")
     t0 = time.time()
     m.run()
@@ -461,11 +617,6 @@ def parse_args():
     p.add_argument("--skip-cpu", action="store_true", help="Skip optional CPU reference print (still compares against PyTorch in VTA run)")
     p.add_argument("--enable-dynamic-dense-quant", action="store_true")
     p.add_argument(
-        "--no-hetero-routing",
-        action="store_true",
-        help="Disable hetero routing (not supported in this script; kept for compatibility)",
-    )
-    p.add_argument(
         "--no-graph-pack",
         action="store_true",
         help="Disable graph_pack in merged flow (memory-safe fallback)",
@@ -483,9 +634,6 @@ def main():
     if args.build_bind_all_params:
         print("  [warn] --build-bind-all-params is deprecated; use --static-debug-mode")
     print("  Runtime mode: %s" % ("STATIC DEBUG" if static_debug_mode else "DYNAMIC (pool vars runtime)"))
-    if args.no_hetero_routing:
-        raise RuntimeError("This script now requires hetero routing; remove --no-hetero-routing")
-
     print("\n[1] Loading OFA model...")
     t0 = time.time()
     ofa_net = OFADynamicResnetAllMod()
@@ -558,7 +706,6 @@ def main():
                 env,
                 enable_dynamic_dense_quant=args.enable_dynamic_dense_quant,
                 static_debug_mode=static_debug_mode,
-                enable_hetero_routing=True,
                 enable_graph_pack=(not args.no_graph_pack),
             )
 
