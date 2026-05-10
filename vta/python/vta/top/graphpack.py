@@ -23,8 +23,11 @@
 import numpy as np
 import tvm
 from tvm import relay
+from tvm import topi
 from tvm.relay import op, transform
 from tvm.relay import ExprMutator
+
+from ..environment import get_env
 
 
 def run_opt_pass(expr, opt_pass):
@@ -83,6 +86,83 @@ def _pack_batch_channel_dense(data, dshape, bfactor, block):
     data = op.transpose(
         data, axes=(0, 2, 1, 3))
     return data
+
+
+def _ceil_div(value, factor):
+    return (value + factor - 1) // factor
+
+
+def _dense_acc_tile_ok(b_tiles, co_tiles, env):
+    """Return True if the accumulator tile fits in VTA local.acc_buffer."""
+    return int(b_tiles) * int(co_tiles) <= int(env.ACC_BUFF_SIZE)
+
+
+def _chunk_packed_dense(
+    packed_data,
+    packed_weight,
+    out_dtype,
+    *,
+    b_outer,
+    k_outer,
+    b_inner,
+    k_inner,
+    c_outer,
+    c_inner,
+):
+    """Chunk packed dense along the packed batch axis to satisfy VTA ACC buffer.
+
+    packed_data shape  = [B_outer, K_outer, B_inner, K_inner]
+    packed_weight shape= [C_outer, K_outer, C_inner, K_inner]
+    output shape       = [B_outer, C_outer, B_inner, C_inner]
+
+    We split B_outer into slices, run dense per slice, then concatenate along axis 0.
+    Each chunk's dense output is wrapped in the VTA epilogue (right_shift + clip + cast
+    + copy + stop_fusion + cast back to int32) before concatenation, ensuring consistent
+    requantization per chunk rather than on the entire concatenated result.
+    """
+    env = get_env()
+
+    # The caller provides compile-time constant packed shapes. Keep this helper side-effect free.
+    b_outer = int(b_outer)
+    k_outer = int(k_outer)
+    b_inner = int(b_inner)
+    k_inner = int(k_inner)
+    c_outer = int(c_outer)
+    c_inner = int(c_inner)
+
+    # Conservative on-chip accumulator constraint from schedule (tile_b_inner * tile_co_inner).
+    # In current schedule tile_co_inner is forced to 1, so we bound by ACC buffer directly.
+    max_b_outer_per_call = int(env.ACC_BUFF_SIZE) // 2
+    if max_b_outer_per_call <= 0:
+        return op.nn.dense(packed_data, packed_weight, out_dtype=out_dtype)
+
+    if b_outer <= max_b_outer_per_call:
+        return op.nn.dense(packed_data, packed_weight, out_dtype=out_dtype)
+
+    def _apply_vta_dense_epilogue(dense_i32):
+        """Wrap a dense int32 output in the VTA requantization epilogue."""
+        shifted = relay.op.tensor.right_shift(
+            dense_i32, relay.Constant(tvm.nd.array(np.array(8, dtype="int32"))))
+        clipped = relay.op.tensor.clip(shifted, -127., 127.)
+        cast_i8 = relay.op.transform.cast(clipped, "int8")
+        copied = relay.Call(op.op.get('copy'), [cast_i8])
+        stopped = relay.annotation.stop_fusion(copied)
+        return relay.op.transform.cast(stopped, "int32")
+
+    parts = []
+    for begin in range(0, b_outer, max_b_outer_per_call):
+        end = min(b_outer, begin + max_b_outer_per_call)
+        data_slice = op.strided_slice(
+            packed_data,
+            begin=[begin, 0, 0, 0],
+            end=[end, k_outer, b_inner, k_inner],
+            strides=[1, 1, 1, 1],
+        )
+        dense_chunk = op.nn.dense(data_slice, packed_weight, out_dtype="int32")
+        epilogued_chunk = _apply_vta_dense_epilogue(dense_chunk)
+        parts.append(epilogued_chunk)
+
+    return op.concatenate(parts, axis=0)
 
 def _unpack_batch_channel(data, old_shape, block, typetrack):
     """Unpack the data channel dimension.
@@ -454,6 +534,9 @@ class ExprPack(ExprMutator):
                 return len(probe.attrs.newshape)
             if op_name == "strided_slice":
                 return len(probe.attrs.end)
+            if op_name == "right_shift" and len(probe.args) == 1:
+                probe = probe.args[0]
+                continue
             break
 
         return None
@@ -725,23 +808,50 @@ class ExprPack(ExprMutator):
                 # Dynamic weight-transform dense ops use units=None (e.g. 25x25, 9x9
                 # OFA kernels). Packing them here introduces padded inner-block outputs
                 # that break subsequent fixed-size reshapes in the transform pipeline.
-                if call.attrs.units is None:
-                    return relay.Call(self.dense, [data, weight], call.attrs)
+                # Keep packing enabled for units=None; reshape handling below trims
+                # padded packed-dense outputs back to logical kernel sizes.
 
                 data_shape = _to_shape(input_types[0].shape)
                 kernel_shape = _to_shape(input_types[1].shape)
                 units = call.attrs.units
-                data = _pack_batch_channel_dense(data, data_shape, self.bfactor,
-                                                 self.blockin)
+
+                if len(data_shape) == 2:
+                    packed_data = _pack_batch_channel_dense(data, data_shape, self.bfactor,
+                                                            self.blockin)
+                else:
+                    return relay.Call(self.dense, [data, weight], call.attrs)
+
                 self.is_packed = True
-                weight, kernel_shape, units = _weight_shape_match_dense(weight,
-                                                                        kernel_shape,
-                                                                        units,
-                                                                        self.blockout,
-                                                                        self.blockin)
-                kernel = _pack_weight_dense(weight, kernel_shape, self.blockout,
-                                            self.blockin)
-                dense = op.nn.dense(data, kernel, out_dtype=call.attrs.out_dtype)
+
+                if len(kernel_shape) == 2:
+                    weight, kernel_shape, units = _weight_shape_match_dense(
+                        weight,
+                        kernel_shape,
+                        units,
+                        self.blockout,
+                        self.blockin,
+                    )
+                    kernel = _pack_weight_dense(weight, kernel_shape, self.blockout, self.blockin)
+                else:
+                    return relay.Call(self.dense, [packed_data, weight], call.attrs)
+
+                # If packed batch outer axis is too large, dense_packed.vta produces no legal
+                # schedule (local.acc_buffer / VTA_MAX_XFER overflow). Split into smaller calls.
+                # Packed shapes are statically determined from original 2D shapes.
+                b_outer = int(data_shape[0]) // int(self.bfactor)
+                k_outer = _ceil_div(int(data_shape[1]), int(self.blockin))
+                c_outer = int(units) // int(self.blockout)
+                dense = _chunk_packed_dense(
+                    packed_data,
+                    kernel,
+                    call.attrs.out_dtype,
+                    b_outer=b_outer,
+                    k_outer=k_outer,
+                    b_inner=int(self.bfactor),
+                    k_inner=int(self.blockin),
+                    c_outer=c_outer,
+                    c_inner=int(self.blockout),
+                )
                 if self.typetrack:
                     newshape = [oshape[0]//self.bfactor, units//self.blockout,
                                 self.bfactor, self.blockout]
@@ -766,8 +876,176 @@ class ExprPack(ExprMutator):
                 method = call.attrs.method
                 align_corners = call.attrs.align_corners
                 return op.nn.upsampling(data, scale_h, scale_w, data_layout, method, align_corners)
-            elif call.op == self.reshape and len(input_types[0].shape) == 4:
+            elif call.op == self.reshape:
                 (data,) = args
+                target_newshape = [int(x) for x in call.attrs.newshape]
+
+                # Dynamic transform-matrix path can feed padded dense output
+                # (e.g. logical 25 padded to 32). Trim to logical units before reshape.
+                if len(target_newshape) == 4 and \
+                   target_newshape[-1] in (3, 5, 7) and \
+                   target_newshape[-2] == target_newshape[-1] and \
+                   all(dim > 0 for dim in target_newshape):
+                    probe = data
+                    # Unwrap common single-arg wrappers (stop_fusion/copy/cast/...) to reach
+                    # the underlying producer. For concatenate-of-dense we need to detect
+                    # the pattern where probe is a concatenate of dense calls.
+                    def _unwrap_to_base(node):
+                        """Descend through common wrapper ops to reach the primary data producer.
+
+                        This unwraps:
+                        - unary wrappers with one arg: stop_fusion, copy, cast, clip, round, right_shift,
+                          reshape, transpose, strided_slice, nn.pad
+                        - binary-ish ops where one arg is a constant (e.g., multiply by constant,
+                          add constant). In those cases we follow the non-constant arg.
+                        - stops on concatenate and Tuple nodes (they are handled separately).
+                        """
+                        p = node
+                        seen = set()
+                        while True:
+                            # Prevent pathological loops
+                            if id(p) in seen:
+                                break
+                            seen.add(id(p))
+
+                            if isinstance(p, relay.Call) and isinstance(p.op, tvm.ir.Op):
+                                opname = p.op.name
+                                # Unary wrappers
+                                if opname in (
+                                    "annotation.stop_fusion",
+                                    "copy",
+                                    "cast",
+                                    "clip",
+                                    "round",
+                                    "reshape",
+                                    "transpose",
+                                    "strided_slice",
+                                    "nn.pad",
+                                ) and len(p.args) == 1:
+                                    p = p.args[0]
+                                    continue
+
+                                # Bit-shifts in quant epilogues are effectively unary for provenance:
+                                # always follow the data operand (arg0).
+                                if opname in ("right_shift", "left_shift") and len(p.args) == 2:
+                                    p = p.args[0]
+                                    continue
+
+                                # Binary ops with a constant operand: follow the non-constant input
+                                if opname in (
+                                    "multiply",
+                                    "add",
+                                    "subtract",
+                                    "divide",
+                                    "right_shift",
+                                    "left_shift",
+                                ) and len(p.args) == 2:
+                                    left, right = p.args
+                                    is_left_const = isinstance(left, relay.Constant)
+                                    is_right_const = isinstance(right, relay.Constant)
+                                    if is_left_const and not is_right_const:
+                                        p = right
+                                        continue
+                                    if is_right_const and not is_left_const:
+                                        p = left
+                                        continue
+
+                            # Stop unwrapping for other node types (including concatenate / Tuple)
+                            break
+                        return p
+
+                    probe = _unwrap_to_base(probe)
+
+                    def _contains_dense(node):
+                        found = [False]
+
+                        class _DenseFinder(relay.ExprVisitor):
+                            def visit_call(self, c):
+                                if isinstance(c.op, tvm.ir.Op) and c.op.name == "nn.dense":
+                                    found[0] = True
+                                super().visit_call(c)
+
+                        _DenseFinder().visit(node)
+                        return found[0]
+
+                    dense_like = False
+                    # Case 1: direct dense producer
+                    if isinstance(probe, relay.Call) and probe.op == self.dense:
+                        dense_like = True
+                    # Case 2: concatenate of dense parts (from _chunk_packed_dense)
+                    elif isinstance(probe, relay.Call) and isinstance(probe.op, tvm.ir.Op) and probe.op.name == "concatenate":
+                        # The concatenate may receive its inputs as multiple args or as a single
+                        # Tuple node (common in Relay: concatenate(Tuple([...]))). Normalize to
+                        # a flat list of elements to inspect.
+                        concat_elems = []
+                        if len(probe.args) == 1 and hasattr(probe.args[0], "fields"):
+                            # probe.args[0] is a Tuple node
+                            concat_elems = list(probe.args[0].fields)
+                        else:
+                            concat_elems = list(probe.args)
+
+                        # Ensure every concatenated element unwraps to a dense call
+                        all_dense = True
+                        for a in concat_elems:
+                            base = _unwrap_to_base(a)
+                            if not (isinstance(base, relay.Call) and base.op == self.dense):
+                                all_dense = False
+                                break
+                        if all_dense:
+                            dense_like = True
+                    elif hasattr(probe, "fields"):
+                        # probe is a bare Tuple (relay.Tuple) of elements (no concatenate call).
+                        concat_elems = list(probe.fields)
+                        all_dense = True
+                        for a in concat_elems:
+                            base = _unwrap_to_base(a)
+                            if not (isinstance(base, relay.Call) and base.op == self.dense):
+                                all_dense = False
+                                break
+                        if all_dense:
+                            dense_like = True
+
+                    # Fallback for wrapped dynamic-weight patterns where direct unwrap
+                    # does not land exactly on a dense call.
+                    if not dense_like and _contains_dense(data):
+                        dense_like = True
+
+                    rows = int(np.prod(target_newshape[:-2]))
+                    logical_units = int(target_newshape[-2] * target_newshape[-1])
+
+                    src_shape = None
+                    try:
+                        src_shape = [int(x) for x in input_types[0].shape]
+                    except Exception:  # pylint: disable=broad-except
+                        src_shape = None
+
+                    # In ANF the reshape input is often a Var, so producer-based unwrap
+                    # may miss dense provenance. Use typed shape gating as fallback:
+                    # - unpacked dense: [rows, padded_units]
+                    # - packed dense:   [rows, co_outer, b_inner, co_inner]
+                    should_trim = False
+                    if src_shape is not None:
+                        if len(src_shape) == 2 and src_shape[0] == rows and src_shape[1] >= logical_units:
+                            should_trim = True
+                        elif len(src_shape) == 4 and src_shape[0] == rows:
+                            packed_units = int(src_shape[1]) * int(src_shape[2]) * int(src_shape[3])
+                            if packed_units >= logical_units:
+                                should_trim = True
+
+                    if dense_like or should_trim:
+                        data = op.reshape(data, newshape=[rows, -1])
+                        dense_trimmed = op.strided_slice(
+                            data,
+                            begin=[0, 0],
+                            end=[rows, logical_units],
+                            strides=[1, 1],
+                        )
+                        return op.reshape(dense_trimmed, newshape=target_newshape)
+
+                # Keep original packed activation unpack behavior for 4D tensors.
+                if len(input_types[0].shape) != 4:
+                    return relay.Call(self.reshape, [data], call.attrs)
+
                 data_rank = self._resolve_effective_rank(data)
                 if data_rank != 6:
                     return relay.Call(self.reshape, [data], call.attrs)
@@ -952,13 +1230,25 @@ def graph_pack(
         or (start_name_idx < stop_name_idx)
     )
     expr = get_subgraph(expr, start_name, stop_name, start_name_idx, stop_name_idx, count_meta)
-    expr = run_opt_pass(expr, transform.InferType())
+    try:
+        expr = run_opt_pass(expr, transform.InferType())
+    except tvm.TVMError as err:
+        if "Input tensor shape and reshaped shape are not compatible" not in str(err):
+            raise
+        expr = _rewrite_prepack_dense_reshape_mismatch(expr)
+        expr = run_opt_pass(expr, transform.InferType())
     packer = ExprPack(
         bfactor, blockin,
         blockout, weight_bits)
     expr = packer.visit(expr)
     assert not packer.start_pack
-    expr = run_opt_pass(expr, transform.InferType())
+    try:
+        expr = run_opt_pass(expr, transform.InferType())
+    except tvm.TVMError as err:
+        if "Input tensor shape and reshaped shape are not compatible" not in str(err):
+            raise
+        expr = _rewrite_prepack_dense_reshape_mismatch(expr)
+        expr = run_opt_pass(expr, transform.InferType())
 
     if device_annot:
         expr_locator = ExprLocator()
@@ -976,6 +1266,107 @@ def graph_pack(
         return run_opt_pass(expr, transform.InferType())
 
     return expr
+
+
+def _rewrite_prepack_dense_reshape_mismatch(expr):
+    """Trim padded dense outputs before static reshape to avoid pre-pack InferType failures."""
+
+    class _Fix(ExprMutator):
+        def _unwrap_to_base(self, node):
+            p = node
+            seen = set()
+            while True:
+                if id(p) in seen:
+                    break
+                seen.add(id(p))
+                if isinstance(p, relay.Call) and isinstance(p.op, tvm.ir.Op):
+                    opname = p.op.name
+                    if opname in (
+                        "annotation.stop_fusion",
+                        "copy",
+                        "cast",
+                        "clip",
+                        "round",
+                        "reshape",
+                        "transpose",
+                        "strided_slice",
+                        "nn.pad",
+                    ) and len(p.args) == 1:
+                        p = p.args[0]
+                        continue
+                    if opname in ("right_shift", "left_shift") and len(p.args) == 2:
+                        p = p.args[0]
+                        continue
+                    if opname in (
+                        "multiply",
+                        "add",
+                        "subtract",
+                        "divide",
+                        "right_shift",
+                        "left_shift",
+                    ) and len(p.args) == 2:
+                        left, right = p.args
+                        is_left_const = isinstance(left, relay.Constant)
+                        is_right_const = isinstance(right, relay.Constant)
+                        if is_left_const and not is_right_const:
+                            p = right
+                            continue
+                        if is_right_const and not is_left_const:
+                            p = left
+                            continue
+                break
+            return p
+
+        def visit_call(self, call):
+            call = super().visit_call(call)
+            if not (isinstance(call.op, tvm.ir.Op) and call.op.name == "reshape"):
+                return call
+            if len(call.args) != 1:
+                return call
+
+            target_newshape = [int(x) for x in call.attrs.newshape]
+            if any(dim <= 0 for dim in target_newshape):
+                return call
+
+            probe = self._unwrap_to_base(call.args[0])
+
+            dense_like = isinstance(probe, relay.Call) and isinstance(probe.op, tvm.ir.Op) and probe.op.name == "nn.dense"
+            if not dense_like:
+                found = [False]
+
+                class _DenseFinder(relay.ExprVisitor):
+                    def visit_call(self, c):
+                        if isinstance(c.op, tvm.ir.Op) and c.op.name == "nn.dense":
+                            found[0] = True
+                        super().visit_call(c)
+
+                _DenseFinder().visit(call.args[0])
+                dense_like = found[0]
+            if not dense_like:
+                return call
+
+            rows = None
+            logical_units = None
+            if len(target_newshape) == 4 and target_newshape[-1] in (3, 5, 7) and target_newshape[-2] == target_newshape[-1]:
+                rows = int(np.prod(target_newshape[:-2]))
+                logical_units = int(target_newshape[-2] * target_newshape[-1])
+            elif len(target_newshape) == 2 and target_newshape[1] in (9, 25, 49):
+                rows = int(target_newshape[0])
+                logical_units = int(target_newshape[1])
+
+            if rows is None or logical_units is None or rows <= 0 or logical_units <= 0:
+                return call
+
+            normalized = op.reshape(call.args[0], newshape=[rows, -1])
+            trimmed = op.strided_slice(
+                normalized,
+                begin=[0, 0],
+                end=[rows, logical_units],
+                strides=[1, 1],
+            )
+            return op.reshape(trimmed, newshape=target_newshape)
+
+    return _Fix().visit(expr)
 
 
 def _collect_op_sequence(expr, count_meta=False):
@@ -1069,6 +1460,10 @@ def graph_pack_dynamic_weights(
             packed = expr
             used_graph_pack = False
             fallback_reason = "graph_pack transpose rank mismatch on dynamic graph"
+        elif allow_fallback and "Input tensor shape and reshaped shape are not compatible" in msg:
+            packed = expr
+            used_graph_pack = False
+            fallback_reason = "graph_pack reshape shape mismatch from chunked dense on dynamic graph"
         else:
             raise
 

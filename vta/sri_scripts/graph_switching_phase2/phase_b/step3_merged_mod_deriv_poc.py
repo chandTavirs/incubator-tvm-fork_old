@@ -15,8 +15,10 @@ happens inside the compiled graph.
 from __future__ import absolute_import, print_function
 
 import argparse
+import faulthandler
 import json
 import os
+import signal
 import sys
 import time
 
@@ -220,6 +222,7 @@ class _PoolLadderStripper(ExprMutator):
     def __init__(self, int8_pool_var_names):
         super().__init__()
         self.int8_pool_var_names = set(int8_pool_var_names)
+        self.wgt_width = int(vta.get_env().WGT_WIDTH)
 
     def _is_pool_int8_var(self, expr):
         return isinstance(expr, relay.Var) and expr.name_hint in self.int8_pool_var_names
@@ -229,6 +232,15 @@ class _PoolLadderStripper(ExprMutator):
 
     def _is_float32_expr(self, expr):
         return self._expr_dtype_no_checked_type(expr) == "float32"
+
+    def _make_dense_requant_epilogue(self, dense_i32):
+        """Match the packed VTA dense epilogue shape used by conv2d paths."""
+        shifted = relay.right_shift(dense_i32, relay.const(self.wgt_width, "int32"))
+        clipped = relay.clip(shifted, a_min=-127.0, a_max=127.0)
+        cast_i8 = relay.cast(clipped, "int8")
+        copied = relay.copy(cast_i8)
+        stopped = relay.annotation.stop_fusion(copied)
+        return relay.cast(stopped, "int32")
 
     def _strip_quant_ladder(self, call):
         if not (isinstance(call.op, tvm.ir.Op) and call.op.name == "cast"):
@@ -268,9 +280,11 @@ class _PoolLadderStripper(ExprMutator):
                 "strided_slice",
                 "reshape",
                 "annotation.stop_fusion",
+                "copy",
                 "transpose",
                 "expand_dims",
                 "squeeze",
+                "right_shift",
             }
             if expr.op.name in passthrough_ops and len(expr.args) >= 1:
                 return self._expr_dtype_no_checked_type(expr.args[0])
@@ -299,12 +313,13 @@ class _PoolLadderStripper(ExprMutator):
             data_dtype = self._expr_dtype_no_checked_type(data)
             weight_dtype = self._expr_dtype_no_checked_type(weight)
             out_dtype = str(call.attrs.out_dtype) if hasattr(call.attrs, "out_dtype") else ""
-            if data_dtype == "int8" and weight_dtype == "int8" and out_dtype != "int32":
-                # Force int32 accumulation, then requantize to int8 for downstream ops.
+            if data_dtype == "int8" and weight_dtype == "int8":
+                # Force int32 accumulation, then recreate the VTA-style dense epilogue
+                # so downstream packing/fusion sees the same right_shift -> clip -> cast ->
+                # copy -> stop_fusion shape used by conv2d paths.
                 units = call.attrs.units if hasattr(call.attrs, "units") else None
                 dense_i32 = relay.nn.dense(data, weight, units=units, out_dtype="int32")
-                dense_clipped = relay.clip(dense_i32, a_min=-127.0, a_max=127.0)
-                return relay.cast(dense_clipped, "int8")
+                return self._make_dense_requant_epilogue(dense_i32)
 
         return call
 
@@ -399,6 +414,7 @@ def step3b_compile_merged(
     enable_dynamic_dense_quant=False,
     static_debug_mode=False,
     enable_graph_pack=True,
+    return_packed_relay_only=False
 ):
     sep("3B Compile Merged: %s" % subnet_id)
 
@@ -497,18 +513,39 @@ def step3b_compile_merged(
         relay_prog = mod_compile["main"]
         print("  graph_pack: SKIPPED")
 
+    if return_packed_relay_only:
+        return relay_prog, params_for_build
+
     build_target = env.target
     print("  Build target: %s" % build_target)
+
+    build_timeout_sec = int(os.environ.get("STEP3_RELAY_BUILD_TIMEOUT_SEC", "600"))
+
+    def _on_build_timeout(_signum, _frame):
+        raise TimeoutError("relay.build exceeded timeout (%ds)" % build_timeout_sec)
 
     t0 = time.time()
     with autotvm.tophub.context(env.target, extra_files=schedule_logs):
         with vta.build_config(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
-            graph, lib, built_params = relay.build(
-                relay_prog,
-                target=build_target,
-                params=params_for_build,
-                target_host=env.target_host,
-            )
+            old_handler = None
+            if build_timeout_sec > 0:
+                print("  relay.build timeout: %ds" % build_timeout_sec)
+                old_handler = signal.signal(signal.SIGALRM, _on_build_timeout)
+                # Dump python traceback shortly before timeout for diagnostics.
+                faulthandler.dump_traceback_later(max(build_timeout_sec - 5, 1), repeat=False)
+                signal.alarm(build_timeout_sec)
+            try:
+                graph, lib, built_params = relay.build(
+                    relay_prog,
+                    target=build_target,
+                    params=params_for_build,
+                    target_host=env.target_host,
+                )
+            finally:
+                if build_timeout_sec > 0:
+                    signal.alarm(0)
+                    faulthandler.cancel_dump_traceback_later()
+                    signal.signal(signal.SIGALRM, old_handler)
     print("  relay.build done in %.1fs" % (time.time() - t0))
     print("  Built params: %d" % len(built_params))
 
@@ -677,7 +714,7 @@ def main():
         print("\n[4] Skipping VTA setup (--skip-vta)")
         env = remote = ctx = None
 
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(99)
     input_np = rng.standard_normal(INPUT_SHAPE).astype("float32")
 
     all_results = {}

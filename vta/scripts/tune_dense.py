@@ -33,8 +33,8 @@ env = vta.get_env()
 Workload = namedtuple("DenseWorkload", ["batch", "in_filter", "out_filter"])
 
 dense_wkls = [
-    ("lstm.dense.1", Workload(1, 256, 128)),
-    ("lstm.dense.4", Workload(4, 256, 128)),
+    ("lstm.dense.1", Workload(1, 256, 25)),
+    # ("lstm.dense.4", Workload(4, 256, 128)),
 ]
 
 
@@ -83,8 +83,8 @@ if __name__ == "__main__":
         os.remove(log_file)
 
     # Get tracker info from env
-    tracket_host = os.environ.get("TVM_TRACKER_HOST", None)
-    tracket_port = os.environ.get("TVM_TRACKER_PORT", None)
+    tracket_host = os.environ.get("TVM_TRACKER_HOST", "127.0.0.1")
+    tracket_port = int(os.environ.get("TVM_TRACKER_PORT", 9190))
     if not tracket_host or not tracket_port:
         print("Set your AutoTVM tracker node host and port variables to run the autotuner")
         exit()
@@ -103,7 +103,7 @@ if __name__ == "__main__":
             args=(N, CI, CO),
             target=tvm.target.vta(),
             target_host=env.target_host,
-            template_key="direct",
+            # template_key="direct",
         )
         print(task.config_space)
 

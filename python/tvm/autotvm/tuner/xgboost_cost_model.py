@@ -228,10 +228,12 @@ class XGBoostCostModel(CostModel):
     def fit_log(self, records, plan_size):
         tic = time.time()
 
-        # filter data, only pick the data with a same task
+        # Filter data to the exact same task identity. The task name alone is not
+        # sufficient for transfer learning because workload/target/code-hash
+        # changes can produce incompatible feature vectors for the same name.
         data = []
         for inp, res in records:
-            if inp.task.name == self.task.name:
+            if _same_task_identity(inp, self.task):
                 data.append((inp, res))
 
         logger.debug("XGB load %d entries from history log file", len(data))
@@ -350,6 +352,26 @@ class XGBoostCostModel(CostModel):
 
     def __del__(self):
         self._close_pool()
+
+
+def _same_task_identity(inp, task):
+    """Check whether a history record belongs to the same task identity."""
+
+    if inp.task.name != task.name:
+        return False
+
+    if getattr(inp.task, "workload", None) != getattr(task, "workload", None):
+        return False
+
+    if str(inp.target) != str(task.target):
+        return False
+
+    inp_code_hash = getattr(inp.config, "code_hash", None)
+    task_code_hash = getattr(getattr(task, "config_space", None), "code_hash", None)
+    if inp_code_hash is not None and task_code_hash is not None and inp_code_hash != task_code_hash:
+        return False
+
+    return True
 
 
 # Global variables for passing arguments to extract functions.

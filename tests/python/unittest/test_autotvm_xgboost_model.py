@@ -16,6 +16,7 @@
 # under the License.
 import time
 
+import copy
 import multiprocessing
 import numpy as np
 
@@ -24,6 +25,7 @@ from tvm import te
 from tvm import autotvm
 from tvm.autotvm import MeasureInput, MeasureResult
 from tvm.autotvm.tuner.xgboost_cost_model import XGBoostCostModel
+from tvm.autotvm.tuner.xgboost_cost_model import XGBoostCostModel, _same_task_identity
 
 from test_autotvm_common import get_sample_task, get_sample_records
 
@@ -65,7 +67,34 @@ def test_tuner():
     tuner.load_history(records)
 
 
+def test_same_task_identity_filter():
+    task, target = get_sample_task()
+
+    # Matching task/workload/target should be accepted.
+    match_task = copy.deepcopy(task)
+    match_task.config_space.code_hash = "cafecafe"
+    match_inp = MeasureInput(target, match_task, match_task.config_space.get(0))
+    match_inp.config.code_hash = "cafecafe"
+    assert _same_task_identity(match_inp, match_task)
+
+    # Mismatched workload should be rejected even if the task name is the same.
+    mismatch_task, _ = get_sample_task(n=64)
+    mismatch_task.config_space.code_hash = "cafecafe"
+    mismatch_conf = mismatch_task.config_space.get(0)
+    mismatch_conf.code_hash = "cafecafe"
+    mismatch_inp = MeasureInput(target, mismatch_task, mismatch_conf)
+    assert not _same_task_identity(mismatch_inp, match_task)
+
+    # Mismatched code hash should also be rejected when both hashes are known.
+    hash_task = copy.deepcopy(task)
+    hash_task.config_space.code_hash = "cafecafe"
+    hash_inp = MeasureInput(target, hash_task, hash_task.config_space.get(0))
+    hash_inp.config.code_hash = "dbffdbff"
+    assert not _same_task_identity(hash_inp, hash_task)
+
+
 if __name__ == "__main__":
     test_fit()
     test_fit_spawn()
     test_tuner()
+    test_same_task_identity_filter()
