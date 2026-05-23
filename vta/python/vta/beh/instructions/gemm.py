@@ -9,6 +9,10 @@ from ..config import env
 # Opcode, GEMM encoding
 VTA_OPCODE_GEMM = 2
 
+# GEMM mode flag: 0 = standard GEMM, 1 = matrix transform (gemm_trf)
+VTA_GEMM_MODE_STANDARD = 0
+VTA_GEMM_MODE_MAT_TRF = 1
+
 ENCODING = {
     'name': 'gemm',
     'type': 'gemm',
@@ -17,9 +21,11 @@ ENCODING = {
 
 # gemm_struct = utils.make_struct(encoding)
 def gemm(instr, uop_mem, inp_mem, wgt_mem, acc_mem, out_mem):
-    '''gemm instruction'''
+    '''gemm instruction - may dispatch to standard GEMM or matrix transform (gemm_trf)'''
     with hcl.Stage("gemm"):
-        reset_reg = hcl.scalar(instr[8:7], name="reset_reg")
+        # Extract GEMM mode flag from bit 7 (unused bit repurposed for variant selection)
+        gemm_mode = hcl.scalar(instr[7:7], name="gemm_mode")
+        reset_reg = hcl.scalar(instr[8:8], name="reset_reg")
         uop_bgn = hcl.scalar(instr[21:8], name="uop_bgn")
         uop_end = hcl.scalar(instr[35:21], name="uop_end")
         iter_out = hcl.scalar(instr[49:35], name="iter_out")
@@ -34,11 +40,17 @@ def gemm(instr, uop_mem, inp_mem, wgt_mem, acc_mem, out_mem):
         trace_mgr.Event("EXE", "GEM  %016lx%016lx\n", (instr[128:64], instr[64:0]))
         trace_mgr.Event("GEM_LOOP", "%04x %04x %04x %04x\n",
                         (iter_out, iter_in, uop_bgn, uop_end))
-        #hcl.print(reset_reg, "- reset_reg = %d\n")
 
-        gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
-                  src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
-                  uop_mem, inp_mem, wgt_mem, acc_mem, out_mem)
+        with hcl.if_(gemm_mode == VTA_GEMM_MODE_MAT_TRF):
+            trace_mgr.Event("GEM_MODE", "MAT_TRF\n")
+            gemm_trf_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
+                          src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
+                          uop_mem, inp_mem, wgt_mem, acc_mem, out_mem)
+        with hcl.else_():
+            trace_mgr.Event("GEM_MODE", "STANDARD\n")
+            gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
+                      src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
+                      uop_mem, inp_mem, wgt_mem, acc_mem, out_mem)
         trace_mgr.Event("RET", "GEM  %016lx%016lx\n", (instr[128:64], instr[64:0]))
 
 def decode_uop(uop):
@@ -104,6 +116,69 @@ def gemm_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, ds
             trace_mgr.Event("+GEM_ITR", "\n")
 
     with hcl.Stage("gemm_core"):
+        domain = (hcl.cast(hcl.UInt(32), iter_out.v), hcl.cast(hcl.UInt(32), iter_in.v),
+                  (hcl.cast(hcl.UInt(32), uop_end.v-uop_bgn.v)))
+        with hcl.if_(reset_reg.v == 1):
+            hcl.mutate(domain, fmutate_reset)
+        with hcl.else_():
+            hcl.mutate(domain, fmutate)
+
+def gemm_trf_core(reset_reg, iter_out, iter_in, uop_bgn, uop_end, dst_factor_out, dst_factor_in,
+                  src_factor_out, src_factor_in, wgt_factor_out, wgt_factor_in,
+                  uop_mem, inp_mem, wgt_mem, acc_mem, out_mem,
+                  batch=env.BATCH, blkin=env.BLOCK_IN, blkout=env.BLOCK_OUT):
+    '''gemm_trf core subblock - matrix transform variant
+    
+    Semantics:
+      - inp_mem[inp_idx] = packed transform blocks (input)
+      - wgt_mem[wgt_idx] = transformation matrix (weight-like)
+      - acc_mem/out_mem[acc_idx] = transformed output blocks
+    
+    Unlike standard GEMM which computes acc += inp * wgt, this computes:
+      transformed = transform(inp, trf_matrix)
+    '''
+    def fmutate(i, j, k):
+        k += uop_bgn
+        uop = uop_mem[k]
+        acc_idx, inp_idx, wgt_idx = decode_uop(uop)
+        acc_idx += j * hcl.cast(hcl.UInt(16), dst_factor_in.v) + \
+                   i * hcl.cast(hcl.UInt(16), dst_factor_out.v)
+        inp_idx += j * hcl.cast(hcl.UInt(16), src_factor_in.v) + \
+                   i * hcl.cast(hcl.UInt(16), src_factor_out.v)
+        wgt_idx += j * hcl.cast(hcl.UInt(16), wgt_factor_in.v) + \
+                   i * hcl.cast(hcl.UInt(16), wgt_factor_out.v)
+        itensor, trf_matrix = inp_mem[inp_idx], wgt_mem[wgt_idx]
+
+        m = hcl.reduce_axis(0, blkin, 'm')
+        # Matrix transform: apply transformation matrix to input blocks
+        # otensor[r,c] = sum_m(itensor[r,m] * trf_matrix[c,m])
+        otensor = hcl.compute(
+            (batch, blkout),
+            lambda r, c: hcl.sum(
+                hcl.cast(hcl.Int(8), itensor[r][m]) *
+                hcl.cast(hcl.Int(8), trf_matrix[c][m]), m,
+                name='trf_dot', dtype=hcl.Int(32)),
+            name='trf_multiply', dtype=hcl.Int(32))
+        # Write directly to output (no accumulation, direct transform output)
+        def fmutate_out(row, col):
+            out_mem[acc_idx][row][col] = hcl.cast(out_mem.dtype, otensor[row][col])
+        hcl.mutate(otensor.shape, fmutate_out)
+        if trace_mgr.Enabled():
+            trace_mgr.Event("GEM_TRF_ITR", "%04x %04x %04x %03x", (i, j, k, acc_idx))
+
+    def fmutate_reset(i, j, k):
+        k += uop_bgn.v
+        uop = uop_mem[k]
+        acc_idx, _, _ = decode_uop(uop)
+        acc_idx += j * hcl.cast(hcl.UInt(16), dst_factor_in.v) + \
+                   i * hcl.cast(hcl.UInt(16), dst_factor_out.v)
+        def fmutate_out_0(row, col):
+            out_mem[acc_idx][row][col] = 0
+        hcl.mutate((batch, blkout), fmutate_out_0)
+        if trace_mgr.Enabled():
+            trace_mgr.Event("GEM_TRF_ITR_RESET", "%04x %04x %04x %03x", (i, j, k, acc_idx))
+
+    with hcl.Stage("gemm_trf_core"):
         domain = (hcl.cast(hcl.UInt(32), iter_out.v), hcl.cast(hcl.UInt(32), iter_in.v),
                   (hcl.cast(hcl.UInt(32), uop_end.v-uop_bgn.v)))
         with hcl.if_(reset_reg.v == 1):
