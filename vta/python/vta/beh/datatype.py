@@ -108,8 +108,9 @@ VTA_OPCODE_BIT_WIDTH = 3
 # ALU opcode field bitwidth
 VTA_ALU_OPCODE_BIT_WIDTH = 3
 
-
-
+# GEMM mode flag: 0 = standard GEMM, 1 = matrix transform (gemm_trf)
+VTA_GEMM_MODE_STANDARD = 0
+VTA_GEMM_MODE_MAT_TRF = 1
 
 # Opcode, finish encoding
 VTA_OPCODE_FINISH = 3
