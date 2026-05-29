@@ -109,10 +109,15 @@ def FoldUopLoop():
 
     def _do_fold(stmt):
         env = get_env()
+        gemm_uop_scopes = {
+            env.dev.vta_push_uop.value,
+            env.dev.vta_push_uop_mat_trf_small.value,
+            env.dev.vta_push_uop_mat_trf_large.value,
+        }
         if (
             stmt.attr_key == "coproc_uop_scope"
             and isinstance(stmt.value, tvm.tir.StringImm)
-            and stmt.value.value == env.dev.vta_push_uop.value
+            and stmt.value.value in gemm_uop_scopes
         ):
             body = stmt.body
             begins = []

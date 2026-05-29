@@ -225,6 +225,38 @@ TVM_DLL void VTAUopLoopEnd();
 TVM_DLL int VTAPushGEMMOp(void** uop_handle, int (*finit)(void*), void* signature, int nbytes);
 
 /*!
+ * \brief Push GEMM_Mat_Trf uop kernel into the command handle.
+ *
+ * Emits a standard GEMM instruction with the FILL_FIELD_GEMM bits (empty_0)
+ * set to mat_trf_mode, selecting the matrix-transform compute path in hardware.
+ * Requires the bitstream to be built with LOG_UOP_BUFF_SIZE <= 14 (FILL_WIDTH_GEMM >= 2).
+ *
+ * \param uop_handle The uop cache handle.
+ * \param finit The initalization function to initialize uop.
+ * \param signature The closure arguments of the finit.
+ * \param nbytes Number of bytes in the closure arguments.
+ * \param mat_trf_mode empty_0 value: VTA_GEMM_MAT_TRF_EMPTY0_SMALL (1) or
+ *                     VTA_GEMM_MAT_TRF_EMPTY0_LARGE (3).
+ * \return 0 if success.
+ */
+TVM_DLL int VTAPushGEMMMatTrfOp(void** uop_handle, int (*finit)(void*), void* signature,
+                                 int nbytes, int mat_trf_mode);
+
+/*!
+ * \brief 4-arg wrapper for small (9x9) GEMM_Mat_Trf, usable as a coproc_uop_scope target.
+ *  Calls VTAPushGEMMMatTrfOp with mat_trf_mode = VTA_GEMM_MAT_TRF_EMPTY0_SMALL.
+ */
+TVM_DLL int VTAPushGEMMMatTrfOpSmall(void** uop_handle, int (*finit)(void*), void* signature,
+                                      int nbytes);
+
+/*!
+ * \brief 4-arg wrapper for large (25x25) GEMM_Mat_Trf, usable as a coproc_uop_scope target.
+ *  Calls VTAPushGEMMMatTrfOp with mat_trf_mode = VTA_GEMM_MAT_TRF_EMPTY0_LARGE.
+ */
+TVM_DLL int VTAPushGEMMMatTrfOpLarge(void** uop_handle, int (*finit)(void*), void* signature,
+                                      int nbytes);
+
+/*!
  * \brief Push ALU uop kernel into the command handle.
  * \param uop_handle The uop cache handle.
  * \param finit The initalization function to initialize uop.

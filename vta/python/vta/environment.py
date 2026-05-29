@@ -89,6 +89,8 @@ class DevContext(object):
     def __init__(self, env):
         self.vta_axis = te.thread_axis("vta")
         self.vta_push_uop = tvm.tir.StringImm("VTAPushGEMMOp")
+        self.vta_push_uop_mat_trf_small = tvm.tir.StringImm("VTAPushGEMMMatTrfOpSmall")
+        self.vta_push_uop_mat_trf_large = tvm.tir.StringImm("VTAPushGEMMMatTrfOpLarge")
         ctx = tvm.tir.call_intrin("handle", "tir.vta.command_handle")
         self.command_handle = tvm.tir.Call("handle", "tir.tvm_thread_context", [ctx])
         self.DEBUG_NO_SYNC = False
