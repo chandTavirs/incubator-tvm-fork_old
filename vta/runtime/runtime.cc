@@ -1468,6 +1468,26 @@ class CommandQueue {
     this->CheckInsnOverFlow();
   }
 
+  void PushGEMMMatTrfOp(void** uop_handle, int (*finit)(void*), void* signature, int nbytes,
+                         int mat_trf_mode) {
+    UopKernelMap** uptr = reinterpret_cast<UopKernelMap**>(uop_handle);
+    if (uptr[0] == nullptr) {
+      uptr[0] = new UopKernelMap();
+    }
+    UopKernel** kptr = uptr[0]->Get(signature, nbytes);
+    if (kptr[0] == nullptr) {
+      record_kernel_ = new UopKernel(static_cast<char*>(signature), nbytes);
+      CHECK_EQ((*finit)(signature), 0);
+      kptr[0] = static_cast<UopKernel*>(record_kernel_);
+      if (debug_flag_ & VTA_DEBUG_DUMP_UOP) {
+        record_kernel_->Dump();
+      }
+      record_kernel_ = nullptr;
+    }
+    this->PushGEMMMatTrfOp(static_cast<UopKernel*>(kptr[0]), mat_trf_mode);
+    this->CheckInsnOverFlow();
+  }
+
   void PushALUUop(void** uop_handle, int (*finit)(void*), void* signature, int nbytes) {
     UopKernelMap** uptr = reinterpret_cast<UopKernelMap**>(uop_handle);
     if (uptr[0] == nullptr) {
@@ -1529,7 +1549,7 @@ class CommandQueue {
       assert(loop[1].extent < (1 << VTA_LOOP_ITER_WIDTH));
       assert(loop[1].wgt_factor < (1 << VTA_WGT_FACTOR_WIDTH));
       assert(loop[1].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
-      assert(loop[1].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));    
+      assert(loop[1].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
       insn->iter_in = loop[1].extent;
       insn->wgt_factor_in = loop[1].wgt_factor;
       insn->src_factor_in = loop[1].src_factor;
@@ -1540,6 +1560,58 @@ class CommandQueue {
       insn->src_factor_in = 0;
       insn->dst_factor_in = 0;
     }
+  }
+
+  // Push GEMM_Mat_Trf uop to the command buffer.
+  // Identical to PushGEMMOp but sets empty_0 = mat_trf_mode in the instruction word,
+  // which routes the compute kernel to the matrix-transform path in the FPGA.
+  void PushGEMMMatTrfOp(UopKernel* kernel, int mat_trf_mode) {
+    uop_queue_.Push(kernel, [this]() { this->AutoSync(); });
+    if (uop_queue_.pending()) {
+      uop_queue_.FlushUopLoad(insn_queue_);
+    }
+    VTAGemInsn* insn = insn_queue_.CreateGemInsn();
+    insn->opcode = VTA_OPCODE_GEMM;
+    insn->reset_reg = kernel->reset_out_;
+    insn->uop_bgn = kernel->sram_begin_;
+    insn->uop_end = kernel->sram_end_;
+    const std::vector<UopKernel::LoopEntry>& loop = kernel->loop();
+    if (loop.size() > 0) {
+      assert(loop[0].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[0].wgt_factor < (1 << VTA_WGT_FACTOR_WIDTH));
+      assert(loop[0].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
+      assert(loop[0].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
+      insn->iter_out = loop[0].extent;
+      insn->wgt_factor_out = loop[0].wgt_factor;
+      insn->src_factor_out = loop[0].src_factor;
+      insn->dst_factor_out = loop[0].dst_factor;
+    } else {
+      insn->iter_out = 1;
+      insn->wgt_factor_out = 0;
+      insn->src_factor_out = 0;
+      insn->dst_factor_out = 0;
+    }
+    if (loop.size() > 1) {
+      assert(loop[1].extent < (1 << VTA_LOOP_ITER_WIDTH));
+      assert(loop[1].wgt_factor < (1 << VTA_WGT_FACTOR_WIDTH));
+      assert(loop[1].src_factor < (1 << VTA_INP_FACTOR_WIDTH));
+      assert(loop[1].dst_factor < (1 << VTA_ACC_FACTOR_WIDTH));
+      insn->iter_in = loop[1].extent;
+      insn->wgt_factor_in = loop[1].wgt_factor;
+      insn->src_factor_in = loop[1].src_factor;
+      insn->dst_factor_in = loop[1].dst_factor;
+    } else {
+      insn->iter_in = 1;
+      insn->wgt_factor_in = 0;
+      insn->src_factor_in = 0;
+      insn->dst_factor_in = 0;
+    }
+#if FILL_WIDTH_GEMM >= 2
+    insn->empty_0 = static_cast<uint64_t>(mat_trf_mode);
+#else
+    (void)mat_trf_mode;
+    CHECK(false) << "VTAPushGEMMMatTrfOp requires FILL_WIDTH_GEMM >= 2 (LOG_UOP_BUFF_SIZE <= 14)";
+#endif
   }
 
   // Push ALU uop to the command buffer
@@ -1725,6 +1797,23 @@ void VTAUopLoopEnd() { vta::CommandQueue::ThreadLocal()->record_kernel()->PushLo
 int VTAPushGEMMOp(void** uop_handle, int (*finit)(void*), void* signature, int nbytes) {
   vta::CommandQueue::ThreadLocal()->PushGEMMOp(uop_handle, finit, signature, nbytes);
   return 0;
+}
+
+int VTAPushGEMMMatTrfOp(void** uop_handle, int (*finit)(void*), void* signature, int nbytes,
+                         int mat_trf_mode) {
+  vta::CommandQueue::ThreadLocal()->PushGEMMMatTrfOp(uop_handle, finit, signature, nbytes,
+                                                      mat_trf_mode);
+  return 0;
+}
+
+int VTAPushGEMMMatTrfOpSmall(void** uop_handle, int (*finit)(void*), void* signature, int nbytes) {
+  return VTAPushGEMMMatTrfOp(uop_handle, finit, signature, nbytes,
+                              VTA_GEMM_MAT_TRF_EMPTY0_SMALL);
+}
+
+int VTAPushGEMMMatTrfOpLarge(void** uop_handle, int (*finit)(void*), void* signature, int nbytes) {
+  return VTAPushGEMMMatTrfOp(uop_handle, finit, signature, nbytes,
+                              VTA_GEMM_MAT_TRF_EMPTY0_LARGE);
 }
 
 int VTAPushALUOp(void** uop_handle, int (*finit)(void*), void* signature, int nbytes) {
