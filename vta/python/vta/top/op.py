@@ -32,6 +32,12 @@ from .utils import is_packed_layout
 from .vta_conv2d import conv2d_packed, schedule_conv2d_packed
 from .vta_conv2d_transpose import conv2d_transpose_packed, schedule_conv2d_transpose_packed
 from .vta_dense import dense_packed, schedule_dense_packed
+# Import vta_gmtf_op for side-effect: registers strategies for vta.gmtf_dense_small/large.
+# Guard with try/except so VTA still loads before the C++ rebuild completes.
+try:
+    from . import vta_gmtf_op as _vta_gmtf_op  # noqa: F401
+except Exception:
+    _vta_gmtf_op = None
 from .vta_depthwise_conv2d import depthwise_conv2d_packed, schedule_depthwise_conv2d_packed
 from .vta_pooling import pooling_packed, schedule_pooling_packed
 from ..environment import get_env

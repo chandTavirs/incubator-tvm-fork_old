@@ -28,6 +28,14 @@ from tvm.relay import op, transform
 from tvm.relay import ExprMutator
 
 from ..environment import get_env
+# Lazy import to avoid circular dependency; resolved at call time.
+_gmtf_op = None
+
+def _get_gmtf_op():
+    global _gmtf_op
+    if _gmtf_op is None:
+        from . import vta_gmtf_op as _gmtf_op  # noqa: F401 (side-effect: registers strategies)
+    return _gmtf_op
 
 
 def run_opt_pass(expr, opt_pass):
@@ -108,6 +116,8 @@ def _chunk_packed_dense(
     k_inner,
     c_outer,
     c_inner,
+    dense_fn=None,
+    max_chunk=None,
 ):
     """Chunk packed dense along the packed batch axis to satisfy VTA ACC buffer.
 
@@ -132,12 +142,21 @@ def _chunk_packed_dense(
 
     # Conservative on-chip accumulator constraint from schedule (tile_b_inner * tile_co_inner).
     # In current schedule tile_co_inner is forced to 1, so we bound by ACC buffer directly.
-    max_b_outer_per_call = int(env.ACC_BUFF_SIZE) // 2
+    if dense_fn is None:
+        dense_fn = lambda d, w: op.nn.dense(d, w, out_dtype=out_dtype)
+
+    # GMTF schedules bulk-load the whole chunk into inp_buffer (no internal tiling),
+    # so the caller passes max_chunk = inp_buffer capacity (2048 small / 1024 large).
+    # The standard dense path tiles internally, so it uses the looser ACC-based bound.
+    if max_chunk is not None:
+        max_b_outer_per_call = int(max_chunk)
+    else:
+        max_b_outer_per_call = int(env.ACC_BUFF_SIZE) // 2
     if max_b_outer_per_call <= 0:
-        return op.nn.dense(packed_data, packed_weight, out_dtype=out_dtype)
+        return dense_fn(packed_data, packed_weight)
 
     if b_outer <= max_b_outer_per_call:
-        return op.nn.dense(packed_data, packed_weight, out_dtype=out_dtype)
+        return dense_fn(packed_data, packed_weight)
 
     def _apply_vta_dense_epilogue(dense_i32):
         """Wrap a dense int32 output in the VTA requantization epilogue."""
@@ -158,7 +177,7 @@ def _chunk_packed_dense(
             end=[end, k_outer, b_inner, k_inner],
             strides=[1, 1, 1, 1],
         )
-        dense_chunk = op.nn.dense(data_slice, packed_weight, out_dtype="int32")
+        dense_chunk = dense_fn(data_slice, packed_weight)
         epilogued_chunk = _apply_vta_dense_epilogue(dense_chunk)
         parts.append(epilogued_chunk)
 
@@ -293,6 +312,46 @@ def _pack_weight_dense(data, dshape, blockout, blockin):
     data = op.reshape(data, newshape=newshape)
     data = op.transpose(
         data, axes=(0, 2, 1, 3))
+
+    return data
+
+
+# OFA kernel transform dimensions (must match HW constants VTA_MAT_TRF_DIM_SMALL/LARGE)
+_GMTF_DIM_SMALL = 9
+_GMTF_DIM_LARGE = 25
+
+
+def _pack_weight_gmtf_large(data, dshape, blockout, blockin):
+    """Pack a (25, 25) T matrix into GEMM_Mat_Trf large format.
+
+    Output shape: (2*blockout, 1, blockout, blockin) = (32, 1, 16, 16).
+    Layout: T[row][j] = packed[row, 0, j//blockin, j%blockin].
+    Rows 25..31 and bus-words 2..blockout-1 are zero-padded; the hardware
+    multiplies those terms by zero T entries, so the sum is unaffected.
+    """
+    assert len(dshape) == 2
+    n_rows  = int(dshape[0])   # 25
+    n_cols  = int(dshape[1])   # 25
+    n_buses = 2                 # ceil(25/blockin) = 2 valid bus words
+    total_rows = 2 * blockout   # 32
+
+    # 1. Pad rows from 25 to 32
+    if n_rows < total_rows:
+        data = op.nn.pad(data, [[0, total_rows - n_rows], [0, 0]])
+
+    # 2. Pad cols from 25 to 2*blockin = 32
+    total_cols = n_buses * blockin  # 32
+    if n_cols < total_cols:
+        data = op.nn.pad(data, [[0, 0], [0, total_cols - n_cols]])
+
+    # 3. Reshape (32, 32) → (32, 2, blockin): rows × bus_words × elements_per_bus
+    data = op.reshape(data, newshape=[total_rows, n_buses, blockin])
+
+    # 4. Pad bus_words from 2 to blockout=16: rows stay, bus dim expands with zeros
+    data = op.nn.pad(data, [[0, 0], [0, blockout - n_buses], [0, 0]])
+
+    # 5. Reshape (32, blockout, blockin) → (32, 1, blockout, blockin)
+    data = op.reshape(data, newshape=[total_rows, 1, blockout, blockin])
 
     return data
 
@@ -501,6 +560,14 @@ class ExprPack(ExprMutator):
         self.global_avg_pool2d = op.op.get("nn.global_avg_pool2d")
         self.max_pool2d = op.op.get("nn.max_pool2d")
         self.dense = op.op.get("nn.dense")
+        # GMTF ops are registered after C++ rebuild; guard with try/except so the
+        # packer is still importable before the build completes.
+        try:
+            self.gmtf_dense_small = op.op.get("vta.gmtf_dense_small")
+            self.gmtf_dense_large = op.op.get("vta.gmtf_dense_large")
+        except Exception:
+            self.gmtf_dense_small = None
+            self.gmtf_dense_large = None
         self.number_of_conv2d = 0
         super().__init__()
 
@@ -823,7 +890,42 @@ class ExprPack(ExprMutator):
 
                 self.is_packed = True
 
-                if len(kernel_shape) == 2:
+                # Detect OFA transform dense ops: units=None with a square (DIM×DIM) weight.
+                # Route to the dedicated vta.gmtf_dense_small/large ops so that relay.build
+                # can dispatch to the GMTF intrinsic schedule without a type-rel conflict.
+                is_gmtf_small = (
+                    units is None
+                    and len(kernel_shape) == 2
+                    and int(kernel_shape[0]) == _GMTF_DIM_SMALL
+                    and int(kernel_shape[1]) == _GMTF_DIM_SMALL
+                )
+                is_gmtf_large = (
+                    units is None
+                    and len(kernel_shape) == 2
+                    and int(kernel_shape[0]) == _GMTF_DIM_LARGE
+                    and int(kernel_shape[1]) == _GMTF_DIM_LARGE
+                )
+
+                # GMTF emits a SINGLE op per transform (no relay-level concatenate, which
+                # explodes for million-row layers).  The GMTF schedule tiles n_batch
+                # internally to respect inp_buffer / acc_buffer.  max_chunk huge ⇒ one call.
+                max_chunk = None
+                if is_gmtf_small:
+                    gmtf = _get_gmtf_op()
+                    # Standard weight packing (1, 1, BLOCK_OUT, BLOCK_IN) works for small mode.
+                    weight, kernel_shape, units = _weight_shape_match_dense(
+                        weight, kernel_shape, None, self.blockout, self.blockin,
+                    )
+                    kernel = _pack_weight_dense(weight, kernel_shape, self.blockout, self.blockin)
+                    dense_fn = lambda d, w: gmtf.gmtf_dense_small(d, w, out_dtype=call.attrs.out_dtype)
+                    max_chunk = 1 << 30  # never chunk; schedule tiles internally
+                elif is_gmtf_large:
+                    gmtf = _get_gmtf_op()
+                    kernel = _pack_weight_gmtf_large(weight, kernel_shape, self.blockout, self.blockin)
+                    units = 2 * self.blockout  # output: (n, 2, BATCH, BLOCK_OUT)
+                    dense_fn = lambda d, w: gmtf.gmtf_dense_large(d, w, out_dtype=call.attrs.out_dtype)
+                    max_chunk = 1 << 30  # never chunk; schedule tiles internally
+                elif len(kernel_shape) == 2:
                     weight, kernel_shape, units = _weight_shape_match_dense(
                         weight,
                         kernel_shape,
@@ -832,12 +934,11 @@ class ExprPack(ExprMutator):
                         self.blockin,
                     )
                     kernel = _pack_weight_dense(weight, kernel_shape, self.blockout, self.blockin)
+                    dense_fn = None  # use default nn.dense in _chunk_packed_dense
                 else:
                     return relay.Call(self.dense, [packed_data, weight], call.attrs)
 
-                # If packed batch outer axis is too large, dense_packed.vta produces no legal
-                # schedule (local.acc_buffer / VTA_MAX_XFER overflow). Split into smaller calls.
-                # Packed shapes are statically determined from original 2D shapes.
+                # If packed batch outer axis is too large, split into buffer-sized chunks.
                 b_outer = int(data_shape[0]) // int(self.bfactor)
                 k_outer = _ceil_div(int(data_shape[1]), int(self.blockin))
                 c_outer = int(units) // int(self.blockout)
@@ -851,6 +952,8 @@ class ExprPack(ExprMutator):
                     k_inner=int(self.blockin),
                     c_outer=c_outer,
                     c_inner=int(self.blockout),
+                    dense_fn=dense_fn,
+                    max_chunk=max_chunk,
                 )
                 if self.typetrack:
                     newshape = [oshape[0]//self.bfactor, units//self.blockout,
@@ -956,12 +1059,21 @@ class ExprPack(ExprMutator):
 
                     probe = _unwrap_to_base(probe)
 
+                    _dense_ops = {self.dense, self.gmtf_dense_small, self.gmtf_dense_large} - {None}
+
+                    def _is_dense_like(node):
+                        return (
+                            isinstance(node, relay.Call)
+                            and isinstance(node.op, tvm.ir.Op)
+                            and node.op in _dense_ops
+                        )
+
                     def _contains_dense(node):
                         found = [False]
 
                         class _DenseFinder(relay.ExprVisitor):
                             def visit_call(self, c):
-                                if isinstance(c.op, tvm.ir.Op) and c.op.name == "nn.dense":
+                                if _is_dense_like(c):
                                     found[0] = True
                                 super().visit_call(c)
 
@@ -970,7 +1082,7 @@ class ExprPack(ExprMutator):
 
                     dense_like = False
                     # Case 1: direct dense producer
-                    if isinstance(probe, relay.Call) and probe.op == self.dense:
+                    if _is_dense_like(probe):
                         dense_like = True
                     # Case 2: concatenate of dense parts (from _chunk_packed_dense)
                     elif isinstance(probe, relay.Call) and isinstance(probe.op, tvm.ir.Op) and probe.op.name == "concatenate":
@@ -988,7 +1100,7 @@ class ExprPack(ExprMutator):
                         all_dense = True
                         for a in concat_elems:
                             base = _unwrap_to_base(a)
-                            if not (isinstance(base, relay.Call) and base.op == self.dense):
+                            if not _is_dense_like(base):
                                 all_dense = False
                                 break
                         if all_dense:
@@ -999,7 +1111,7 @@ class ExprPack(ExprMutator):
                         all_dense = True
                         for a in concat_elems:
                             base = _unwrap_to_base(a)
-                            if not (isinstance(base, relay.Call) and base.op == self.dense):
+                            if not _is_dense_like(base):
                                 all_dense = False
                                 break
                         if all_dense:
