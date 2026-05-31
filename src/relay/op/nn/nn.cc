@@ -218,6 +218,64 @@ RELAY_REGISTER_OP("nn.contrib_dense_pack")
     .set_support_level(10)
     .add_type_rel("DensePack", DensePackRel<DenseAttrs>);
 
+// -----------------------------------------------------------------------
+// vta.gmtf_dense_small  (VTA GEMM_Mat_Trf, 3x3 kernel / 9x9 transform)
+//   data:   (n_batch, 1, BATCH, BLOCK_IN)
+//   weight: (1, 1, BLOCK_OUT, BLOCK_IN)
+//   out:    (n_batch, 1, BATCH, BLOCK_OUT)
+// -----------------------------------------------------------------------
+Expr MakeGmtfDenseSmall(Expr data, Expr weight, DataType out_dtype) {
+  auto attrs = make_object<DenseAttrs>();
+  attrs->out_dtype = out_dtype;
+  static const Op& op = Op::Get("vta.gmtf_dense_small");
+  return Call(op, {data, weight}, Attrs(attrs), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op.nn._make.gmtf_dense_small").set_body_typed(MakeGmtfDenseSmall);
+
+RELAY_REGISTER_OP("vta.gmtf_dense_small")
+    .describe(R"(VTA GEMM_Mat_Trf dense, small mode (3x3 kernel / 9x9 transform).
+data:   (n_batch, 1, BATCH, BLOCK_IN)     -- one inp tile per batch element
+weight: (1, 1, BLOCK_OUT, BLOCK_IN)       -- 9x9 T matrix in bus words 0..8
+out:    (n_batch, 1, BATCH, BLOCK_OUT)
+)")
+    .set_attrs_type<DenseAttrs>()
+    .set_num_inputs(2)
+    .add_argument("data",   "4D Tensor", "Packed input (n_batch, 1, BATCH, BLOCK_IN).")
+    .add_argument("weight", "4D Tensor", "GMTF small packed T matrix (1, 1, BLOCK_OUT, BLOCK_IN).")
+    .set_support_level(10)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable)
+    .add_type_rel("GmtfDenseSmall", GmtfDenseRel<DenseAttrs>);
+
+// -----------------------------------------------------------------------
+// vta.gmtf_dense_large  (VTA GEMM_Mat_Trf, 5x5 kernel / 25x25 transform)
+//   data:   (n_batch, 2, BATCH, BLOCK_IN)
+//   weight: (2*BLOCK_OUT, 1, BLOCK_OUT, BLOCK_IN)
+//   out:    (n_batch, 2, BATCH, BLOCK_OUT)
+// -----------------------------------------------------------------------
+Expr MakeGmtfDenseLarge(Expr data, Expr weight, DataType out_dtype) {
+  auto attrs = make_object<DenseAttrs>();
+  attrs->out_dtype = out_dtype;
+  static const Op& op = Op::Get("vta.gmtf_dense_large");
+  return Call(op, {data, weight}, Attrs(attrs), {});
+}
+
+TVM_REGISTER_GLOBAL("relay.op.nn._make.gmtf_dense_large").set_body_typed(MakeGmtfDenseLarge);
+
+RELAY_REGISTER_OP("vta.gmtf_dense_large")
+    .describe(R"(VTA GEMM_Mat_Trf dense, large mode (5x5 kernel / 25x25 transform).
+data:   (n_batch, 2, BATCH, BLOCK_IN)           -- two inp tiles per batch element
+weight: (2*BLOCK_OUT, 1, BLOCK_OUT, BLOCK_IN)   -- one wgt entry per T row (32 entries)
+out:    (n_batch, 2, BATCH, BLOCK_OUT)
+)")
+    .set_attrs_type<DenseAttrs>()
+    .set_num_inputs(2)
+    .add_argument("data",   "4D Tensor", "Packed input (n_batch, 2, BATCH, BLOCK_IN).")
+    .add_argument("weight", "4D Tensor", "GMTF large packed T matrix (2*BLOCK_OUT, 1, BLOCK_OUT, BLOCK_IN).")
+    .set_support_level(10)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable)
+    .add_type_rel("GmtfDenseLarge", GmtfDenseRel<DenseAttrs>);
+
 // relay.leaky_relu
 TVM_REGISTER_NODE_TYPE(LeakyReluAttrs);
 

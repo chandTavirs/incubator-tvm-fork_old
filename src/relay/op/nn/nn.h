@@ -128,6 +128,44 @@ bool DensePackRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   return true;
 }
 
+// Type relation for VTA GEMM_Mat_Trf dense ops (small and large mode).
+//
+// Small mode:
+//   data:   (n_batch, 1, BATCH, BLOCK_IN)
+//   weight: (1, 1, BLOCK_OUT, BLOCK_IN)          <- all 9 T rows in bus words 0..8
+//   out:    (n_batch, 1, BATCH, BLOCK_OUT)
+//
+// Large mode:
+//   data:   (n_batch, 2, BATCH, BLOCK_IN)
+//   weight: (2*BLOCK_OUT, 1, BLOCK_OUT, BLOCK_IN) <- one wgt entry per T row
+//   out:    (n_batch, 2, BATCH, BLOCK_OUT)
+//
+// General rule: out = (data[0], data[1], data[2], weight[2])
+// No k_o matching constraint — weight axis[1] is always 1 (GMTF wgt group index).
+template <typename AttrType>
+bool GmtfDenseRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+                  const TypeReporter& reporter) {
+  ICHECK_EQ(types.size(), 3);
+  const auto* data   = types[0].as<TensorTypeNode>();
+  const auto* weight = types[1].as<TensorTypeNode>();
+  if (data == nullptr || weight == nullptr) return false;
+
+  ICHECK_EQ(static_cast<int>(data->shape.size()),   4)
+      << "GmtfDenseRel: data must be 4D (n_batch, k_tiles, BATCH, BLOCK_IN)";
+  ICHECK_EQ(static_cast<int>(weight->shape.size()), 4)
+      << "GmtfDenseRel: weight must be 4D (n_rows, 1, BLOCK_OUT, BLOCK_IN)";
+
+  // out: (n_batch, k_tiles, BATCH, BLOCK_OUT)
+  Array<IndexExpr> oshape = {data->shape[0], data->shape[1], data->shape[2], weight->shape[2]};
+
+  const AttrType* param = attrs.as<AttrType>();
+  DataType out_dtype = param->out_dtype;
+  if (out_dtype.bits() == 0) out_dtype = data->dtype;
+
+  reporter->Assign(types[2], TensorType(oshape, out_dtype));
+  return true;
+}
+
 }  // namespace relay
 }  // namespace tvm
 #endif  // TVM_RELAY_OP_NN_NN_H_
