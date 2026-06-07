@@ -21,7 +21,8 @@ def _run(env, remote):
     print("CMA single-allocation probe (int8 buffers on ext_dev)")
     print("=" * 56)
     held = []  # keep references so they aren't freed between steps
-    for mb in [1, 2, 4, 8, 16, 32, 64, 128]:
+    for mb in [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+               64, 64, 64, 64, 64, 64, 64, 64]:  # push cumulatively until CMA fails
         n = mb * 1024 * 1024
         try:
             a = tvm.nd.array(np.zeros((n,), dtype="int8"), ctx)
