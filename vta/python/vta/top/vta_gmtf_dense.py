@@ -87,6 +87,13 @@ def schedule_dense_pack_gmtf_small(cfg, outs):
 
     Mirrors schedule_dense_packed but tensorizes at xbi using
     gemm_mat_trf(large_mode=False) instead of env.gemm.
+
+    Two paths:
+      epilogue=True  (merged module): output has VTA ALU post-ops; dense_stage is
+        inner; set_scope(acc_scope) + compute_at(output, x_co) is the standard pattern.
+      epilogue=False (derive module): output IS dense_stage (no VTA post-ops).
+        cache_write creates acc_dense in acc_scope; dense_stage (= output) stays in
+        global scope and triggers the DMA store via pragma.
     """
     assert len(outs) == 1
     output = outs[0]
@@ -116,66 +123,84 @@ def schedule_dense_pack_gmtf_small(cfg, outs):
     assert len(dense_res) == 1
     dense_stage = dense_res[0].output(0)
 
+    # Detect no-epilogue BEFORE cache_read / set_scope (cache_write changes the op).
+    no_epilogue = output.op.same_as(dense_stage.op)
+
     s   = te.create_schedule(output.op)
     env = get_env()
 
-    data, weight = dense_stage.op.input_tensors
-
-    cdata   = s.cache_read(data,   env.inp_scope, [dense_stage])
-    cweight = s.cache_read(weight, env.wgt_scope, [dense_stage])
-    s[dense_stage].set_scope(env.acc_scope)
-
-    cache_read_ewise = []
-    for consumer, tensor in ewise_inputs:
-        cache_read_ewise.append(s.cache_read(tensor, env.acc_scope, [consumer]))
-
-    for op in ewise_ops:
-        s[op].set_scope(env.acc_scope)
-        s[op].pragma(s[op].op.axis[0], env.alu)
-    for op in const_ops:
-        s[op].compute_inline()
-
-    # Tile n_batch into TILE-sized chunks.  The cross-tile STORE→LOAD dependency
-    # (illegal in VTA, runtime.cc:695) is avoided by exposing an OUTER reduce axis as
-    # the cache-read load point — exactly how conv2d places loads at k_o.  The reduction
-    # makes the acc buffer persistent state, so the buffer-reuse dependency routes
-    # STORE→COMPUTE→LOAD through the compute stage instead of a direct STORE→LOAD.
     # TILE=512: on-chip tile = 512 acc entries < 2048.
+    # Cross-tile STORE→LOAD (illegal VTA, runtime.cc:695) is avoided by placing the outer
+    # reduce axis (d_ko, extent 1) OUTSIDE the tile batch loop (d_b/x_bn), so buffer
+    # reuse routes STORE→COMPUTE→LOAD through the compute stage.
     TILE = 512
-    x_b, x_co, x_bi, x_ci = s[output].op.axis  # (n_batch, 1, BATCH=1, BLOCK_OUT=16)
-    x_bo, x_bn = s[output].split(x_b, factor=TILE)
-    s[output].reorder(x_bo, x_co, x_bn, x_bi, x_ci)
-    store_pt = x_co
 
-    s[dense_stage].compute_at(s[output], store_pt)
-    for op in ewise_ops:
-        s[op].compute_at(s[output], store_pt)
-    for tensor in cache_read_ewise:
-        s[tensor].compute_at(s[output], store_pt)
-        s[tensor].pragma(s[tensor].op.axis[0], env.dma_copy)
+    if no_epilogue:
+        # output IS dense_stage — no VTA epilogue ops after the GMTF compute.
+        # Use cache_write so the accumulation stage (acc_dense) lives in acc_scope and
+        # dense_stage (= output) stays in global scope for the DMA store pragma.
+        acc_dense = s.cache_write(dense_stage, env.acc_scope)
+        data_in, weight_in = acc_dense.op.input_tensors
+        cdata   = s.cache_read(data_in,   env.inp_scope, [acc_dense])
+        cweight = s.cache_read(weight_in, env.wgt_scope, [acc_dense])
 
-    # Split the reduce axis ki → (d_ko outer, d_kii inner).  d_ko (extent 1) is the
-    # conv2d-style load point and is placed OUTSIDE the batch loop d_b, so:
-    #   - the cache-read load is BULK (one DMA for the whole tile, not per-row), and
-    #   - FoldUopLoop folds d_b into a single UOP GEMM (one instruction, not per-row).
-    # This keeps instruction count O(tiles), not O(rows) — critical: per-row instructions
-    # overflow VTA_MAX_XFER (2^21 insns) at ~262144 rows.  Loads at d_ko (inside the
-    # compute scope) still give the STORE→COMPUTE ring (no illegal STORE→LOAD).
-    d_b, d_co, d_bi, d_ci = s[dense_stage].op.axis
-    (d_ki,) = s[dense_stage].op.reduce_axis
-    d_ko, d_kii = s[dense_stage].split(d_ki, factor=env.BLOCK_IN)
-    s[dense_stage].reorder(d_ko, d_b, d_bi, d_ci, d_kii)
-    s[cdata].compute_at(s[dense_stage],   d_ko)
-    s[cweight].compute_at(s[dense_stage], d_ko)
-    s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
-    s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        x_b, x_co, x_bi, x_ci = s[dense_stage].op.axis  # (n_batch, 1, BATCH=1, BLOCK_OUT=16)
+        x_bo, x_bn = s[dense_stage].split(x_b, factor=TILE)
+        s[dense_stage].reorder(x_bo, x_co, x_bn, x_bi, x_ci)
+        store_pt = x_co
 
-    s[dense_stage].tensorize(
-        d_bi,
-        intrin.gemm_mat_trf(env, mock=False, large_mode=False),
-    )
-    # Bulk store: pragma at x_bn (tile batch axis) stores the whole tile in ONE DMA.
-    s[output].pragma(x_bn, env.dma_copy)
+        s[acc_dense].compute_at(s[dense_stage], store_pt)
+
+        d_b, d_co, d_bi, d_ci = s[acc_dense].op.axis
+        (d_ki,) = s[acc_dense].op.reduce_axis
+        d_ko, d_kii = s[acc_dense].split(d_ki, factor=env.BLOCK_IN)
+        s[acc_dense].reorder(d_ko, d_b, d_bi, d_ci, d_kii)
+        s[cdata].compute_at(s[acc_dense],   d_ko)
+        s[cweight].compute_at(s[acc_dense], d_ko)
+        s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
+        s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        s[acc_dense].tensorize(d_bi, intrin.gemm_mat_trf(env, mock=False, large_mode=False))
+        s[dense_stage].pragma(x_bn, env.dma_copy)
+    else:
+        data, weight = dense_stage.op.input_tensors
+        cdata   = s.cache_read(data,   env.inp_scope, [dense_stage])
+        cweight = s.cache_read(weight, env.wgt_scope, [dense_stage])
+        s[dense_stage].set_scope(env.acc_scope)
+
+        cache_read_ewise = []
+        for consumer, tensor in ewise_inputs:
+            cache_read_ewise.append(s.cache_read(tensor, env.acc_scope, [consumer]))
+
+        for op in ewise_ops:
+            s[op].set_scope(env.acc_scope)
+            s[op].pragma(s[op].op.axis[0], env.alu)
+        for op in const_ops:
+            s[op].compute_inline()
+
+        x_b, x_co, x_bi, x_ci = s[output].op.axis  # (n_batch, 1, BATCH=1, BLOCK_OUT=16)
+        x_bo, x_bn = s[output].split(x_b, factor=TILE)
+        s[output].reorder(x_bo, x_co, x_bn, x_bi, x_ci)
+        store_pt = x_co
+
+        s[dense_stage].compute_at(s[output], store_pt)
+        for op in ewise_ops:
+            s[op].compute_at(s[output], store_pt)
+        for tensor in cache_read_ewise:
+            s[tensor].compute_at(s[output], store_pt)
+            s[tensor].pragma(s[tensor].op.axis[0], env.dma_copy)
+
+        # d_ko (extent 1) outside d_b: bulk cache-read load + FoldUopLoop folds d_b
+        # into a single UOP GEMM → instruction count O(tiles) not O(rows).
+        d_b, d_co, d_bi, d_ci = s[dense_stage].op.axis
+        (d_ki,) = s[dense_stage].op.reduce_axis
+        d_ko, d_kii = s[dense_stage].split(d_ki, factor=env.BLOCK_IN)
+        s[dense_stage].reorder(d_ko, d_b, d_bi, d_ci, d_kii)
+        s[cdata].compute_at(s[dense_stage],   d_ko)
+        s[cweight].compute_at(s[dense_stage], d_ko)
+        s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
+        s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        s[dense_stage].tensorize(d_bi, intrin.gemm_mat_trf(env, mock=False, large_mode=False))
+        s[output].pragma(x_bn, env.dma_copy)
 
     return s
 
@@ -232,6 +257,8 @@ def schedule_dense_pack_gmtf_large(cfg, outs):
     for relay.build: uses cache_read to set VTA scope, then tensorizes at xco (range 2).
     Epilogue ops (right_shift, clip, cast, copy, stop_fusion) from _PoolLadderStripper
     are scheduled as VTA ALU instructions.
+
+    Two paths (same rationale as small mode — see schedule_dense_pack_gmtf_small).
     """
     assert len(outs) == 1
     output = outs[0]
@@ -261,66 +288,79 @@ def schedule_dense_pack_gmtf_large(cfg, outs):
     assert len(dense_res) == 1
     dense_stage = dense_res[0].output(0)
 
+    # Detect no-epilogue BEFORE cache_read / set_scope (cache_write changes the op).
+    no_epilogue = output.op.same_as(dense_stage.op)
+
     s   = te.create_schedule(output.op)
     env = get_env()
 
-    data, weight = dense_stage.op.input_tensors
-
-    # DMA: DRAM → inp_scope / wgt_scope
-    cdata   = s.cache_read(data,   env.inp_scope, [dense_stage])
-    cweight = s.cache_read(weight, env.wgt_scope, [dense_stage])
-    s[dense_stage].set_scope(env.acc_scope)
-
-    # Cache-read any ewise (epilogue) inputs into acc_scope
-    cache_read_ewise = []
-    for consumer, tensor in ewise_inputs:
-        cache_read_ewise.append(s.cache_read(tensor, env.acc_scope, [consumer]))
-
-    for op in ewise_ops:
-        s[op].set_scope(env.acc_scope)
-        s[op].pragma(s[op].op.axis[0], env.alu)
-    for op in const_ops:
-        s[op].compute_inline()
-
-    # Tile n_batch.  Cross-tile STORE→LOAD (illegal, runtime.cc:695) is avoided by
-    # exposing an OUTER reduce axis as the cache-read load point (conv2d's k_o pattern),
-    # which routes the buffer-reuse dependency STORE→COMPUTE→LOAD through compute.
     # TILE=256: on-chip tile = 512 acc entries (2/batch elem) < 2048.
     TILE = 256
-    x_b, x_co, x_bi, x_ci = s[output].op.axis  # (n_batch, 2, BATCH=1, BLOCK_OUT=16)
-    x_bo, x_bn = s[output].split(x_b, factor=TILE)
-    s[output].reorder(x_bo, x_bn, x_co, x_bi, x_ci)
-    store_pt = x_bo
 
-    s[dense_stage].compute_at(s[output], store_pt)
-    for op in ewise_ops:
-        s[op].compute_at(s[output], store_pt)
-    for tensor in cache_read_ewise:
-        s[tensor].compute_at(s[output], store_pt)
-        s[tensor].pragma(s[tensor].op.axis[0], env.dma_copy)
+    if no_epilogue:
+        # output IS dense_stage: use cache_write for acc_scope; dense_stage (= output)
+        # stays in global scope and carries the DMA-store pragma.
+        acc_dense = s.cache_write(dense_stage, env.acc_scope)
+        data_in, weight_in = acc_dense.op.input_tensors
+        cdata   = s.cache_read(data_in,   env.inp_scope, [acc_dense])
+        cweight = s.cache_read(weight_in, env.wgt_scope, [acc_dense])
 
-    # Split inner reduce ki → (d_kio outer load point, d_kii inner).  d_kio (extent 1)
-    # is the conv2d-style load point, placed OUTSIDE the batch loop d_b so the load is
-    # BULK and d_b folds into one UOP GEMM (instruction count O(tiles), not O(rows) —
-    # per-row instructions overflow VTA_MAX_XFER at ~262144 rows).  Load at d_kio (in
-    # the compute scope) still gives the STORE→COMPUTE ring.
-    d_b, d_co, d_bi, d_ci = s[dense_stage].op.axis
-    d_ko, d_ki = s[dense_stage].op.reduce_axis
-    d_kio, d_kii = s[dense_stage].split(d_ki, factor=env.BLOCK_IN)
-    s[dense_stage].reorder(d_kio, d_b, d_co, d_bi, d_ci, d_ko, d_kii)
-    s[cdata].compute_at(s[dense_stage],   d_kio)
-    s[cweight].compute_at(s[dense_stage], d_kio)
-    s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
-    s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        x_b, x_co, x_bi, x_ci = s[dense_stage].op.axis  # (n_batch, 2, BATCH=1, BLOCK_OUT=16)
+        x_bo, x_bn = s[dense_stage].split(x_b, factor=TILE)
+        s[dense_stage].reorder(x_bo, x_bn, x_co, x_bi, x_ci)
+        store_pt = x_bo
 
-    # Tensorize at d_co (range 2); FoldUopLoop folds d_b (TILE) with stride-2
-    # → VTAUopLoopBegin(TILE, dst_factor=2, src_factor=2, wgt_factor=0).
-    s[dense_stage].tensorize(
-        d_co,
-        intrin.gemm_mat_trf(env, mock=False, large_mode=True),
-    )
+        s[acc_dense].compute_at(s[dense_stage], store_pt)
 
-    # DMA STORE of the tile (x_bn spans TILE elements).
-    s[output].pragma(x_bn, env.dma_copy)
+        d_b, d_co, d_bi, d_ci = s[acc_dense].op.axis
+        d_ko, d_ki = s[acc_dense].op.reduce_axis
+        d_kio, d_kii = s[acc_dense].split(d_ki, factor=env.BLOCK_IN)
+        s[acc_dense].reorder(d_kio, d_b, d_co, d_bi, d_ci, d_ko, d_kii)
+        s[cdata].compute_at(s[acc_dense],   d_kio)
+        s[cweight].compute_at(s[acc_dense], d_kio)
+        s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
+        s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        s[acc_dense].tensorize(d_co, intrin.gemm_mat_trf(env, mock=False, large_mode=True))
+        s[dense_stage].pragma(x_bn, env.dma_copy)
+    else:
+        data, weight = dense_stage.op.input_tensors
+        cdata   = s.cache_read(data,   env.inp_scope, [dense_stage])
+        cweight = s.cache_read(weight, env.wgt_scope, [dense_stage])
+        s[dense_stage].set_scope(env.acc_scope)
+
+        cache_read_ewise = []
+        for consumer, tensor in ewise_inputs:
+            cache_read_ewise.append(s.cache_read(tensor, env.acc_scope, [consumer]))
+
+        for op in ewise_ops:
+            s[op].set_scope(env.acc_scope)
+            s[op].pragma(s[op].op.axis[0], env.alu)
+        for op in const_ops:
+            s[op].compute_inline()
+
+        x_b, x_co, x_bi, x_ci = s[output].op.axis  # (n_batch, 2, BATCH=1, BLOCK_OUT=16)
+        x_bo, x_bn = s[output].split(x_b, factor=TILE)
+        s[output].reorder(x_bo, x_bn, x_co, x_bi, x_ci)
+        store_pt = x_bo
+
+        s[dense_stage].compute_at(s[output], store_pt)
+        for op in ewise_ops:
+            s[op].compute_at(s[output], store_pt)
+        for tensor in cache_read_ewise:
+            s[tensor].compute_at(s[output], store_pt)
+            s[tensor].pragma(s[tensor].op.axis[0], env.dma_copy)
+
+        # d_kio (extent 1) outside d_b: bulk load + FoldUopLoop folds d_b with stride-2
+        # → VTAUopLoopBegin(TILE, dst_factor=2, src_factor=2, wgt_factor=0).
+        d_b, d_co, d_bi, d_ci = s[dense_stage].op.axis
+        d_ko, d_ki = s[dense_stage].op.reduce_axis
+        d_kio, d_kii = s[dense_stage].split(d_ki, factor=env.BLOCK_IN)
+        s[dense_stage].reorder(d_kio, d_b, d_co, d_bi, d_ci, d_ko, d_kii)
+        s[cdata].compute_at(s[dense_stage],   d_kio)
+        s[cweight].compute_at(s[dense_stage], d_kio)
+        s[cdata].pragma(s[cdata].op.axis[0],     env.dma_copy)
+        s[cweight].pragma(s[cweight].op.axis[0], env.dma_copy)
+        s[dense_stage].tensorize(d_co, intrin.gemm_mat_trf(env, mock=False, large_mode=True))
+        s[output].pragma(x_bn, env.dma_copy)
 
     return s

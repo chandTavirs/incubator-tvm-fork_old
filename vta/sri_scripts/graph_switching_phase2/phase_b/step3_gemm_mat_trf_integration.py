@@ -104,7 +104,8 @@ class _CompositeAwarePoolLadderStripper(_PoolLadderStripper):
     def visit_call(self, call):
         if isinstance(call.op, relay.Function):
             try:
-                composite_tag = call.op.attrs and call.op.attrs.get("Composite")
+                # tvm.ir.DictAttrs has no .get() — use [] with try/except
+                composite_tag = call.op.attrs and call.op.attrs["Composite"]
             except Exception:
                 composite_tag = None
             if composite_tag:
