@@ -288,6 +288,16 @@ class _PoolLadderStripper(ExprMutator):
             }
             if expr.op.name in passthrough_ops and len(expr.args) >= 1:
                 return self._expr_dtype_no_checked_type(expr.args[0])
+            # Arithmetic ops propagate dtype: float32 dominates, otherwise all-same wins.
+            arith_ops = {"multiply", "add", "subtract", "divide", "sqrt", "negative",
+                         "round", "nn.relu", "abs"}
+            if expr.op.name in arith_ops:
+                arg_dtypes = [self._expr_dtype_no_checked_type(a) for a in expr.args]
+                if "float32" in arg_dtypes:
+                    return "float32"
+                non_none = [d for d in arg_dtypes if d is not None]
+                if non_none and len(set(non_none)) == 1:
+                    return non_none[0]
         return None
 
     def visit_call(self, call):

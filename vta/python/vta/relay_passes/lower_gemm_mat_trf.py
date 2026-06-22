@@ -39,8 +39,41 @@ def _normalize_names(transform_var_names):
     return normalized
 
 
+def _unwrap_quant_chain_to_var(expr):
+    """Walk cast/clip/round/multiply chains to find an underlying relay.Var.
+
+    Handles the pattern produced by enable_dynamic_dense_quant=True:
+      cast(clip(round(multiply(cast(transform_var, float32), scale))), int8)
+    Returns the relay.Var if found, else None.
+    """
+    if isinstance(expr, relay.Var):
+        return expr
+    if not isinstance(expr, relay.Call) or not isinstance(expr.op, tvm.ir.Op):
+        return None
+    op_name = expr.op.name
+    if op_name in ("cast", "round", "clip", "annotation.stop_fusion"):
+        return _unwrap_quant_chain_to_var(expr.args[0])
+    if op_name == "multiply":
+        v = _unwrap_quant_chain_to_var(expr.args[0])
+        if v is not None:
+            return v
+        return _unwrap_quant_chain_to_var(expr.args[1])
+    return None
+
+
 def _is_transform_weight(expr, normalized_names):
-    return isinstance(expr, relay.Var) and expr.name_hint in normalized_names
+    """True if expr is a known transform var, or a quantize chain wrapping one.
+
+    The enable_dynamic_dense_quant path wraps transform vars in:
+      cast(clip(round(multiply(cast(var, float32), scale))), int8)
+    We detect this by unwrapping the chain to find the underlying Var.
+    """
+    if isinstance(expr, relay.Var):
+        return expr.name_hint in normalized_names
+    underlying = _unwrap_quant_chain_to_var(expr)
+    return (underlying is not None
+            and isinstance(underlying, relay.Var)
+            and underlying.name_hint in normalized_names)
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +145,15 @@ class DenseTransformLowerer(ExprMutator):
     def _lower_cpu(self, data_arg, weight_arg, original_call):
         """Substitute relay.const if pre-computed, else leave for CPU dense."""
         import numpy as np
-        arr = self._precomputed.get(weight_arg.name_hint)
-        if arr is not None:
-            return relay.const(arr.astype("float32"))
-        # No pre-computed value: x86 dense will execute it at runtime.
+        # weight_arg may be a bare Var or a quantize chain wrapping one.
+        underlying = (weight_arg if isinstance(weight_arg, relay.Var)
+                      else _unwrap_quant_chain_to_var(weight_arg))
+        name = getattr(underlying, "name_hint", None)
+        if name is not None:
+            arr = self._precomputed.get(name)
+            if arr is not None:
+                return relay.const(arr.astype("float32"))
+        # No pre-computed value: CPU dense will execute it at runtime.
         return original_call
 
     # ------------------------------------------------------------------
