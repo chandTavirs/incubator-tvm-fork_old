@@ -125,6 +125,102 @@ class _CompositeAwarePoolLadderStripper(_PoolLadderStripper):
         return super().visit_call(call)
 
 
+class _Fix3x3BNFoldShift(ExprMutator):
+    """Fix 3×3 (two-stage Dense) BN fold: relay.quantize emits shift=12/bias=2048, but
+    stage2_int8 × BN_scale_16 = 127 × 16 = 2032 < 2048 → ALL outputs round to zero.
+
+    Root cause: relay.quantize adds 4 to the BN fold shift for each Dense stage's
+    right_shift(4) epilogue (from _PoolLadderStripper), but this extra shift makes
+    the rounding bias (2048) exceed the maximum product, zeroing every value.
+
+    Fix: use shift=7/bias=64, which gives (127 × 1 + 64) >> 7 = 1 → non-zero
+    even when BN_scale rounds to 1 (block3 large-channel case). Safe to apply
+    globally: shift=12 and bias=2048 appear ONLY in 3×3 BN folds in this graph.
+    """
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name == "right_shift" and len(call.args) == 2:
+            lhs, rhs = call.args
+            if isinstance(rhs, relay.Constant):
+                val = int(rhs.data.asnumpy().flat[0])
+                if val == 12:
+                    return relay.right_shift(lhs, relay.const(7, "int32"))
+        if call.op.name == "add" and len(call.args) == 2:
+            lhs, rhs = call.args
+            if isinstance(rhs, relay.Constant):
+                arr = rhs.data.asnumpy()
+                if arr.size == 1 and int(arr.flat[0]) == 2048:
+                    return relay.add(lhs, relay.const(64, "int32"))
+        return call
+
+
+def _fix_3x3_bn_fold_shift(mod):
+    main = mod["main"]
+    new_body = _Fix3x3BNFoldShift().visit(main.body)
+    new_main = relay.Function(
+        main.params, new_body, main.ret_type, main.type_params, main.attrs
+    )
+    new_mod = tvm.IRModule.from_expr(new_main)
+    return relay.transform.InferType()(new_mod)
+
+
+class _Fix5x5BNFoldShift(ExprMutator):
+    """Fix 5×5 (single-stage Dense) BN fold: relay.quantize emits shift=8/bias=128.
+
+    Root cause: graphpack ×16 on both Dense Large inputs yields 256×/16 = 16×
+    over-amplified stage1 vs. what relay.quantize calibrated for. Rounding bias
+    (128) exceeds stage1×BN_scale for BN_scale=1 channels: 127×1+128=255 < 256
+    → zero for every BN_scale=1 channel (block3 BN_gamma ≈ 0.06).
+
+    Fix: shift=5/bias=16. Threshold drops from stage1≥128 (impossible, int8 max=127)
+    to stage1≥16, recovering BN_scale=1 channels: (127×1+16)>>5=4.
+
+    Shape guard: only patches add(X,128)→right_shift(8) where X has 5×5 spatial
+    dims. Leaves 3×3 BN folds that also use shift=8 (arch variants) untouched.
+    """
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name != "right_shift" or len(call.args) != 2:
+            return call
+        lhs, rhs = call.args
+        if not isinstance(rhs, relay.Constant):
+            return call
+        if int(rhs.data.asnumpy().flat[0]) != 8:
+            return call
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return call
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return call
+        bias_arr = add_rhs.data.asnumpy()
+        if bias_arr.size != 1 or int(bias_arr.flat[0]) != 128:
+            return call
+        try:
+            shape = [int(d) for d in lhs.checked_type.shape]
+        except Exception:
+            return call
+        if len(shape) < 2 or shape[-2] != 5 or shape[-1] != 5:
+            return call
+        new_add = relay.add(lhs.args[0], relay.const(16, "int32"))
+        return relay.right_shift(new_add, relay.const(5, "int32"))
+
+
+def _fix_5x5_bn_fold_shift(mod):
+    main = mod["main"]
+    new_body = _Fix5x5BNFoldShift().visit(main.body)
+    new_main = relay.Function(
+        main.params, new_body, main.ret_type, main.type_params, main.attrs
+    )
+    new_mod = tvm.IRModule.from_expr(new_main)
+    return relay.transform.InferType()(new_mod)
+
+
 def _materialize_int8_pool_constants(mod_q, tvm_params_full, pool_var_names):
     """Like the base version but uses _CompositeAwarePoolLadderStripper.
 
@@ -543,7 +639,10 @@ def step6_materialize_int8_pool(mod_q, tvm_params, pool_var_names):
         "  Int8 runtime pool: %d | Float32 runtime pool: %d"
         % (len(int8_runtime_pool_params), len(runtime_pool_params_np))
     )
-    
+
+    print("  Fixing 3x3 BN fold shift (12->7, bias 2048->64) ...")
+    mod_compile = _fix_3x3_bn_fold_shift(mod_compile)
+
     return mod_compile, runtime_pool_params_np
 
 

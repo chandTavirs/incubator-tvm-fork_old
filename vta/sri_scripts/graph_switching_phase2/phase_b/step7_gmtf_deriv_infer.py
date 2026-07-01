@@ -174,6 +174,71 @@ def _split_mod(mod_compile):
 
 
 # ============================================================
+# Fix scale inconsistency introduced by _Fix3x3BNFoldShift
+# ============================================================
+
+class _Fix3x3InferConv2dShift(relay.ExprMutator):
+    """Fix infer-module conv2d output shift for 3×3 kernels derived via two-stage Dense.
+
+    _Fix3x3BNFoldShift changed the derive module's 3×3 BN fold from shift=12→7
+    (and bias 2048→64), making the 3×3 derived weights 2^(12-7)=32× larger than
+    relay.quantize expected. The infer conv2d for those layers still uses the
+    relay.quantize-generated right_shift (e.g. 4), which now under-shifts by 5 bits.
+
+    Pattern in the post-graphpack infer_fn:
+        nn.conv2d(..., kernel_size=[3,3], ...) → add(bias) → right_shift(N) → clip → cast
+
+    Fix: for 3×3 conv2d outputs, right_shift(N) → right_shift(N+5) and update the
+    rounding bias to 2^(N+5-1) = 2^(N+4).
+
+    All other kernel sizes (1×1, 5×5, 7×7) are unchanged — only 3×3 paths went
+    through two Dense stages whose BN fold we patched.
+    """
+    _EXTRA_SHIFT = 5  # = orig_bn_fold_shift(12) - new_bn_fold_shift(7)
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name != "right_shift" or len(call.args) != 2:
+            return call
+        rhs = call.args[1]
+        if not isinstance(rhs, relay.Constant):
+            return call
+        # lhs should be add(conv2d_output, rounding_bias)
+        lhs = call.args[0]
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return call
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return call
+        conv = lhs.args[0]
+        if not (isinstance(conv, relay.Call) and isinstance(conv.op, tvm.ir.Op)
+                and conv.op.name == "nn.conv2d"):
+            return call
+        # Only fix 3×3 kernels — those are the two-stage Dense paths
+        ks = list(conv.attrs.kernel_size)
+        if ks != [3, 3]:
+            return call
+        old_shift = int(rhs.data.asnumpy().flat[0])
+        new_shift = old_shift + self._EXTRA_SHIFT
+        new_bias  = 1 << (new_shift - 1)
+        new_add   = relay.add(conv, relay.const(new_bias, "int32"))
+        return relay.right_shift(new_add, relay.const(new_shift, "int32"))
+
+
+def _fix_3x3_infer_conv2d_shift(infer_fn):
+    new_body = _Fix3x3InferConv2dShift().visit(infer_fn.body)
+    new_fn = relay.Function(
+        infer_fn.params, new_body, infer_fn.ret_type,
+        infer_fn.type_params, infer_fn.attrs,
+    )
+    new_mod = tvm.IRModule.from_expr(new_fn)
+    return relay.transform.InferType()(new_mod)["main"]
+
+
+# ============================================================
 # Build one derive + infer module pair
 # ============================================================
 
@@ -245,6 +310,15 @@ def build_deriv_infer_subnet(subnet_id, arch, ofa_net, pool, env, schedule_logs,
     # derive_fn outputs VTA-packed weights (includes layout_transform).
     # infer_fn receives pre-packed derived_weight_i — no layout_transform at inference time.
     derive_fn, infer_fn, n_w, derived_vars = _split_mod(mod_packed)
+
+    # Save post-graphpack derive + infer IR to files for inspection
+    _ir_dir = os.path.join(SCRIPT_DIR, "step3_results")
+    _derive_ir_path = os.path.join(_ir_dir, "derive_fn_ir_%s.txt" % subnet_id)
+    _infer_ir_path  = os.path.join(_ir_dir, "infer_fn_ir_%s.txt"  % subnet_id)
+    with open(_derive_ir_path, "w") as _f:
+        _f.write(derive_fn.astext(show_meta_data=False))
+    with open(_infer_ir_path, "w") as _f:
+        _f.write(infer_fn.astext(show_meta_data=False))
 
     # BN scale params (gamma, var) that appear in derive_fn are per-subnet constants —
     # fold them into the derive module at build time so they need not be bound at runtime.
@@ -667,6 +741,92 @@ def main():
               % (sid, t1v, t1r, match,
                  tm["switch"], tm["derive_run"], tm["bind_derived"],
                  tm["run"]), flush=True)
+
+    # ------------------------------------------------------------------
+    print("", flush=True)
+    print("[7b] Derive IR + output diagnostics ...", flush=True)
+    for i, built in enumerate(built_list[:1]):   # only subnet 0
+        sid = built["subnet_id"]
+        ir_dir = os.path.join(SCRIPT_DIR, "step3_results")
+        derive_ir_path = os.path.join(ir_dir, "derive_fn_ir_%s.txt" % sid)
+        infer_ir_path  = os.path.join(ir_dir, "infer_fn_ir_%s.txt"  % sid)
+
+        with open(derive_ir_path) as f:
+            derive_ir = f.read()
+        with open(infer_ir_path) as f:
+            infer_ir = f.read()
+
+        has_gmtf_large = "vta.gmtf_dense_large" in derive_ir
+        has_gmtf_small = "vta.gmtf_dense_small" in derive_ir
+        gmtf_large_count = derive_ir.count("vta.gmtf_dense_large")
+        gmtf_small_count = derive_ir.count("vta.gmtf_dense_small")
+        has_nn_dense     = "nn.dense" in derive_ir
+        print("  [derive IR] %s" % sid, flush=True)
+        print("    vta.gmtf_dense_large: %d occurrences" % gmtf_large_count, flush=True)
+        print("    vta.gmtf_dense_small: %d occurrences" % gmtf_small_count, flush=True)
+        print("    nn.dense (uncompiled): %s" % ("YES — fallback ops remain!" if has_nn_dense else "none"), flush=True)
+
+        # Print first 60 lines of derive IR
+        print("  --- derive_fn IR (first 60 lines) ---", flush=True)
+        for ln in derive_ir.splitlines()[:60]:
+            print("  " + ln, flush=True)
+
+        # Infer IR snippet
+        has_conv2d_infer = "nn.conv2d" in infer_ir
+        infer_line_count = len(infer_ir.splitlines())
+        print("  [infer IR]  lines=%d  nn.conv2d present=%s" % (infer_line_count, has_conv2d_infer), flush=True)
+        print("  --- infer_fn IR (first 30 lines) ---", flush=True)
+        for ln in infer_ir.splitlines()[:30]:
+            print("  " + ln, flush=True)
+
+        # Switch to this subnet and inspect derive outputs
+        rt._evict()
+        rt._switch(i)
+        m_derive = rt.live_derive_m
+        n_w = built["n_derived_weights"]
+
+        # Compute float32 reference derived weights from pool numpy arrays.
+        # Reproduce the GMTF steps: strided_slice(pool_base) → reshape → TM_mul → reshape.
+        # We use the merged relay IR (pre-graphpack) op ordering to know which TM goes with which base.
+        # For simplicity, compute float32 reference RMS from the numpy pool directly:
+        # float32_rms = RMS of raw float32 derived weight (no quantization).
+        # VTA int8 output represents float32 × HW_QUANT_SCALE; so:
+        #   expected VTA RMS ≈ float32_rms × HW_QUANT_SCALE
+        # We do the GMTF manually for each derive output using pool numpy arrays.
+        HW_QUANT_SCALE = 128.0
+        INT8_SCALE = 16.0   # input pool weight quantization: int8 = round(float32 × 16)
+
+        # Build (name → numpy float32) for pool vars
+        base_w_np = {k: v.numpy() if hasattr(v, "numpy") else np.array(v)
+                     for k, v in pool["base_weights"].items()}
+        tm_np = {k: v.numpy() if hasattr(v, "numpy") else np.array(v)
+                 for k, v in pool["transform_matrices"].items()}
+
+        print("  [derive outputs] RMS check (n_weights=%d):" % n_w, flush=True)
+        all_zero_count = 0
+        saturated_count = 0
+        for wi in range(n_w):
+            try:
+                arr = m_derive.get_output(wi).asnumpy().astype(np.float32)
+            except Exception as e:
+                print("    weight_%d: ERROR %s" % (wi, e), flush=True)
+                continue
+            rms = float(np.sqrt(np.mean(arr ** 2)))
+            amax = float(np.max(np.abs(arr)))
+            nz_pct = float(100.0 * np.count_nonzero(arr) / arr.size)
+            flags = []
+            if rms < 0.1:
+                flags.append("ALL-ZERO?")
+                all_zero_count += 1
+            if amax >= 126.5:
+                flags.append("SATURATED?")
+                saturated_count += 1
+            flag_str = "  *** " + " ".join(flags) if flags else ""
+            print("    weight_%2d  shape=%-30s  rms=%6.2f  max_abs=%5.1f  nz=%.0f%%%s"
+                  % (wi, str(arr.shape), rms, amax, nz_pct, flag_str), flush=True)
+
+        print("  Summary: %d all-zero, %d saturated (out of %d)"
+              % (all_zero_count, saturated_count, n_w), flush=True)
 
     # ------------------------------------------------------------------
     print("", flush=True)

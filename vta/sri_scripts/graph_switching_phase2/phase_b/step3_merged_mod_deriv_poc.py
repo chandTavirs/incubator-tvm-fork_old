@@ -219,10 +219,14 @@ def _is_scalar_const(expr):
 class _PoolLadderStripper(ExprMutator):
     """Replace pool-only float32->int8 quant ladders with direct int8 pool vars."""
 
+    # Requant shift for GMTF Dense int8×int8 accumulator → int8 output.
+    # Empirically validated for both stage-1 (7→5) and stage-2 (5→3) paths.
+    # WGT_WIDTH=8 (the old value) was wrong: it drives both-stage outputs to zero.
+    _GMTF_REQUANT_SHIFT = 4
+
     def __init__(self, int8_pool_var_names):
         super().__init__()
         self.int8_pool_var_names = set(int8_pool_var_names)
-        self.wgt_width = int(vta.get_env().WGT_WIDTH)
 
     def _is_pool_int8_var(self, expr):
         return isinstance(expr, relay.Var) and expr.name_hint in self.int8_pool_var_names
@@ -235,7 +239,7 @@ class _PoolLadderStripper(ExprMutator):
 
     def _make_dense_requant_epilogue(self, dense_i32):
         """Match the packed VTA dense epilogue shape used by conv2d paths."""
-        shifted = relay.right_shift(dense_i32, relay.const(self.wgt_width, "int32"))
+        shifted = relay.right_shift(dense_i32, relay.const(self._GMTF_REQUANT_SHIFT, "int32"))
         clipped = relay.clip(shifted, a_min=-127.0, a_max=127.0)
         cast_i8 = relay.cast(clipped, "int8")
         copied = relay.copy(cast_i8)
@@ -310,6 +314,23 @@ class _PoolLadderStripper(ExprMutator):
                 return relay.multiply(relay.cast(lhs, "float32"), rhs)
             if self._is_int8_expr(rhs) and self._is_float32_expr(lhs):
                 return relay.multiply(lhs, relay.cast(rhs, "float32"))
+            # Strip relay.quantize's ×16 re-quantize on already-int8 pool vars.
+            # Pattern: multiply(cast(float32, int8_expr), scalar_const).
+            # This ×16 scale is a relay.quantize artifact; for GMTF Dense paths both
+            # data and TM weight are already at int8 scale and should not be amplified.
+            # The parent round→clip→cast(int8) chain becomes a no-op identity.
+            if _is_scalar_const(rhs) and isinstance(lhs, relay.Call) \
+                    and isinstance(lhs.op, tvm.ir.Op) and lhs.op.name == "cast" \
+                    and str(lhs.attrs.dtype) == "float32":
+                inner = lhs.args[0]
+                if self._is_int8_expr(inner):
+                    return inner
+            if _is_scalar_const(lhs) and isinstance(rhs, relay.Call) \
+                    and isinstance(rhs.op, tvm.ir.Op) and rhs.op.name == "cast" \
+                    and str(rhs.attrs.dtype) == "float32":
+                inner = rhs.args[0]
+                if self._is_int8_expr(inner):
+                    return inner
 
         stripped = self._strip_quant_ladder(call)
         if stripped is not None:
@@ -332,6 +353,107 @@ class _PoolLadderStripper(ExprMutator):
                 return self._make_dense_requant_epilogue(dense_i32)
 
         return call
+
+
+class _Fix3x3BNFoldShift(ExprMutator):
+    """Fix 3×3 (two-stage Dense) BN fold: relay.quantize emits shift=12/bias=2048, but
+    stage2_int8 × BN_scale_16 = 127 × 16 = 2032 < 2048 → ALL outputs round to zero.
+
+    Root cause: relay.quantize adds 4 to the BN fold shift for each Dense stage's
+    right_shift(4) epilogue (from _PoolLadderStripper), but this extra shift makes
+    the rounding bias (2048) exceed the maximum product, zeroing every value.
+
+    Fix: use shift=7/bias=64, which gives (127 × 1 + 64) >> 7 = 1 → non-zero
+    even when BN_scale rounds to 1 (block3 large-channel case). shift=8/bias=128
+    fixes most layers but fails when BN_scale=1: 127×1+128=255 < 256 → 0.
+    shift=7 clears that boundary: 127×1+64=191 >> 7 = 1.
+
+    Safe to apply globally: shift=12 and bias=2048 appear ONLY in 3×3 BN folds.
+    Dense epilogues use shift=4, 5×5 BN folds use shift=8/bias=128, VTA conv2d
+    uses shift=15 or other values never equal to 12.
+    """
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name == "right_shift" and len(call.args) == 2:
+            lhs, rhs = call.args
+            if isinstance(rhs, relay.Constant):
+                val = int(rhs.data.asnumpy().flat[0])
+                if val == 12:
+                    return relay.right_shift(lhs, relay.const(7, "int32"))
+        if call.op.name == "add" and len(call.args) == 2:
+            lhs, rhs = call.args
+            if isinstance(rhs, relay.Constant):
+                arr = rhs.data.asnumpy()
+                if arr.size == 1 and int(arr.flat[0]) == 2048:
+                    return relay.add(lhs, relay.const(64, "int32"))
+        return call
+
+
+def _fix_3x3_bn_fold_shift(mod):
+    main = mod["main"]
+    new_body = _Fix3x3BNFoldShift().visit(main.body)
+    new_main = relay.Function(
+        main.params, new_body, main.ret_type, main.type_params, main.attrs
+    )
+    new_mod = tvm.IRModule.from_expr(new_main)
+    return relay.transform.InferType()(new_mod)
+
+
+class _Fix5x5BNFoldShift(ExprMutator):
+    """Fix 5×5 (single-stage Dense) BN fold: relay.quantize emits shift=8/bias=128.
+
+    Root cause: graphpack ×16 on both Dense Large inputs yields 256×/16 = 16×
+    over-amplified stage1 vs. what relay.quantize calibrated for. Rounding bias
+    (128) exceeds stage1×BN_scale for BN_scale=1 channels: 127×1+128=255 < 256
+    → zero for every BN_scale=1 channel (block3 BN_gamma ≈ 0.06).
+
+    Fix: shift=5/bias=16. Threshold drops from stage1≥128 (impossible, int8 max=127)
+    to stage1≥16, recovering BN_scale=1 channels: (127×1+16)>>5=4.
+
+    Shape guard: only patches add(X,128)→right_shift(8) where X has 5×5 spatial
+    dims. Leaves 3×3 BN folds that also use shift=8 (arch variants) untouched.
+    """
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name != "right_shift" or len(call.args) != 2:
+            return call
+        lhs, rhs = call.args
+        if not isinstance(rhs, relay.Constant):
+            return call
+        if int(rhs.data.asnumpy().flat[0]) != 8:
+            return call
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return call
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return call
+        bias_arr = add_rhs.data.asnumpy()
+        if bias_arr.size != 1 or int(bias_arr.flat[0]) != 128:
+            return call
+        try:
+            shape = [int(d) for d in lhs.checked_type.shape]
+        except Exception:
+            return call
+        if len(shape) < 2 or shape[-2] != 5 or shape[-1] != 5:
+            return call
+        new_add = relay.add(lhs.args[0], relay.const(16, "int32"))
+        return relay.right_shift(new_add, relay.const(5, "int32"))
+
+
+def _fix_5x5_bn_fold_shift(mod):
+    main = mod["main"]
+    new_body = _Fix5x5BNFoldShift().visit(main.body)
+    new_main = relay.Function(
+        main.params, new_body, main.ret_type, main.type_params, main.attrs
+    )
+    new_mod = tvm.IRModule.from_expr(new_main)
+    return relay.transform.InferType()(new_mod)
 
 
 def _materialize_int8_pool_constants(mod_q, tvm_params_full, pool_var_names):
@@ -483,6 +605,10 @@ def step3b_compile_merged(
         runtime_pool_params_np.update(int8_runtime_pool_params)
         print("  Int8 runtime pool vars prepared: %d" % len(int8_runtime_pool_params))
         print("  Float32 runtime pool vars kept: %d" % len(runtime_pool_params_np))
+
+    if not static_debug_mode:
+        print("  Fixing 3x3 BN fold shift (12->7, bias 2048->64) ...")
+        mod_compile = _fix_3x3_bn_fold_shift(mod_compile)
 
     compile_main_vars = {v.name_hint for v in relay.analysis.free_vars(mod_compile["main"].body)}
     if not static_debug_mode:
