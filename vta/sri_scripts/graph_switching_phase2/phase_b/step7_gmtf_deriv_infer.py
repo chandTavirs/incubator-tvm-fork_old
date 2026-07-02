@@ -71,7 +71,7 @@ from step3_merged_mod_deriv_poc import (
     OFA_CHECKPOINT, ARCH_FILE, POOL_DIR, SA_RESULTS_FILE,
     DEVICE_HOST, DEVICE_PORT, GLOBAL_SCALE, SKIP_CONV_LAYERS, OPT_LEVEL,
     MODEL_NAME, INPUT_NAME, INPUT_SHAPE, PACK_DICT,
-    pick_subnets_from_sa, get_ofa_reference_output, load_schedule_logs,
+    pick_subnets_from_sa, pick_subnets_from_sa_with_exec, get_ofa_reference_output, load_schedule_logs,
     build_merged_artifacts,
 )
 from step3_gemm_mat_trf_integration import (
@@ -654,6 +654,7 @@ def parse_args():
     p.add_argument("--arch-file", default=ARCH_FILE)
     p.add_argument("--n", type=int, default=25)
     p.add_argument("--lambda", dest="lambda_value", type=float, default=4.0)
+    p.add_argument("--gamma", dest="gamma_value", type=float, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num-subnets", type=int, default=2,
                    help="K: how many subnets (POC default = 2)")
@@ -685,11 +686,18 @@ def main():
 
     # ------------------------------------------------------------------
     print("[2] Select K=%d subnets ..." % args.num_subnets, flush=True)
-    archs = pick_subnets_from_sa(
-        args.sa_results, args.arch_file,
-        target_n=args.n, target_lambda=args.lambda_value,
-        target_seed=args.seed, k=args.num_subnets,
-    )
+    if args.gamma_value is None:
+        archs = pick_subnets_from_sa(
+            args.sa_results, args.arch_file,
+            target_n=args.n, target_lambda=args.lambda_value,
+            target_seed=args.seed, k=args.num_subnets,
+        )
+    else:
+        archs = pick_subnets_from_sa_with_exec(
+            args.sa_results, args.arch_file,
+            target_n=args.n, target_lambda=args.lambda_value, target_gamma=args.gamma_value,
+            target_seed=args.seed, k=args.num_subnets,
+        )
 
     # ------------------------------------------------------------------
     env = vta.get_env()

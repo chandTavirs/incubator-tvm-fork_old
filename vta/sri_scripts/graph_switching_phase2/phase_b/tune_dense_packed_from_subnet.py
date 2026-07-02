@@ -36,7 +36,10 @@ from ofa_derivation_extractor import OFADerivationExtractor
 from ofa_relay_graph_builder import build_relay_with_ofa_pool_vars
 from ofa_weight_pool_extractor import load_ofa_pool
 from quantize_dynamic_weights import quantize_with_dynamic_weights
-from step3_merged_mod_deriv_poc import pick_subnets_from_sa, step3b_compile_merged, build_merged_artifacts, sep
+from step3_merged_mod_deriv_poc import (
+    pick_subnets_from_sa, pick_subnets_from_sa_with_exec,
+    step3b_compile_merged, build_merged_artifacts, sep,
+)
 
 
 # ============================================================
@@ -164,14 +167,25 @@ def construct_tasks(args):
     )
 
     print("\n[3] Selecting subnets...")
-    poc_archs = pick_subnets_from_sa(
-        args.sa_results,
-        args.arch_file,
-        target_n=args.n,
-        target_lambda=args.lambda_value,
-        target_seed=args.seed,
-        k=args.num_subnets,
-    )
+    if args.gamma_value is None:
+        poc_archs = pick_subnets_from_sa(
+            args.sa_results,
+            args.arch_file,
+            target_n=args.n,
+            target_lambda=args.lambda_value,
+            target_seed=args.seed,
+            k=args.num_subnets,
+        )
+    else:
+        poc_archs = pick_subnets_from_sa_with_exec(
+            args.sa_results,
+            args.arch_file,
+            target_n=args.n,
+            target_lambda=args.lambda_value,
+            target_gamma=args.gamma_value,
+            target_seed=args.seed,
+            k=args.num_subnets,
+        )
 
     all_tasks = []
     for subnet_id, arch in poc_archs.items():
@@ -307,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch-file", default=ARCH_FILE)
     parser.add_argument("--n", type=int, default=25)
     parser.add_argument("--lambda", dest="lambda_value", type=float, default=4.0)
+    parser.add_argument("--gamma", dest="gamma_value", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument(
