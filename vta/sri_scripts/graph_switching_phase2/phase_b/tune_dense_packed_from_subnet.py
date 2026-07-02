@@ -182,8 +182,48 @@ def register_vta_tuning_tasks():
     """Register GMTF dense tuning templates in AutoTVM task table."""
     from tvm.autotvm.task import TaskExtractEnv
     TaskExtractEnv()
-    # Side-effect: registers dense_pack_gmtf_small.vta and dense_pack_gmtf_large.vta templates.
+    # Side-effect: registers vta.gmtf_dense_small/large strategies.
     from vta.top import vta_gmtf_op as _  # noqa: F401
+    from vta.top.vta_gmtf_dense import (
+        dense_pack_gmtf_small, schedule_dense_pack_gmtf_small,
+        dense_pack_gmtf_large, schedule_dense_pack_gmtf_large,
+    )
+
+    # @autotvm.register_topi_compute only covers extract_from_program; task.create()
+    # needs an @autotvm.template.  Add right_shift(4)+clip+cast(int8) epilogue so
+    # VTA's CopyIntrinInjector sees int8 output instead of int32.
+
+    @autotvm.template("dense_pack_gmtf_small.vta")
+    def _tune_gmtf_small(*args, **kwargs):
+        assert not kwargs
+        data, weight = args[0], args[1]
+        with tvm.target.vta():
+            res = dense_pack_gmtf_small(data, weight, None, env.acc_dtype)
+            res = topi.right_shift(res, 4)
+            res = topi.clip(res, -127, 127)
+            res = topi.cast(res, env.out_dtype)
+        current_target = tvm.target.Target.current()
+        if current_target is not None and current_target.device_name == "vta":
+            sched = schedule_dense_pack_gmtf_small([res])
+        else:
+            sched = te.create_schedule([res.op])
+        return sched, [data, weight, res]
+
+    @autotvm.template("dense_pack_gmtf_large.vta")
+    def _tune_gmtf_large(*args, **kwargs):
+        assert not kwargs
+        data, weight = args[0], args[1]
+        with tvm.target.vta():
+            res = dense_pack_gmtf_large(data, weight, None, env.acc_dtype)
+            res = topi.right_shift(res, 4)
+            res = topi.clip(res, -127, 127)
+            res = topi.cast(res, env.out_dtype)
+        current_target = tvm.target.Target.current()
+        if current_target is not None and current_target.device_name == "vta":
+            sched = schedule_dense_pack_gmtf_large([res])
+        else:
+            sched = te.create_schedule([res.op])
+        return sched, [data, weight, res]
 
 
 def construct_tasks(args):
