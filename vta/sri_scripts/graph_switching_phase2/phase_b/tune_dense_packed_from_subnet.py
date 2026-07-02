@@ -38,8 +38,9 @@ from ofa_weight_pool_extractor import load_ofa_pool
 from quantize_dynamic_weights import quantize_with_dynamic_weights
 from step3_merged_mod_deriv_poc import (
     pick_subnets_from_sa, pick_subnets_from_sa_with_exec,
-    step3b_compile_merged, build_merged_artifacts, sep,
+    build_merged_artifacts, sep,
 )
+from step3_gemm_mat_trf_integration import step5_quantize_module, step6_materialize_int8_pool
 
 
 # ============================================================
@@ -95,15 +96,74 @@ def _to_int_tuple(shape):
     return tuple(int(x) for x in shape)
 
 
-class _DensePackedShapeCollector(ExprVisitor):
-    """Collect packed nn.dense input/weight shapes from typed Relay."""
+class _GraphSplitter(relay.ExprMutator):
+    """Collect conv2d weight sub-graphs and replace them with free vars (derive/infer split)."""
 
     def __init__(self):
         super().__init__()
-        self.workloads = []
+        self._weight_exprs = []
+        self._derived_vars = []
+        self._wid_to_var = {}
+        self._counter = 0
 
     def visit_call(self, call):
-        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.dense":
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.conv2d":
+            new_data = self.visit(call.args[0])
+            orig_w = call.args[1]
+            wid = id(orig_w)
+            if wid not in self._wid_to_var:
+                shape = [int(d) for d in orig_w.checked_type.shape]
+                dtype = str(orig_w.checked_type.dtype)
+                v = relay.var("derived_weight_%d" % self._counter, shape=shape, dtype=dtype)
+                self._wid_to_var[wid] = v
+                self._weight_exprs.append(orig_w)
+                self._derived_vars.append(v)
+                self._counter += 1
+            return relay.Call(call.op, [new_data, self._wid_to_var[wid]], call.attrs, call.type_args)
+        return super().visit_call(call)
+
+    @property
+    def weight_exprs(self):
+        return list(self._weight_exprs)
+
+    @property
+    def derived_vars(self):
+        return list(self._derived_vars)
+
+
+def _split_mod(mod_compile):
+    """Split mod_compile into (derive_fn, infer_fn, n_weights, derived_vars)."""
+    main = mod_compile["main"]
+    splitter = _GraphSplitter()
+    infer_body = splitter.visit(main.body)
+    weights = splitter.weight_exprs
+    derived_vars = splitter.derived_vars
+    n_conv = len(weights)
+    if n_conv == 0:
+        raise RuntimeError("_split_mod: no nn.conv2d calls found in mod_compile")
+    derive_body = relay.Tuple(weights)
+    derive_free_names = {v.name_hint for v in relay.analysis.free_vars(derive_body)}
+    derive_params = [p for p in main.params if p.name_hint in derive_free_names]
+    derive_fn = relay.Function(derive_params, derive_body)
+    infer_free_names = {v.name_hint for v in relay.analysis.free_vars(infer_body)}
+    orig_infer_params = [p for p in main.params if p.name_hint in infer_free_names]
+    infer_fn = relay.Function(orig_infer_params + derived_vars, infer_body)
+    return derive_fn, infer_fn, n_conv, derived_vars
+
+
+class _GmtfDenseShapeCollector(ExprVisitor):
+    """Collect vta.gmtf_dense_small/large input/weight shapes from typed Relay."""
+
+    def __init__(self):
+        super().__init__()
+        self.workloads = []  # list of (data_shape, weight_shape, kind) where kind in ("small","large")
+
+    def visit_call(self, call):
+        if isinstance(call.op, tvm.ir.Op) and call.op.name in (
+            "vta.gmtf_dense_small",
+            "vta.gmtf_dense_large",
+        ):
+            kind = "small" if call.op.name == "vta.gmtf_dense_small" else "large"
             data_ty = getattr(call.args[0], "checked_type", None)
             weight_ty = getattr(call.args[1], "checked_type", None)
             if (
@@ -114,34 +174,16 @@ class _DensePackedShapeCollector(ExprVisitor):
             ):
                 data_shape = _to_int_tuple(data_ty.shape)
                 weight_shape = _to_int_tuple(weight_ty.shape)
-                self.workloads.append((data_shape, weight_shape))
+                self.workloads.append((data_shape, weight_shape, kind))
         super().visit_call(call)
 
+
 def register_vta_tuning_tasks():
-    """Register dense_packed tuning template in AutoTVM task table."""
+    """Register GMTF dense tuning templates in AutoTVM task table."""
     from tvm.autotvm.task import TaskExtractEnv
-
-    # Init autotvm env to register VTA operator templates.
     TaskExtractEnv()
-
-    @autotvm.template("dense_packed.vta")
-    def _topi_nn_dense_packed(*args, **kwargs):
-        assert not kwargs, "Do not support kwargs in template function call"
-        data, weight = args[:2]
-
-        with tvm.target.vta():
-            res = vta.top.dense_packed(*args, **kwargs)
-            # Standalone dense returns int32. Add a minimal epilogue so VTA
-            # copy-intrin lowering sees an int8 output tensor as in real graphs.
-            res = topi.right_shift(res, 8)
-            res = topi.cast(res, env.out_dtype)
-
-        current_target = tvm.target.Target.current()
-        if current_target is not None and current_target.device_name == "vta":
-            sched = vta.top.schedule_dense_packed([res])
-        else:
-            sched = te.create_schedule([res.op])
-        return sched, [data, weight, res]
+    # Side-effect: registers dense_pack_gmtf_small.vta and dense_pack_gmtf_large.vta templates.
+    from vta.top import vta_gmtf_op as _  # noqa: F401
 
 
 def construct_tasks(args):
@@ -191,46 +233,52 @@ def construct_tasks(args):
     for subnet_id, arch in poc_archs.items():
         sep("Processing %s" % subnet_id)
         try:
-            merged_artifacts = build_merged_artifacts(
-                subnet_id,
-                arch,
-                ofa_net,
-                base_weights,
-                transform_matrices,
-                bn_params,
-                other_params,
+            artifacts = build_merged_artifacts(
+                subnet_id, arch, ofa_net, base_weights, transform_matrices, bn_params, other_params,
+            )
+            mod_full = artifacts["mod_full"]
+            tvm_params_full = artifacts["tvm_params_full"]
+
+            all_dynamic_var_names = list(tvm_params_full.keys())
+            pool_only_var_names = [k for k in tvm_params_full.keys() if k.startswith("pool_")]
+
+            mod_q, _ = step5_quantize_module(
+                mod_full, tvm_params_full, all_dynamic_var_names, enable_dynamic_dense_quant=True,
+            )
+            mod_compile, _ = step6_materialize_int8_pool(
+                mod_q, tvm_params_full, pool_only_var_names,
             )
 
+            mod_compile_typed = relay.transform.InferType()(mod_compile)
+            pack_entry = PACK_DICT.get(MODEL_NAME, ["nn.max_pool2d", "nn.adaptive_avg_pool2d"])
+            with tvm.transform.PassContext(opt_level=OPT_LEVEL, disabled_pass={"AlterOpLayout"}):
+                full_packed_fn = graph_pack(
+                    mod_compile_typed["main"], env.BATCH, env.BLOCK_IN, env.BLOCK_OUT, env.WGT_WIDTH,
+                    start_name=pack_entry[0], stop_name=pack_entry[1],
+                    device_annot=(env.TARGET == "intelfocl"),
+                )
+            mod_packed = relay.transform.InferType()(tvm.IRModule.from_expr(full_packed_fn))
 
-            relay_prog, params_for_build = step3b_compile_merged(
-                subnet_id,
-                merged_artifacts,
-                env,
-                enable_dynamic_dense_quant=True,
-                static_debug_mode=False,
-                enable_graph_pack=True,
-                return_packed_relay_only=True
-            )
+            derive_fn, _infer_fn, n_w, _derived_vars = _split_mod(mod_packed)
+            derive_mod = relay.transform.InferType()(tvm.IRModule.from_expr(derive_fn))
 
-            mod = tvm.IRModule.from_expr(relay_prog)
-            mod = relay.transform.InferType()(mod)
+            collector = _GmtfDenseShapeCollector()
+            collector.visit(derive_mod["main"])
 
-            collector = _DensePackedShapeCollector()
-            collector.visit(mod["main"])
-
-            for data_shape, weight_shape in collector.workloads:
+            print("  %s: %d GMTF dense workloads found" % (subnet_id, len(collector.workloads)))
+            for data_shape, weight_shape, kind in collector.workloads:
                 data = te.placeholder(data_shape, name="data", dtype=env.inp_dtype)
                 weight = te.placeholder(weight_shape, name="weight", dtype=env.wgt_dtype)
+                task_name = "dense_pack_gmtf_small.vta" if kind == "small" else "dense_pack_gmtf_large.vta"
                 task = autotvm.task.create(
-                    "dense_packed.vta",
+                    task_name,
                     args=(data, weight, None, env.acc_dtype),
                     target=env.target,
                     target_host=env.target_host,
                 )
                 all_tasks.append(task)
-        except Exception as e:
+        except Exception:
             import traceback
-
             traceback.print_exc()
 
     uniq = {}
@@ -352,7 +400,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log-dir",
         type=str,
-        default="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/sri_scripts/logs/tuning_logs/vta_1x16x16/candidate_set/dense_vta_try",
+        default="/home/srchand/Desktop/research/TVM_Intel_Fork/tvm/vta/sri_scripts/logs/tuning_logs/vta_1x16x16/candidate_set/dense_vta_n20_exec",
         help="Directory to store per-workload tuning logs",
     )
     parser.add_argument(
@@ -394,12 +442,11 @@ if __name__ == "__main__":
     register_vta_tuning_tasks()
 
     tasks = construct_tasks(args)
-    # tasks = tasks[8:]
     if not tasks:
-        print("No dense_packed.vta tasks extracted.")
+        print("No GMTF dense tasks extracted.")
         sys.exit(0)
 
-    print("Extracted %d dense_packed.vta tasks" % len(tasks))
+    print("Extracted %d GMTF dense tasks" % len(tasks))
     for idx, task in enumerate(tasks):
         print("  [%d] %s" % (idx, task.workload))
 
@@ -427,7 +474,7 @@ if __name__ == "__main__":
         tuner=args.tuner,
         n_trial=(args.n_trial if args.n_trial is not None else 1000),
         early_stopping=args.early_stopping,
-        log_filename=os.path.join(args.log_dir, "dense_packed.vta.log"),
+        log_filename=os.path.join(args.log_dir, "gmtf_dense.vta.log"),
         use_transfer_learning=(not args.no_transfer_learning),
     )
 
