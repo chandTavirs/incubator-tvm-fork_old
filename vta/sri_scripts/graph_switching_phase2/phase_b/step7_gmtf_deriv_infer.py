@@ -40,6 +40,7 @@ from __future__ import absolute_import, print_function
 import argparse
 import collections
 import gc
+import json
 import os
 import random
 import sys
@@ -238,6 +239,146 @@ def _fix_3x3_infer_conv2d_shift(infer_fn):
     return relay.transform.InferType()(new_mod)["main"]
 
 
+class _Fix5x5InferConv2dShift(relay.ExprMutator):
+    """Fix infer-module conv2d output shift for 5×5 kernels derived via single-stage Dense.
+
+    _FixDeriveBNFoldShift8 changes the 5×5 BN fold from
+      multiply(X, S) → add(128) → right_shift(8)
+    to
+      multiply(X, S) → add(8)   → right_shift(4)
+    making the 5×5 derived weights ~16× larger (ratio is exact for large |S×GMTF|).
+    The infer conv2d for those layers still uses the relay.quantize-generated right_shift,
+    which now under-shifts by 4 bits.
+
+    Pattern: nn.conv2d(..., kernel_size=[5,5], ...) → add(bias) → right_shift(N)
+    Fix: right_shift(N) → right_shift(N+4), bias → 2^(N+4-1).
+    Only 5×5 conv2d outputs are patched.
+    """
+    _EXTRA_SHIFT = 3  # derive weights 8× larger after add(16)→right_shift(5) formula (2^3=8)
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name != "right_shift" or len(call.args) != 2:
+            return call
+        rhs = call.args[1]
+        if not isinstance(rhs, relay.Constant):
+            return call
+        lhs = call.args[0]
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return call
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return call
+        conv = lhs.args[0]
+        if not (isinstance(conv, relay.Call) and isinstance(conv.op, tvm.ir.Op)
+                and conv.op.name == "nn.conv2d"):
+            return call
+        ks = list(conv.attrs.kernel_size)
+        if ks != [5, 5]:
+            return call
+        old_shift = int(rhs.data.asnumpy().flat[0])
+        new_shift = old_shift + self._EXTRA_SHIFT
+        new_bias  = 1 << (new_shift - 1)
+        new_add   = relay.add(conv, relay.const(new_bias, "int32"))
+        return relay.right_shift(new_add, relay.const(new_shift, "int32"))
+
+
+def _fix_5x5_infer_conv2d_shift(infer_fn):
+    new_body = _Fix5x5InferConv2dShift().visit(infer_fn.body)
+    new_fn = relay.Function(
+        infer_fn.params, new_body, infer_fn.ret_type,
+        infer_fn.type_params, infer_fn.attrs,
+    )
+    new_mod = tvm.IRModule.from_expr(new_fn)
+    return relay.transform.InferType()(new_mod)["main"]
+
+
+class _FixDeriveBNFoldShift8(relay.ExprMutator):
+    """Fix derive-fn BN fold add(128)→right_shift(8) patterns post-graphpack.
+
+    Two distinct patterns are handled:
+
+    1. NO-MULTIPLY 3×3 (single-stage Dense, no BN_scale multiply visible):
+           add(GMTF_int32, 128) → right_shift(8)
+       (GMTF+128)>>8 = 0 for all |GMTF|≤127 → ALL weights are zero.
+       Fix: _FIXES[spatial] = (new_shift, new_bias).  For spatial=3:
+           add(GMTF, 4) → right_shift(3)  → (127+4)/8=16 (max), non-zero for |GMTF|≥4.
+
+    2. WITH-MULTIPLY 5×5: NOT FIXED here (spatial==5 returns None).
+       Post-graphpack correction is fundamentally incompatible with relay.quantize
+       calibration: calibration sees float32 non-zero weights, so infer right_shifts
+       are calibrated for that scale. Any post-graphpack fix (shift=5, runtime
+       maximum(BN_scale,2)) puts derived weights at a different scale than calibration
+       expected → arch_0585 regression (vta=2→8, tested both approaches).
+       Proper fix requires pre-quantize formula correction in step3.
+
+    TOP-DOWN detection reads checked_type on ORIGINAL nodes (before super().visit_call()
+    creates new untyped nodes).  Prerequisite: InferType() before this pass.
+    """
+
+    _FIXES = {3: (3, 4)}  # NO-MULTIPLY: spatial → (new_shift, new_bias)
+
+    def visit_call(self, call):
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "right_shift":
+            fixed = self._try_fix(call)
+            if fixed is not None:
+                return self.visit(fixed)
+        return super().visit_call(call)
+
+    def _try_fix(self, call):
+        lhs, rhs = call.args[0], call.args[1]
+        if not isinstance(rhs, relay.Constant):
+            return None
+        if int(rhs.data.asnumpy().flat[0]) != 8:
+            return None
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return None
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return None
+        bias_arr = add_rhs.data.asnumpy()
+        if bias_arr.size != 1 or int(bias_arr.flat[0]) != 128:
+            return None
+        try:
+            shape = [int(d) for d in lhs.checked_type.shape]
+        except Exception:
+            return None
+        if len(shape) < 2 or shape[-2] != shape[-1]:
+            return None
+        spatial = shape[-1]
+        add_lhs = lhs.args[0]
+
+        # WITH-MULTIPLY 5×5: no post-graphpack fix possible.
+        # Problem: relay.quantize calibrated infer right_shifts for float32 non-zero weights.
+        # Any post-graphpack weight correction changes BN_scale=1 channels from 0 to non-zero
+        # at a scale that doesn't match calibration → infer accumulation off → arch_0585 2→8.
+        # Proper fix requires pre-quantize formula correction in step3 so calibration sees
+        # correct values; post-graphpack patching is fundamentally incompatible with calibration.
+        if spatial == 5:
+            return None
+
+        # NO-MULTIPLY 3×3: spatial in _FIXES dict → all channels were all-zero, fix them.
+        if spatial not in self._FIXES:
+            return None
+        new_shift, new_bias = self._FIXES[spatial]
+        new_add = relay.add(add_lhs, relay.const(new_bias, "int32"))
+        return relay.right_shift(new_add, relay.const(new_shift, "int32"))
+
+
+def _fix_derive_bn_fold_shift_8(derive_fn):
+    """Fix 3×3 and 5×5 BN fold shift=8 patterns on derive_fn (post-graphpack)."""
+    derive_mod = relay.transform.InferType()(tvm.IRModule.from_expr(derive_fn))
+    fn = derive_mod["main"]
+    new_body = _FixDeriveBNFoldShift8().visit(fn.body)
+    new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
+    new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
+    return new_mod["main"]
+
+
 # ============================================================
 # Build one derive + infer module pair
 # ============================================================
@@ -310,6 +451,13 @@ def build_deriv_infer_subnet(subnet_id, arch, ofa_net, pool, env, schedule_logs,
     # derive_fn outputs VTA-packed weights (includes layout_transform).
     # infer_fn receives pre-packed derived_weight_i — no layout_transform at inference time.
     derive_fn, infer_fn, n_w, derived_vars = _split_mod(mod_packed)
+
+    # Post-graphpack BN fold fixes: recover all-zero weights caused by quantized BN fold formulas.
+    # (1) NO-MULTIPLY 3×3: add(GMTF, 128)→right_shift(8) → add(GMTF, 4)→right_shift(3)
+    # (2) WITH-MULTIPLY 5×5: clamp BN_scale=1→2 in multiply(GMTF, BN_scale) node.
+    #     Keeps add(128)→right_shift(8) formula → no saturation, no infer compensation.
+    print("  [fix-bn-fold] Fixing post-graphpack derive BN fold shift/8 patterns ...", flush=True)
+    derive_fn = _fix_derive_bn_fold_shift_8(derive_fn)
 
     # Save post-graphpack derive + infer IR to files for inspection
     _ir_dir = os.path.join(SCRIPT_DIR, "step3_results")
@@ -663,6 +811,8 @@ def parse_args():
     p.add_argument("--rng-seed", type=int, default=42)
     p.add_argument("--build-only", action="store_true",
                    help="Stop after relay.build (no VTA device needed)")
+    p.add_argument("--results-out", type=str, default=None,
+                   help="Path to write per-iteration JSONL results (default: auto in SCRIPT_DIR)")
     return p.parse_args()
 
 
@@ -753,7 +903,7 @@ def main():
     # ------------------------------------------------------------------
     print("", flush=True)
     print("[7b] Derive IR + output diagnostics ...", flush=True)
-    for i, built in enumerate(built_list[:1]):   # only subnet 0
+    for i, built in enumerate(built_list):   # all subnets
         sid = built["subnet_id"]
         ir_dir = os.path.join(SCRIPT_DIR, "step3_results")
         derive_ir_path = os.path.join(ir_dir, "derive_fn_ir_%s.txt" % sid)
@@ -861,12 +1011,18 @@ def main():
     print("[9] Switch sweep: all %d subnets in order ..." % len(rt), flush=True)
     rt._evict()
     sweep_switch, sweep_derive, sweep_bind_derived, sweep_run = [], [], [], []
+    sweep_records = []
     for i in range(len(rt)):
         _, tm, sid = rt.run(i, input_np)
         sweep_switch.append(tm["switch"])
         sweep_derive.append(tm["derive_run"])
         sweep_bind_derived.append(tm["bind_derived"])
         sweep_run.append(tm["run"])
+        sweep_records.append({
+            "phase": "sweep", "order_idx": i, "subnet_idx": i, "subnet_id": sid,
+            "n_derived_weights": rt.subnets[i]["n_derived_weights"],
+            "is_actual_switch": True, **tm,
+        })
         print("  -> %-30s  switch=%6.0f ms (derive=%5.0f bind_w=%5.0f)  run=%5.0f ms"
               % (sid, tm["switch"], tm["derive_run"], tm["bind_derived"],
                  tm["run"]), flush=True)
@@ -884,13 +1040,20 @@ def main():
     agg = {k: [] for k in agg_keys}
     same_run = []
     seq = []
+    random_records = []
     prev_idx = rt.live_idx
-    for _ in range(args.switch_iters):
+    for iter_i in range(args.switch_iters):
         k = random.randrange(len(rt))
+        is_actual_switch = (k != prev_idx)
         out, tm, sid = rt.run(k, input_np)
         for key in agg_keys:
             agg[key].append(tm[key])
         seq.append(k)
+        random_records.append({
+            "phase": "random", "iter": iter_i, "subnet_idx": k, "subnet_id": sid,
+            "n_derived_weights": rt.subnets[k]["n_derived_weights"],
+            "is_actual_switch": is_actual_switch, **tm,
+        })
         if k == prev_idx:
             same_run.append(tm["run"])
         prev_idx = k
@@ -907,6 +1070,20 @@ def main():
         ss = np.array(same_run)
         print("  Same-subnet (no switch):  mean=%.0f ms  n=%d" % (ss.mean(), len(ss)),
               flush=True)
+
+    # ------------------------------------------------------------------
+    # Save per-iteration JSONL results
+    if args.results_out is None:
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_path = os.path.join(SCRIPT_DIR, "step7_results_%s.jsonl" % ts)
+    else:
+        results_path = args.results_out
+    all_records = sweep_records + random_records
+    with open(results_path, "w") as _f:
+        for _rec in all_records:
+            _f.write(json.dumps(_rec) + "\n")
+    print("  Results saved -> %s  (%d records)" % (results_path, len(all_records)), flush=True)
 
     # ------------------------------------------------------------------
     sep("Summary")

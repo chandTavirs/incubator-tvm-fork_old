@@ -179,6 +179,14 @@ class _Fix5x5BNFoldShift(ExprMutator):
 
     Shape guard: only patches add(X,128)→right_shift(8) where X has 5×5 spatial
     dims. Leaves 3×3 BN folds that also use shift=8 (arch variants) untouched.
+
+    WARNING: This pre-graphpack fix must NOT be applied here.  graphpack transforms
+    the corrected add(16)→right_shift(5) to add(8)→right_shift(4) (absorbs one bit
+    for VTA packing), producing weights 2× too large for relay.quantize's calibration
+    → arch_0922 breaks.  The equivalent post-graphpack fix lives in step7's
+    _FixDeriveBNFoldShift8 (currently disabled because it offers no net improvement
+    for the tested arches — 0922 passes without it, 0585/0838 mismatch regardless).
+    This class is kept as reference; _fix_5x5_bn_fold_shift is intentionally a no-op.
     """
 
     def visit_call(self, call):
@@ -212,8 +220,64 @@ class _Fix5x5BNFoldShift(ExprMutator):
 
 
 def _fix_5x5_bn_fold_shift(mod):
+    # Intentional no-op — see _Fix5x5BNFoldShift docstring for why pre-graphpack
+    # application breaks arch_0922 (graphpack absorbs one shift bit, giving 2× too large weights).
+    return mod
+
+
+class _Fix3x3BNFoldShift8(ExprMutator):
+    """Fix 3×3 two-stage BN folds where relay.quantize emits shift=8/bias=128.
+
+    Root cause: same as _Fix3x3BNFoldShift but for arch variants where the
+    calibrated base BN fold shift is 0 (not 4). relay.quantize adds 4 per
+    Dense stage's right_shift(4) (8 bits total for two stages), yielding
+    shift=8. With stage2_int8 in [-127,127]: (127+128)>>8=0 — ALL zero.
+
+    Fix: shift=3/bias=4 (same 5-bit reduction as _Fix3x3BNFoldShift so that
+    the existing _Fix3x3InferConv2dShift +5 compensation remains correct):
+        (127+4)>>3 = 16  → non-zero ✓
+
+    Shape guard: in mod_compile (pre-graphpack), the two-stage 3×3 BN fold
+    epilogue sits directly on the Dense_small output, which has flat shape
+    [N', 9] (9 = K_small). The 5×5 single-stage path reshapes to [O,I,5,5]
+    before the fold (_Fix5x5BNFoldShift handles it). The 3×3 two-stage path
+    does NOT reshape before the fold, so we match on len==2 and shape[-1]==9.
+    """
+
+    def visit_call(self, call):
+        call = super().visit_call(call)
+        if not isinstance(call.op, tvm.ir.Op):
+            return call
+        if call.op.name != "right_shift" or len(call.args) != 2:
+            return call
+        lhs, rhs = call.args
+        if not isinstance(rhs, relay.Constant):
+            return call
+        if int(rhs.data.asnumpy().flat[0]) != 8:
+            return call
+        if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
+                and lhs.op.name == "add" and len(lhs.args) == 2):
+            return call
+        add_rhs = lhs.args[1]
+        if not isinstance(add_rhs, relay.Constant):
+            return call
+        bias_arr = add_rhs.data.asnumpy()
+        if bias_arr.size != 1 or int(bias_arr.flat[0]) != 128:
+            return call
+        try:
+            shape = [int(d) for d in lhs.checked_type.shape]
+        except Exception:
+            return call
+        # Pre-graphpack shape is [N', 9] (flat Dense_small output, K=9 for 3×3 GMTF small)
+        if len(shape) != 2 or shape[-1] != 9:
+            return call
+        new_add = relay.add(lhs.args[0], relay.const(4, "int32"))
+        return relay.right_shift(new_add, relay.const(3, "int32"))
+
+
+def _fix_3x3_bn_fold_shift_8(mod):
     main = mod["main"]
-    new_body = _Fix5x5BNFoldShift().visit(main.body)
+    new_body = _Fix3x3BNFoldShift8().visit(main.body)
     new_main = relay.Function(
         main.params, new_body, main.ret_type, main.type_params, main.attrs
     )
@@ -642,6 +706,11 @@ def step6_materialize_int8_pool(mod_q, tvm_params, pool_var_names):
 
     print("  Fixing 3x3 BN fold shift (12->7, bias 2048->64) ...")
     mod_compile = _fix_3x3_bn_fold_shift(mod_compile)
+    print("  Fixing 5x5 BN fold shift (8->5, bias 128->16) ...")
+    mod_compile = _fix_5x5_bn_fold_shift(mod_compile)
+    # Note: _Fix3x3BNFoldShift8 (shift=8→3 for 3×3 two-stage) must be applied AFTER
+    # graphpack on derive_fn (post-graphpack shape is [O,I,3,3]; pre-graphpack is [N',9]
+    # and the checked_type is unreliable at that point). See step7 _fix_3x3_bn_fold_shift_8_derive.
 
     return mod_compile, runtime_pool_params_np
 

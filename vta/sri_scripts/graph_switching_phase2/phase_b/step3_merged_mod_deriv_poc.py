@@ -135,6 +135,33 @@ def pick_subnets_from_sa(sa_file, arch_file, target_n, target_lambda, target_see
     print("  Subnets: %s" % chosen)
     return {mid: arch_mapping[mid] for mid in chosen}
 
+def pick_subnets_from_sa_with_exec(sa_file, arch_file, target_n, target_lambda, target_gamma, target_seed, k):
+    with open(sa_file) as f:
+        results = json.load(f)
+    arch_mapping = load_arch_mapping(arch_file)
+    runs = results.get("runs", [])
+    nl = [
+        r
+        for r in runs
+        if isinstance(r, dict)
+        and r.get("N") == target_n
+        and _as_float(r.get("lambda")) is not None
+        and abs(_as_float(r.get("lambda")) - float(target_lambda)) < 1e-9
+        and _as_float(r.get("gamma")) is not None
+        and abs(_as_float(r.get("gamma")) - float(target_gamma)) < 1e-9
+    ]
+    if not nl:
+        raise ValueError("No run for N=%d, lambda=%s, gamma=%s" % (target_n, target_lambda, target_gamma))
+    exact = [r for r in nl if r.get("seed") == target_seed]
+    run = exact[0] if exact else sorted(nl, key=lambda r: r.get("seed", 0))[0]
+    if not exact:
+        print("  [warn] seed=%s not found; using seed=%s" % (target_seed, run.get("seed")))
+    ids = [x for x in run.get("ids", []) if x in arch_mapping]
+    chosen = ids[:k]
+    print("  SA run: N=%s, lambda=%s, gamma=%s, seed=%s" % (run["N"], run["lambda"], run["gamma"], run.get("seed")))
+    print("  Subnets: %s" % chosen)
+    return {mid: arch_mapping[mid] for mid in chosen}
+
 
 def load_schedule_logs():
     logs = []
