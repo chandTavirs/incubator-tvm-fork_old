@@ -284,16 +284,25 @@ class _PoolLadderStripper(ExprMutator):
         rnd = clip.args[0]
         if not (isinstance(rnd, relay.Call) and isinstance(rnd.op, tvm.ir.Op) and rnd.op.name == "round"):
             return None
-        mul = rnd.args[0]
-        if not (isinstance(mul, relay.Call) and isinstance(mul.op, tvm.ir.Op) and mul.op.name == "multiply"):
-            return None
-        lhs, rhs = mul.args
-        # After pool vars are rewritten to int8, quant ladders can sit on top of
-        # int8-preserving ops (slice/reshape/stop_fusion), not only raw vars.
-        if self._is_int8_expr(lhs) and _is_scalar_const(rhs):
-            return lhs
-        if self._is_int8_expr(rhs) and _is_scalar_const(lhs):
-            return rhs
+        inner = rnd.args[0]
+
+        # Pattern 1: cast(int8, clip(round(multiply(cast(float32, int8_expr), scale))))
+        # The full relay.quantize ladder on an int8 pool var.
+        if isinstance(inner, relay.Call) and isinstance(inner.op, tvm.ir.Op) and inner.op.name == "multiply":
+            lhs, rhs = inner.args
+            # After pool vars are rewritten to int8, quant ladders can sit on top of
+            # int8-preserving ops (slice/reshape/stop_fusion), not only raw vars.
+            if self._is_int8_expr(lhs) and _is_scalar_const(rhs):
+                return lhs
+            if self._is_int8_expr(rhs) and _is_scalar_const(lhs):
+                return rhs
+
+        # Pattern 2: cast(int8, clip(round(int8_expr)))
+        # Occurs after visit_call strips the multiply: the remaining chain is a
+        # no-op identity on an already-int8 value. Return the int8 expr directly.
+        if self._is_int8_expr(inner):
+            return inner
+
         return None
 
     def _expr_dtype_no_checked_type(self, expr):
@@ -358,6 +367,25 @@ class _PoolLadderStripper(ExprMutator):
                 inner = rhs.args[0]
                 if self._is_int8_expr(inner):
                     return inner
+            # BN fold case: multiply(multiply(cast(float32, int8_pool), BN_scale), scalar_16f)
+            # pool_int8 is already at ×16 scale, so cast(float32, int8_pool) × BN_scale is
+            # already at ×16 × BN_scale — the outer ×16 relay.quantize requantize is spurious.
+            # Without this strip, direct BN fold layers (no GMTF transform matrix) produce
+            # weights at ×256 × BN_scale → saturation → stuck class-2 predictions.
+            for scalar_arg, mul_arg in [(rhs, lhs), (lhs, rhs)]:
+                if not _is_scalar_const(scalar_arg):
+                    continue
+                if not (isinstance(mul_arg, relay.Call) and isinstance(mul_arg.op, tvm.ir.Op)
+                        and mul_arg.op.name == "multiply"):
+                    continue
+                inner_lhs, inner_rhs = mul_arg.args
+                for cast_arg in [inner_lhs, inner_rhs]:
+                    if (isinstance(cast_arg, relay.Call) and isinstance(cast_arg.op, tvm.ir.Op)
+                            and cast_arg.op.name == "cast"
+                            and str(cast_arg.attrs.dtype) == "float32"
+                            and self._is_int8_expr(cast_arg.args[0])):
+                        return mul_arg  # strip the outer ×scalar
+                break
 
         stripped = self._strip_quant_ladder(call)
         if stripped is not None:

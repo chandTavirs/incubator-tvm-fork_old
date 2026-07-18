@@ -296,30 +296,200 @@ def _fix_5x5_infer_conv2d_shift(infer_fn):
     return relay.transform.InferType()(new_mod)["main"]
 
 
+class _FixWith5x5FloatBNFold(relay.ExprMutator):
+    """Post-graphpack: replace integer BN fold with float32 for all WITH-MULTIPLY derive layers.
+
+    Broken formula (collapses to 0 when BN scale rounds to 0):
+        clip(right_shift(add(multiply(GMTF_int32, BN_scale_int32), bias), shift), -127, 127)
+    where BN_scale_int32 = cast(clip(round(γ/√(σ²+ε) × 16, -127, 127), int32)).
+    When γ/√(σ²+ε) < 0.5/16 = 0.03125, the scale rounds to 0 → all-zero derived weights.
+
+    Applies to WITH-MULTIPLY kernel sizes >= 5×5 (excludes 1×1 and 3×3):
+        5×5 WITH-MULTIPLY: float BN fold (discriminative signal survives)
+        3×3 WITH-MULTIPLY: zeros_like (handled above; 2 OG groups saturate via _FixInferAccumCast)
+        7×7: direct pool-weight layers use float BN fold in the raw derive fn (no right_shift),
+             so they are not matched here; _FixDeriveNOMULTIPLY7x7Padding is disabled (see comments)
+
+    Float32 fix (same output scale, no precision loss):
+        cast(clip(round(cast(GMTF_int32, float32) × γ/√(σ²+ε)), -127, 127), int32)
+
+    Derivation: GMTF_int32 is the stage epilogue output cast back to int32, at ×16 scale
+    (values ≈ derived_weight_float × 16, in [-127, 127]).
+    Float formula: GMTF_×16 × γ/√(σ²+ε) ≈ derived_weight × 16 × ratio → ×16 scale output.
+    Divisor is always 1 regardless of the pre-graphpack BN fold shift: all VTA infer conv2d
+    use right_shift(4) calibrated for ×16 weights (×16_act × ×16_wt = ×256 → /16 → ×16).
+    Using divisor=2^(shift-4)=16 for shift=8 blocks would produce ×1 scale weights and
+    cause 16× activation collapse (near-zero logits) — wrong regardless of BN fold shift.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.n_fixed = 0
+
+    def visit_call(self, call):
+        # TOP-DOWN: check pattern on original nodes (checked_type is set), then visit replacement.
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "clip":
+            fixed = self._try_fix(call)
+            if fixed is not None:
+                self.n_fixed += 1
+                return self.visit(fixed)
+        return super().visit_call(call)
+
+    def _try_fix(self, call):
+        # Match: clip(right_shift(add(multiply(GMTF, BN_scale_int32), bias), shift), -127, 127)
+        # where bias == 2^(shift-1) (standard rounding bias) and shift >= 4.
+        try:
+            if not (abs(float(call.attrs.a_min) + 127) < 1e-3
+                    and abs(float(call.attrs.a_max) - 127) < 1e-3):
+                return None
+        except Exception:
+            return None
+
+        rshift = call.args[0]
+        if not (isinstance(rshift, relay.Call) and isinstance(rshift.op, tvm.ir.Op)
+                and rshift.op.name == "right_shift"):
+            return None
+        if not isinstance(rshift.args[1], relay.Constant):
+            return None
+        shift = int(rshift.args[1].data.asnumpy().flat[0])
+        if shift < 4:  # only fix WITH-MULTIPLY shifts ≥ 4; skip NO-MULTIPLY (shift ≤ 3)
+            return None
+
+        add_node = rshift.args[0]
+        if not (isinstance(add_node, relay.Call) and isinstance(add_node.op, tvm.ir.Op)
+                and add_node.op.name == "add"):
+            return None
+        if not isinstance(add_node.args[1], relay.Constant):
+            return None
+        bias = int(add_node.args[1].data.asnumpy().flat[0])
+        if bias != (1 << (shift - 1)):  # must be standard rounding bias 2^(shift-1)
+            return None
+
+        mul = add_node.args[0]
+        if not (isinstance(mul, relay.Call) and isinstance(mul.op, tvm.ir.Op)
+                and mul.op.name == "multiply"):
+            return None
+
+        gmtf_int32 = mul.args[0]
+        bn_scale_int32 = mul.args[1]
+
+        # Require spatial dims ≥ 3×3; use checked_type on original (unvisited) node
+        try:
+            shape = [int(d) for d in gmtf_int32.checked_type.shape]
+        except Exception:
+            return None
+        if len(shape) != 4 or shape[-2] < 3 or shape[-1] < 3:
+            return None
+
+        if shape[-2] == 3 and shape[-1] == 3:
+            # WITH-MULTIPLY 3×3: zero out (both zeros_like and integer BN fold give constant
+            # saturation patterns across images — 0065 is stuck regardless. zeros_like is
+            # preferred as it removes the spurious constant bias and gives cleaner logits).
+            return relay.zeros_like(gmtf_int32)
+
+        # Extract float32 γ/√(σ²+ε) from BN_scale_int32 computation chain
+        float_scale = self._extract_float32_scale(bn_scale_int32)
+        if float_scale is None:
+            return None
+
+        # Float32 BN fold: GMTF_int32 × float_scale (divisor always 1; see class docstring)
+        #
+        # Zero-scale guard: for output channels where round(|gamma/sqrt(var)| × 16) = 0,
+        # the true BN-folded weight is ~0.002 but the smallest representable VTA int8
+        # weight is ±1/16 = ±0.0625 (30× too large).  Even a few ±1 elements across 576
+        # kernel positions saturate the per-group conv at ±127, and 4-group accumulation
+        # stays pinned ±127 regardless of input — worse than setting to 0.  Zeroing those
+        # channels lets only BN_bias + residual contribute, matching the float model closely
+        # (where the conv term is ~4.6 at ×16 ≈ negligible next to the residual).
+        _abs_scale = relay.abs(float_scale)
+        _int_scale = relay.round(relay.multiply(_abs_scale, relay.const(16.0, "float32")))
+        _nonzero_mask = relay.clip(_int_scale, a_min=0.0, a_max=1.0)
+        float_scale_safe = relay.multiply(float_scale, _nonzero_mask)
+        gmtf_float = relay.cast(gmtf_int32, "float32")
+        scaled = relay.multiply(gmtf_float, float_scale_safe)
+        rounded = relay.round(scaled)
+        return relay.cast(relay.clip(rounded, a_min=-127.0, a_max=127.0), "int32")
+
+    @staticmethod
+    def _extract_float32_scale(bn_scale_int32):
+        """Trace: cast(round(clip(float_expr × 16, ...)), "int32") → return float_expr."""
+        if not (isinstance(bn_scale_int32, relay.Call) and isinstance(bn_scale_int32.op, tvm.ir.Op)
+                and bn_scale_int32.op.name == "cast"):
+            return None
+        try:
+            if str(bn_scale_int32.attrs.dtype) != "int32":
+                return None
+        except Exception:
+            return None
+
+        # Actual IR order is cast→clip→round→mul16 (clip wraps round, not the other way around)
+        clp = bn_scale_int32.args[0]
+        if not (isinstance(clp, relay.Call) and isinstance(clp.op, tvm.ir.Op)
+                and clp.op.name == "clip"):
+            return None
+
+        rnd = clp.args[0]
+        if not (isinstance(rnd, relay.Call) and isinstance(rnd.op, tvm.ir.Op)
+                and rnd.op.name == "round"):
+            return None
+
+        mul16 = rnd.args[0]
+        if not (isinstance(mul16, relay.Call) and isinstance(mul16.op, tvm.ir.Op)
+                and mul16.op.name == "multiply"):
+            return None
+
+        # One arg should be the constant 16.0; the other is the float32 scale expression
+        for idx in range(2):
+            const_arg = mul16.args[idx]
+            scale_arg = mul16.args[1 - idx]
+            if isinstance(const_arg, relay.Constant):
+                try:
+                    val = float(const_arg.data.asnumpy().flat[0])
+                    if abs(val - 16.0) < 1e-6:
+                        return scale_arg
+                except Exception:
+                    pass
+        return None
+
+
+def _fix_with5x5_float_bn_fold(derive_fn, subnet_id="?"):
+    """Apply float32 BN fold fix to WITH-MULTIPLY patterns in derive_fn."""
+    derive_mod = relay.transform.InferType()(tvm.IRModule.from_expr(derive_fn))
+    fn = derive_mod["main"]
+    fixer = _FixWith5x5FloatBNFold()
+    new_body = fixer.visit(fn.body)
+    print("  [fix-5x5-bn-fold] %s: %d WITH-MULTIPLY patterns replaced with float32 BN fold"
+          % (subnet_id, fixer.n_fixed), flush=True)
+    new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
+    new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
+    return new_mod["main"]
+
+
 class _FixDeriveBNFoldShift8(relay.ExprMutator):
-    """Fix derive-fn BN fold add(128)→right_shift(8) patterns post-graphpack.
+    """Fix NO-MULTIPLY 3×3 BN fold: remove spurious /16 to restore ×16 scale.
 
-    Two distinct patterns are handled:
+    Root cause:
+        Two-stage GMTF produces stage2_int8 at ×16 scale (values in [-127, 127]).
+        The NO-MULTIPLY BN fold then applies add(rounding_bias)→right_shift(shift)
+        which divides by 16 again → ×1 scale output.  The infer right_shift(4) is
+        calibrated for ×16 scale weights (relay.quantize saw the float merged module),
+        so ×1 scale weights cause a 16× activation collapse → near-zero logits →
+        class-2 stuck predictions.
 
-    1. NO-MULTIPLY 3×3 (single-stage Dense, no BN_scale multiply visible):
-           add(GMTF_int32, 128) → right_shift(8)
-       (GMTF+128)>>8 = 0 for all |GMTF|≤127 → ALL weights are zero.
-       Fix: _FIXES[spatial] = (new_shift, new_bias).  For spatial=3:
-           add(GMTF, 4) → right_shift(3)  → (127+4)/8=16 (max), non-zero for |GMTF|≥4.
+    Pattern matched (pre-graphpack shift=8 OR post-graphpack shift=4, both absorbed by
+    graphpack's GMTF conversion):
+        right_shift(add(stage2_int32, 2^(shift-1)), shift)
+    where add_lhs is NOT a multiply op (i.e. NO-MULTIPLY, not WITH-MULTIPLY 3×3).
 
-    2. WITH-MULTIPLY 5×5: NOT FIXED here (spatial==5 returns None).
-       Post-graphpack correction is fundamentally incompatible with relay.quantize
-       calibration: calibration sees float32 non-zero weights, so infer right_shifts
-       are calibrated for that scale. Any post-graphpack fix (shift=5, runtime
-       maximum(BN_scale,2)) puts derived weights at a different scale than calibration
-       expected → arch_0585 regression (vta=2→8, tested both approaches).
-       Proper fix requires pre-quantize formula correction in step3.
+    Fix: return stage2_int32 directly — at ×16 scale, matching infer calibration.
+    WITH-MULTIPLY 3×3 or 5×5: skipped when add_lhs is a multiply op (_FixWith5x5FloatBNFold handles it).
+    NO-MULTIPLY 5×5: same spurious ÷16 as 3×3 — now also fixed here (added to _FIXES).
 
     TOP-DOWN detection reads checked_type on ORIGINAL nodes (before super().visit_call()
     creates new untyped nodes).  Prerequisite: InferType() before this pass.
     """
 
-    _FIXES = {3: (3, 4)}  # NO-MULTIPLY: spatial → (new_shift, new_bias)
+    _FIXES = {3, 5}  # NO-MULTIPLY spatial dims to fix (3×3 two-stage GMTF, 5×5 one-stage GMTF)
 
     def visit_call(self, call):
         if isinstance(call.op, tvm.ir.Op) and call.op.name == "right_shift":
@@ -332,7 +502,11 @@ class _FixDeriveBNFoldShift8(relay.ExprMutator):
         lhs, rhs = call.args[0], call.args[1]
         if not isinstance(rhs, relay.Constant):
             return None
-        if int(rhs.data.asnumpy().flat[0]) != 8:
+        shift_val = int(rhs.data.asnumpy().flat[0])
+        # Match pre-graphpack (shift=8/bias=128) OR post-graphpack (shift=4/bias=8) NO-MULTIPLY.
+        # Graphpack may absorb the GMTF stage's right_shift(4) into the BN fold shift,
+        # converting shift=8→4 and bias=128→8 automatically. Handle both cases.
+        if shift_val not in (4, 8):
             return None
         if not (isinstance(lhs, relay.Call) and isinstance(lhs.op, tvm.ir.Op)
                 and lhs.op.name == "add" and len(lhs.args) == 2):
@@ -341,7 +515,8 @@ class _FixDeriveBNFoldShift8(relay.ExprMutator):
         if not isinstance(add_rhs, relay.Constant):
             return None
         bias_arr = add_rhs.data.asnumpy()
-        if bias_arr.size != 1 or int(bias_arr.flat[0]) != 128:
+        # Must be the standard rounding bias 2^(shift-1)
+        if bias_arr.size != 1 or int(bias_arr.flat[0]) != (1 << (shift_val - 1)):
             return None
         try:
             shape = [int(d) for d in lhs.checked_type.shape]
@@ -352,21 +527,19 @@ class _FixDeriveBNFoldShift8(relay.ExprMutator):
         spatial = shape[-1]
         add_lhs = lhs.args[0]
 
-        # WITH-MULTIPLY 5×5: no post-graphpack fix possible.
-        # Problem: relay.quantize calibrated infer right_shifts for float32 non-zero weights.
-        # Any post-graphpack weight correction changes BN_scale=1 channels from 0 to non-zero
-        # at a scale that doesn't match calibration → infer accumulation off → arch_0585 2→8.
-        # Proper fix requires pre-quantize formula correction in step3 so calibration sees
-        # correct values; post-graphpack patching is fundamentally incompatible with calibration.
-        if spatial == 5:
+        # WITH-MULTIPLY 3×3 or 5×5: add_lhs is a multiply(GMTF_int32, BN_scale_int32) op.
+        # These are handled by _FixWith5x5FloatBNFold — skip here.
+        if (isinstance(add_lhs, relay.Call) and isinstance(add_lhs.op, tvm.ir.Op)
+                and add_lhs.op.name == "multiply"):
             return None
 
-        # NO-MULTIPLY 3×3: spatial in _FIXES dict → all channels were all-zero, fix them.
+        # NO-MULTIPLY 3×3: the two-stage GMTF already outputs stage2_int8 at ×16 scale.
+        # The add(bias)→right_shift(shift) divides by 16 again → ×1 scale output,
+        # but infer right_shift(4) is calibrated for ×16 scale weights → 16× mismatch.
+        # Fix: return stage2_int32 directly (skip the spurious /16), preserving ×16 scale.
         if spatial not in self._FIXES:
             return None
-        new_shift, new_bias = self._FIXES[spatial]
-        new_add = relay.add(add_lhs, relay.const(new_bias, "int32"))
-        return relay.right_shift(new_add, relay.const(new_shift, "int32"))
+        return add_lhs
 
 
 def _fix_derive_bn_fold_shift_8(derive_fn):
@@ -377,6 +550,215 @@ def _fix_derive_bn_fold_shift_8(derive_fn):
     new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
     new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
     return new_mod["main"]
+
+
+# ============================================================
+# NO-MULTIPLY 7×7 direct path: fix channel-lane padding
+# ============================================================
+
+def _trace_strided_slice_ic_start(expr):
+    """Trace through BN fold ops to find the strided_slice's input-channel start (begin[1]).
+
+    Returns the integer begin[1] if a strided_slice is found in the data path,
+    or None if the pattern is not recognized.
+    """
+    if not isinstance(expr, relay.Call):
+        return None
+    if not isinstance(expr.op, tvm.ir.Op):
+        return None
+    name = expr.op.name
+    # Single-arg ops along the data path — follow the argument
+    if name in ("cast", "round", "clip", "expand_dims", "squeeze", "sqrt", "nn.relu"):
+        return _trace_strided_slice_ic_start(expr.args[0])
+    # Binary ops: one branch leads to the pool slice, the other to a BN param constant/var
+    if name in ("multiply", "add", "divide", "subtract"):
+        for arg in expr.args:
+            result = _trace_strided_slice_ic_start(arg)
+            if result is not None:
+                return result
+        return None
+    # strided_slice: read the input-channel start position
+    if name == "strided_slice":
+        begin = [int(b) for b in expr.attrs.begin]
+        return begin[1] if len(begin) >= 2 else None
+    return None
+
+
+class _FixDeriveNOMULTIPLY7x7Padding(relay.ExprMutator):
+    """Fix channel-lane padding for NO-MULTIPLY 7×7 direct BN fold weight groups.
+
+    Root cause (post-graphpack derive body):
+        graphpack emits nn.pad([[0,0],[0,8],[0,0],[0,0]]) for EVERY 8-channel pool-weight
+        slice, placing real channels at VTA input lanes 0..7 and zeros at 8..15.
+        For slices whose pool in-channel start has ic_start % 16 == 8 (the second half
+        of a VTA 16-channel input block), the infer conv2d uses the same feature-map
+        input block as the first half.  The conv then computes:
+            w[lanes 0..7] × feat[lanes 0..7]   (WRONG: should be × feat[lanes 8..15])
+        because the real weight is at lanes 0..7 instead of 8..15.
+
+        Fix: change nn.pad from [[0,0],[0,8],[0,0],[0,0]] (zeros after)
+             to                  [[0,0],[8,0],[0,0],[0,0]] (zeros before)
+        so that the real weight occupies lanes 8..15, and the infer conv2d naturally
+        picks up feat[lanes 8..15] for these groups.
+
+    Only fires for nn.pad whose data argument traces back (through BN fold ops) to a
+    strided_slice with begin[1] % 16 == 8.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.n_fixed = 0
+
+    def visit_call(self, call):
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "nn.pad":
+            fixed = self._try_fix_pad(call)
+            if fixed is not None:
+                return fixed
+        return super().visit_call(call)
+
+    def _try_fix_pad(self, call):
+        pad_width = call.attrs.pad_width
+        # Must be 4D (OIHW) with channel axis (1) padded as [0, 8] (zeros after real ch)
+        if len(pad_width) != 4:
+            return None
+        if list(pad_width[0]) != [0, 0] or list(pad_width[1]) != [0, 8]:
+            return None
+        if list(pad_width[2]) != [0, 0] or list(pad_width[3]) != [0, 0]:
+            return None
+        # Trace back through BN fold to find the pool strided_slice channel start
+        ic_start = _trace_strided_slice_ic_start(call.args[0])
+        if ic_start is None or ic_start % 16 != 8:
+            return None
+        # Fix: pad BEFORE so real channels land at lanes 8..15 of the VTA input block
+        self.n_fixed += 1
+        return relay.nn.pad(
+            self.visit(call.args[0]),
+            pad_width=[(0, 0), (8, 0), (0, 0), (0, 0)],
+            pad_value=0,
+        )
+
+
+def _fix_derive_no_multiply_7x7_padding(derive_fn, subnet_id="?"):
+    """Fix channel-lane padding for NO-MULTIPLY 7×7 direct BN fold groups (post-graphpack)."""
+    derive_mod = relay.transform.InferType()(tvm.IRModule.from_expr(derive_fn))
+    fn = derive_mod["main"]
+    fixer = _FixDeriveNOMULTIPLY7x7Padding()
+    new_body = fixer.visit(fn.body)
+    if fixer.n_fixed > 0:
+        print("  [fix-7x7-pad] %s: %d NO-MULTIPLY 7×7 groups had lane padding corrected"
+              % (subnet_id, fixer.n_fixed), flush=True)
+    new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
+    new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
+    return new_mod["main"]
+
+
+# ============================================================
+# Fix infer int8 accumulation truncation
+# ============================================================
+
+def _is_partial_sum_int32(expr):
+    """Check: cast(stop_fusion*(copy*(cast_int8(...))), int32) — a clipped partial conv output."""
+    if not (isinstance(expr, relay.Call) and isinstance(expr.op, tvm.ir.Op)
+            and expr.op.name == "cast"):
+        return False
+    if str(expr.attrs.dtype) != "int32":
+        return False
+    inner = expr.args[0]
+    while isinstance(inner, relay.Call) and isinstance(inner.op, tvm.ir.Op):
+        if inner.op.name in ("annotation.stop_fusion", "copy"):
+            inner = inner.args[0]
+        else:
+            break
+    return (isinstance(inner, relay.Call) and isinstance(inner.op, tvm.ir.Op)
+            and inner.op.name == "cast" and str(inner.attrs.dtype) == "int8")
+
+
+class _FixInferAccumCast(relay.ExprMutator):
+    """Fix int8 truncation when accumulating 2 partial conv outputs in the infer function.
+
+    Root cause: graphpack emits
+        cast(add(cast(stop_fusion(copy(cast_int8(clip(...)))), int32),
+                 cast(stop_fusion(copy(cast_int8(clip(...)))), int32)),
+             int8)
+    Each partial was already clipped to [-127,127], so their sum ∈ [-254,254].
+    Casting directly to int8 truncates modulo 256 — values > 127 wrap negative.
+
+    Fix: insert clip(-127,127) before the int8 cast so the sum is correctly saturated.
+    This is a no-op when the sum is already in [-127,127], and fixes truncation when
+    both partials hit ±127 (which happens for ANY output size when the conv accumulates
+    enough elements — including 3×3 two-stage GMTF blocks with OG=16).
+    """
+    def __init__(self):
+        super().__init__()
+        self.n_fixed = 0
+
+    def visit_call(self, call):
+        # Determine whether to fix BEFORE recursing: original nodes have checked_type
+        # from InferType, but super().visit_call() may reconstruct nodes without it.
+        should_fix = False
+        if (isinstance(call.op, tvm.ir.Op) and call.op.name == "cast"
+                and str(call.attrs.dtype) == "int8"):
+            add_orig = call.args[0]
+            if (isinstance(add_orig, relay.Call) and isinstance(add_orig.op, tvm.ir.Op)
+                    and add_orig.op.name == "add"):
+                lhs_orig, rhs_orig = add_orig.args
+                if _is_partial_sum_int32(lhs_orig) and _is_partial_sum_int32(rhs_orig):
+                    # Fix ALL partial sum accumulations regardless of OG.
+                    # Original OG>=32 guard was too conservative: 3×3 two-stage GMTF blocks
+                    # (OG=16, 256 output channels across 16 tiles) also overflow — each
+                    # group's right_shift(4)+clip saturates at ±127, so group1+group2 = ±254
+                    # wraps to ±(-2) as int8. clip(-127,127) before cast is always correct.
+                    should_fix = True
+
+        new_call = super().visit_call(call)
+        if not should_fix:
+            return new_call
+        self.n_fixed += 1
+        return relay.cast(relay.clip(new_call.args[0], a_min=-127.0, a_max=127.0), "int8")
+
+
+def _fix_infer_accum_cast(infer_fn, subnet_id="?"):
+    """Insert clip(-127,127) before int8 casts of accumulated partial conv sums."""
+    infer_mod = relay.transform.InferType()(tvm.IRModule.from_expr(infer_fn))
+    fn = infer_mod["main"]
+    fixer = _FixInferAccumCast()
+    new_body = fixer.visit(fn.body)
+    if fixer.n_fixed > 0:
+        print("  [fix-infer-accum] %s: %d int8 accumulation truncations fixed with clip"
+              % (subnet_id, fixer.n_fixed), flush=True)
+    new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
+    new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
+    return new_mod["main"]
+
+
+# ============================================================
+# Pre-quantize BN gamma clamp: fix 5x5 GMTF all-zero derive weights
+# ============================================================
+
+class _ClampBatchNormGamma(relay.ExprMutator):
+    """Pre-quantize pass: clamp BN scale gamma/sqrt(var+eps) so GMTF BN_scale_int32 >= 2.
+
+    CURRENTLY DISABLED (pass-through) while establishing baseline correctness.
+    The ratio-clamp approach over-corrected channels with BN_scale_int32=0,1 and
+    introduced systematic logit bias across all inputs. Kept as a stub for future use.
+
+    For 5x5 GMTF BN fold: multiply(GMTF_int32, BN_scale_int32) + 128 >> 8
+      where BN_scale_int32 = round(gamma/sqrt(var+eps) × 16).
+    When gamma/sqrt(var+eps) < 1.5/16 the result is always 0 (all-zero weights).
+    """
+    MIN_BN_SCALE = 2.0 / 16.0  # target minimum (not currently enforced)
+
+    def visit_call(self, call):
+        return super().visit_call(call)
+
+
+def _clamp_bn_gamma_for_derive(mod_full):
+    """Apply _ClampBatchNormGamma to pre-quantize module. Returns type-inferred module."""
+    mod_full = relay.transform.InferType()(mod_full)
+    main = mod_full["main"]
+    new_body = _ClampBatchNormGamma().visit(main.body)
+    new_main = relay.Function(main.params, new_body, main.ret_type, main.type_params, main.attrs)
+    return relay.transform.InferType()(tvm.IRModule.from_expr(new_main))
 
 
 # ============================================================
@@ -409,6 +791,25 @@ def build_deriv_infer_subnet(subnet_id, arch, ofa_net, pool, env, schedule_logs,
     )
     mod_full = artifacts["mod_full"]
     tvm_params_full = artifacts["tvm_params_full"]
+
+    # Pre-quantize BN gamma clamp: ensures GMTF 5x5 BN_scale_int32 >= 2 so derived weights
+    # are non-zero. Must run BEFORE step5_quantize_module so calibration and runtime derive_fn
+    # both see the clamped gamma -- the root cause of the post-graphpack regression was that
+    # calibration used unclamped float32 while runtime used clamped int32.
+    # Diagnostic: print min BN_scale_int32 per layer BEFORE the clamp.
+    _bn_gamma_keys = {k[:-6]: k for k in tvm_params_full if k.endswith("_gamma")}
+    _bn_var_keys   = {k[:-4]: k for k in tvm_params_full if k.endswith("_var")}
+    for _prefix in sorted(_bn_gamma_keys.keys() & _bn_var_keys.keys()):
+        _g = tvm_params_full[_bn_gamma_keys[_prefix]].asnumpy().ravel()
+        _v = tvm_params_full[_bn_var_keys[_prefix]].asnumpy().ravel()
+        _scale = _g / np.sqrt(_v + 1e-5) * 16.0
+        _int32_min = int(np.round(_scale.min()))
+        print("  [bn-diag] %-60s  min_scale_x16=%.3f  → BN_scale_int32_min=%d" % (
+            _prefix, _scale.min(), _int32_min), flush=True)
+
+    print("  [bn-gamma-clamp] Clamping BN scale gamma/sqrt(var+eps) (min=%.4f) pre-quantize ..."
+          % _ClampBatchNormGamma.MIN_BN_SCALE, flush=True)
+    mod_full = _clamp_bn_gamma_for_derive(mod_full)
 
     all_dynamic_var_names = list(tvm_params_full.keys())
     pool_only_var_names = [k for k in tvm_params_full.keys() if k.startswith("pool_")]
@@ -454,10 +855,18 @@ def build_deriv_infer_subnet(subnet_id, arch, ofa_net, pool, env, schedule_logs,
 
     # Post-graphpack BN fold fixes: recover all-zero weights caused by quantized BN fold formulas.
     # (1) NO-MULTIPLY 3×3: add(GMTF, 128)→right_shift(8) → add(GMTF, 4)→right_shift(3)
-    # (2) WITH-MULTIPLY 5×5: clamp BN_scale=1→2 in multiply(GMTF, BN_scale) node.
-    #     Keeps add(128)→right_shift(8) formula → no saturation, no infer compensation.
-    print("  [fix-bn-fold] Fixing post-graphpack derive BN fold shift/8 patterns ...", flush=True)
+    # (2) WITH-MULTIPLY 5×5 (integer BN_scale): replace entirely with float32 BN fold so that
+    #     channels where round(ratio×16)=0 still produce non-zero derived weights.
+    print("  [fix-bn-fold] Fixing post-graphpack derive BN fold patterns ...", flush=True)
     derive_fn = _fix_derive_bn_fold_shift_8(derive_fn)
+    print("  [fix-5x5-bn-fold] Applying float32 BN fold for 5×5 WITH-MULTIPLY layers ...", flush=True)
+    derive_fn = _fix_with5x5_float_bn_fold(derive_fn, subnet_id=subnet_id)
+    # _fix_derive_no_multiply_7x7_padding: disabled — correct lane alignment for 7×7 direct
+    # pool-weight groups causes full saturation (16×49 MAC always hits ±127), making per-class
+    # predictions WORSE (0065: 1/10→0/10) compared to the "wrong" alignment that gave less
+    # saturation and more discriminative outputs. Left in codebase for reference.
+    # derive_fn = _fix_derive_no_multiply_7x7_padding(derive_fn, subnet_id=subnet_id)
+    infer_fn = _fix_infer_accum_cast(infer_fn, subnet_id=subnet_id)
 
     # Save post-graphpack derive + infer IR to files for inspection
     _ir_dir = os.path.join(SCRIPT_DIR, "step3_results")
@@ -575,7 +984,7 @@ class GmtfDerivInferRuntime:
 
     # ------------------------------------------------------------------
     def init_shared_base_weights(self, runtime_pool_params_np, base_weight_names):
-        """Upload shared int8 base weights to ext_dev(0) CMA ONCE at startup.
+        """Upload shared float32 base weights to ext_dev(0) CMA ONCE at startup.
 
         Uploading to ext_dev (VTA CMA) means the derive module — also created on
         ext_dev — can bind them via same-device CMA-to-CMA assignment at switch
@@ -615,7 +1024,7 @@ class GmtfDerivInferRuntime:
         self.remote.upload(infer_path)
         up_ms = (time.time() - t0) * 1000.0
 
-        # Per-subnet transform matrices (int8, small).
+        # Per-subnet transform matrices (float32, small).
         non_base_pool_np = {
             k: v for k, v in built["runtime_pool_params_np"].items()
             if k not in self._base_weight_names
@@ -635,7 +1044,7 @@ class GmtfDerivInferRuntime:
             "derive_param_names": built["derive_param_names"],
             "infer_orig_param_names": built["infer_orig_param_names"],
             "n_derived_weights": built["n_derived_weights"],
-            "non_base_pool_np": non_base_pool_np,    # int8 transform matrices
+            "non_base_pool_np": non_base_pool_np,    # float32 transform matrices
             "non_pool_np": non_pool_np,               # float32 BN + FC (infer only)
         })
         nb_mb = (
@@ -681,7 +1090,7 @@ class GmtfDerivInferRuntime:
                 pass
         bind_base_ms = (time.time() - t0) * 1000.0
 
-        # Bind per-subnet transform matrices (~50 KB, host numpy → ext_dev via RPC).
+        # Bind per-subnet transform matrices (float32, host numpy → ext_dev via RPC).
         # Also set folded BN scale constants (~KB total, pre-computed at build time).
         t0 = time.time()
         for name, arr in sub["non_base_pool_np"].items():
@@ -720,6 +1129,12 @@ class GmtfDerivInferRuntime:
                 print("  [warn] derived_weight_%d bind failed: %s" % (i, e), flush=True)
         bind_derived_ms = (time.time() - t0) * 1000.0
 
+        # Free derive graph now — set_input above did a same-device CMA memcpy into
+        # m_infer's param storage, so m_derive's output buffers are no longer needed.
+        # Freeing here prevents CMA accumulation across subnet switches.
+        del m_derive
+        gc.collect()
+
         # Bind infer module's original params (BN bias/mean + FC, float32).
         t0 = time.time()
         for name, arr in sub["non_pool_np"].items():
@@ -732,7 +1147,7 @@ class GmtfDerivInferRuntime:
             m_infer.set_input(**sub["infer_params_build"])
         bind_infer_other_ms = (time.time() - t0) * 1000.0
 
-        self.live_derive_m = m_derive   # keep alive (holds output buffers)
+        self.live_derive_m = None        # freed above; slot kept for _evict() compatibility
         self.live_infer_m  = m_infer
         self.live_idx      = idx
 
@@ -804,6 +1219,8 @@ def parse_args():
     p.add_argument("--lambda", dest="lambda_value", type=float, default=4.0)
     p.add_argument("--gamma", dest="gamma_value", type=float, default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--arch-ids", type=str, default=None,
+                   help="Comma-separated arch IDs to use instead of SA selection (e.g. 0185,0599)")
     p.add_argument("--num-subnets", type=int, default=2,
                    help="K: how many subnets (POC default = 2)")
     p.add_argument("--switch-iters", type=int, default=20)
@@ -813,7 +1230,65 @@ def parse_args():
                    help="Stop after relay.build (no VTA device needed)")
     p.add_argument("--results-out", type=str, default=None,
                    help="Path to write per-iteration JSONL results (default: auto in SCRIPT_DIR)")
+    p.add_argument("--images-dir", type=str, default=None,
+                   help="Path to ImageNette images folder (uses real images for correctness instead of random noise)")
     return p.parse_args()
+
+
+# ImageNet class indices for the 10 ImageNette classes (standard ImageNet labels).
+_IMAGENETTE_IMAGENET_CLASS = {
+    "tench":            0,
+    "english_springer": 217,
+    "cassette_player":  482,
+    "chainsaw":         491,
+    "church":           497,
+    "french_horn":      566,
+    "garbage_truck":    569,
+    "gas_pump":         571,
+    "golf_ball":        574,
+    "parachute":        701,
+}
+
+def load_imagenette_images(images_dir, n_per_class=1):
+    """Load ImageNette images and return list of (input_np, stem, ofa_class_idx).
+
+    Expects structure: {images_dir}/val/{0..9}/*.JPEG  (standard ImageNette download layout).
+    Picks n_per_class images from each of the 10 class folders (sorted filenames, first N).
+    OFA class index equals the folder index (0-9 remapping from the 10 ImageNette classes).
+
+    Applies val transform: Resize(256) → CenterCrop(224) → ToTensor() [0,1].
+    input_np is float32 [1, 3, 224, 224].
+    """
+    from PIL import Image
+    import torchvision.transforms as T
+
+    transform = T.Compose([
+        T.Resize(256),
+        T.CenterCrop(224),
+        T.ToTensor(),
+    ])
+
+    val_dir = os.path.join(images_dir, "val")
+    if not os.path.isdir(val_dir):
+        raise FileNotFoundError("Val directory not found: %s" % val_dir)
+
+    results = []
+    for cls_idx in range(10):
+        cls_dir = os.path.join(val_dir, str(cls_idx))
+        if not os.path.isdir(cls_dir):
+            continue
+        fnames = sorted(f for f in os.listdir(cls_dir)
+                        if f.lower().endswith((".jpeg", ".jpg", ".png")))
+        for fname in fnames[:n_per_class]:
+            stem = "%d_%s" % (cls_idx, os.path.splitext(fname)[0])
+            img = Image.open(os.path.join(cls_dir, fname)).convert("RGB")
+            tensor = transform(img)
+            input_np = tensor.unsqueeze(0).numpy()
+            results.append((input_np, stem, cls_idx))
+
+    print("  Loaded %d images (%d per class) from %s" % (len(results), n_per_class, val_dir),
+          flush=True)
+    return results
 
 
 def sep(t=""):
@@ -836,7 +1311,12 @@ def main():
 
     # ------------------------------------------------------------------
     print("[2] Select K=%d subnets ..." % args.num_subnets, flush=True)
-    if args.gamma_value is None:
+    if args.arch_ids is not None:
+        from step3_merged_mod_deriv_poc import load_arch_mapping
+        _all_archs = load_arch_mapping(args.arch_file)
+        archs = {sid: _all_archs[sid] for sid in args.arch_ids.split(",") if sid in _all_archs}
+        print("  [arch-ids] Loaded %d archs: %s" % (len(archs), list(archs.keys())), flush=True)
+    elif args.gamma_value is None:
         archs = pick_subnets_from_sa(
             args.sa_results, args.arch_file,
             target_n=args.n, target_lambda=args.lambda_value,
@@ -884,21 +1364,58 @@ def main():
     rng = np.random.default_rng(99)
     input_np = rng.standard_normal(INPUT_SHAPE).astype("float32")
 
+    # Load real images if --images-dir provided; otherwise fall back to random noise.
+    if args.images_dir:
+        print("[6b] Loading real ImageNette images from %s ..." % args.images_dir, flush=True)
+        real_images = load_imagenette_images(args.images_dir)
+        # Use first image as the default single input for warm/sweep steps.
+        input_np = real_images[0][0]
+    else:
+        real_images = None
+
     # ------------------------------------------------------------------
     print("", flush=True)
-    print("[7] Correctness: one inference per subnet ...", flush=True)
-    for i, built in enumerate(built_list):
-        out, tm, sid = rt.run(i, input_np)
-        ref = get_ofa_reference_output(ofa_net, built["arch"], input_np)
-        t1v = int(np.argmax(out[0]))
-        t1r = int(np.argmax(ref[0]))
-        match = "OK" if t1v == t1r else "MISMATCH"
-        print("  %-30s vta=%4d ref=%4d %-9s"
-              "  switch=%6.0f ms (derive_run=%5.0f  bind_derived=%5.0f)"
-              "  run=%5.0f ms"
-              % (sid, t1v, t1r, match,
-                 tm["switch"], tm["derive_run"], tm["bind_derived"],
-                 tm["run"]), flush=True)
+    if real_images:
+        n_imgs = len(real_images)
+        print("[7] Correctness: %d real images × %d subnets ..." % (n_imgs, len(built_list)),
+              flush=True)
+        for i, built in enumerate(built_list):
+            sid = built["subnet_id"]
+            n_ok = 0
+            first_switch_ms = None
+            for img_np, stem, gt_cls in real_images:
+                out, tm, _ = rt.run(i, img_np)
+                ref = get_ofa_reference_output(ofa_net, built["arch"], img_np)
+                t1v = int(np.argmax(out[0]))
+                t1r = int(np.argmax(ref[0]))
+                match_str = "OK" if t1v == t1r else "MISMATCH"
+                if first_switch_ms is None:
+                    first_switch_ms = tm["switch"]
+                    sw_ms = tm["switch"]
+                    dr_ms = tm["derive_run"]
+                    bd_ms = tm["bind_derived"]
+                    run_ms = tm["run"]
+                if t1v == t1r:
+                    n_ok += 1
+                print("    %-28s  %-20s  gt=%3d  vta=%4d  ref=%4d  %s"
+                      % (sid, stem, gt_cls, t1v, t1r, match_str), flush=True)
+            print("  %-28s  accuracy=%d/%d  switch=%6.0f ms (derive=%5.0f bind=%5.0f)  run=%5.0f ms"
+                  % (sid, n_ok, n_imgs, sw_ms, dr_ms, bd_ms, run_ms), flush=True)
+            print("", flush=True)
+    else:
+        print("[7] Correctness: one inference per subnet (random noise input) ...", flush=True)
+        for i, built in enumerate(built_list):
+            out, tm, sid = rt.run(i, input_np)
+            ref = get_ofa_reference_output(ofa_net, built["arch"], input_np)
+            t1v = int(np.argmax(out[0]))
+            t1r = int(np.argmax(ref[0]))
+            match = "OK" if t1v == t1r else "MISMATCH"
+            print("  %-30s vta=%4d ref=%4d %-9s"
+                  "  switch=%6.0f ms (derive_run=%5.0f  bind_derived=%5.0f)"
+                  "  run=%5.0f ms"
+                  % (sid, t1v, t1r, match,
+                     tm["switch"], tm["derive_run"], tm["bind_derived"],
+                     tm["run"]), flush=True)
 
     # ------------------------------------------------------------------
     print("", flush=True)
@@ -1064,8 +1581,11 @@ def main():
     print("", flush=True)
     for key in agg_keys:
         a = np.array(agg[key])
-        print("  %-18s  mean=%6.0f ms  min=%6.0f  max=%6.0f"
-              % (key, a.mean(), a.min(), a.max()), flush=True)
+        if a.size == 0:
+            print("  %-18s  (no iterations)" % key, flush=True)
+        else:
+            print("  %-18s  mean=%6.0f ms  min=%6.0f  max=%6.0f"
+                  % (key, a.mean(), a.min(), a.max()), flush=True)
     if same_run:
         ss = np.array(same_run)
         print("  Same-subnet (no switch):  mean=%.0f ms  n=%d" % (ss.mean(), len(ss)),

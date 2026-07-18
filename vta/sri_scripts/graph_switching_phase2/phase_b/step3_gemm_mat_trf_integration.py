@@ -133,9 +133,12 @@ class _Fix3x3BNFoldShift(ExprMutator):
     right_shift(4) epilogue (from _PoolLadderStripper), but this extra shift makes
     the rounding bias (2048) exceed the maximum product, zeroing every value.
 
-    Fix: use shift=7/bias=64, which gives (127 × 1 + 64) >> 7 = 1 → non-zero
-    even when BN_scale rounds to 1 (block3 large-channel case). Safe to apply
-    globally: shift=12 and bias=2048 appear ONLY in 3×3 BN folds in this graph.
+    Fix: use shift=4/bias=8, giving (stage2_int8 × BN_scale_16 + 8) >> 4 =
+    round(stage2_int8 × BN_ratio × 16 / 16) = round(stage2_int8 × BN_ratio) ≈
+    round(DW_BN_float × 16) → weight at ×16 scale, matching the ×16 infer
+    activation scale so infer right_shift(4) produces correct ×16 output.
+    Even when BN_scale_16 rounds to 1: (127 × 1 + 8) >> 4 = 8 → non-zero ✓.
+    Safe to apply globally: shift=12 and bias=2048 appear ONLY in 3×3 BN folds.
     """
     def visit_call(self, call):
         call = super().visit_call(call)
@@ -146,13 +149,13 @@ class _Fix3x3BNFoldShift(ExprMutator):
             if isinstance(rhs, relay.Constant):
                 val = int(rhs.data.asnumpy().flat[0])
                 if val == 12:
-                    return relay.right_shift(lhs, relay.const(7, "int32"))
+                    return relay.right_shift(lhs, relay.const(4, "int32"))
         if call.op.name == "add" and len(call.args) == 2:
             lhs, rhs = call.args
             if isinstance(rhs, relay.Constant):
                 arr = rhs.data.asnumpy()
                 if arr.size == 1 and int(arr.flat[0]) == 2048:
-                    return relay.add(lhs, relay.const(64, "int32"))
+                    return relay.add(lhs, relay.const(8, "int32"))
         return call
 
 
@@ -233,9 +236,9 @@ class _Fix3x3BNFoldShift8(ExprMutator):
     Dense stage's right_shift(4) (8 bits total for two stages), yielding
     shift=8. With stage2_int8 in [-127,127]: (127+128)>>8=0 — ALL zero.
 
-    Fix: shift=3/bias=4 (same 5-bit reduction as _Fix3x3BNFoldShift so that
-    the existing _Fix3x3InferConv2dShift +5 compensation remains correct):
-        (127+4)>>3 = 16  → non-zero ✓
+    Fix: shift=4/bias=8 (same 8-bit reduction as _Fix3x3BNFoldShift, targeting
+    the same ×16 weight scale so infer right_shift(4) produces correct output):
+        (127+8)>>4 = 8  → non-zero ✓
 
     Shape guard: in mod_compile (pre-graphpack), the two-stage 3×3 BN fold
     epilogue sits directly on the Dense_small output, which has flat shape
@@ -271,8 +274,8 @@ class _Fix3x3BNFoldShift8(ExprMutator):
         # Pre-graphpack shape is [N', 9] (flat Dense_small output, K=9 for 3×3 GMTF small)
         if len(shape) != 2 or shape[-1] != 9:
             return call
-        new_add = relay.add(lhs.args[0], relay.const(4, "int32"))
-        return relay.right_shift(new_add, relay.const(3, "int32"))
+        new_add = relay.add(lhs.args[0], relay.const(8, "int32"))
+        return relay.right_shift(new_add, relay.const(4, "int32"))
 
 
 def _fix_3x3_bn_fold_shift_8(mod):
@@ -286,11 +289,19 @@ def _fix_3x3_bn_fold_shift_8(mod):
 
 
 def _materialize_int8_pool_constants(mod_q, tvm_params_full, pool_var_names):
-    """Like the base version but uses _CompositeAwarePoolLadderStripper.
+    """Rewrite module for int8 pool constants and strip relay.quantize ladder.
 
-    This ensures that composite function calls (e.g. 'vta.gemm_mat_trf')
-    receive properly cast args after pool vars are rewritten to int8, so
-    relay.transform.InferType() does not raise a BroadcastRel type error.
+    Pool vars (base weights + transform matrices) are converted to int8 at ×16
+    scale.  _CompositeAwarePoolLadderStripper then strips the relay.quantize chain
+    (cast→×16→round→clip→cast(int8)) so each pool var flows directly as int8 into
+    the GMTF Dense ops — single float32→int8 conversion.
+
+    The strip works in two steps inside _PoolLadderStripper:
+      1. visit_call strips multiply(cast(float32, int8_var), 16f) → int8_var
+      2. _strip_quant_ladder Pattern 2 strips the leftover cast(int8,clip(round(int8_var)))
+
+    First-layer pool var stays float32 (7×7 conv, not GMTF-derived).
+    Uses _SafeParamBinder to avoid beta-reducing composite function calls.
     """
     main = mod_q["main"]
 
@@ -312,23 +323,23 @@ def _materialize_int8_pool_constants(mod_q, tvm_params_full, pool_var_names):
     body = _SafeParamBinder(param_map).visit(main.body)
     body = _CompositeAwarePoolLadderStripper(set(int8_pool_vars)).visit(body)
 
-    new_main = relay.Function(new_params, body)
-    mod_i8 = tvm.IRModule.from_expr(new_main)
-    mod_i8 = relay.transform.InferType()(mod_i8)
+    new_main = relay.Function(new_params, body, main.ret_type, main.type_params, main.attrs)
+    mod_out = tvm.IRModule.from_expr(new_main)
+    mod_out = relay.transform.InferType()(mod_out)
 
     int8_runtime_pool_params = {}
-    runtime_pool_params = {}
     for name in int8_pool_vars:
         arr = tvm_params_full[name]
         if hasattr(arr, "asnumpy"):
             arr = arr.asnumpy()
         int8_runtime_pool_params[name] = _quantize_np_to_int8(arr)
 
+    runtime_float_pool_params = {}
     for name in runtime_float_pool_vars:
         arr = tvm_params_full[name]
-        runtime_pool_params[name] = arr.asnumpy() if hasattr(arr, "asnumpy") else np.asarray(arr)
+        runtime_float_pool_params[name] = arr.asnumpy() if hasattr(arr, "asnumpy") else np.asarray(arr, dtype=np.float32)
 
-    return mod_i8, int8_runtime_pool_params, runtime_pool_params
+    return mod_out, int8_runtime_pool_params, runtime_float_pool_params
 
 # ============================================================
 # Config (same as step3)
@@ -686,29 +697,27 @@ def step5_quantize_module(mod, tvm_params, pool_var_names, enable_dynamic_dense_
 
 
 # ============================================================
-# Step 6: Materialize Int8 Pool Constants
+# Step 6: Dense Epilogue + BN Fold Shift Fix
 # ============================================================
 def step6_materialize_int8_pool(mod_q, tvm_params, pool_var_names):
-    sep("Step 6: Materialize Int8 Pool Constants")
-    
-    print("  Rewriting graph for int8 runtime-pool materialization...")
-    mod_compile, int8_runtime_pool_params, runtime_pool_params_np = _materialize_int8_pool_constants(
+    sep("Step 6: Dense Epilogue + BN Fold Shift Fix")
+
+    print("  Rewriting pool vars to int8, stripping relay.quantize ladder...")
+    mod_compile, int8_pool_params, float32_pool_params = _materialize_int8_pool_constants(
         mod_q,
         tvm_params,
         pool_var_names,
     )
-    
-    runtime_pool_params_np.update(int8_runtime_pool_params)
-    print(
-        "  Int8 runtime pool: %d | Float32 runtime pool: %d"
-        % (len(int8_runtime_pool_params), len(runtime_pool_params_np))
-    )
+    runtime_pool_params_np = {**int8_pool_params, **float32_pool_params}
 
-    print("  Fixing 3x3 BN fold shift (12->7, bias 2048->64) ...")
+    print("  Int8 runtime pool: %d | Float32 runtime pool: %d"
+          % (len(int8_pool_params), len(runtime_pool_params_np)))
+
+    print("  Fixing 3x3 BN fold shift (12->4, bias 2048->8) ...")
     mod_compile = _fix_3x3_bn_fold_shift(mod_compile)
-    print("  Fixing 5x5 BN fold shift (8->5, bias 128->16) ...")
+    print("  Fixing 5x5 BN fold shift (no-op: graphpack absorbs one bit, post-graphpack fix in step7) ...")
     mod_compile = _fix_5x5_bn_fold_shift(mod_compile)
-    # Note: _Fix3x3BNFoldShift8 (shift=8→3 for 3×3 two-stage) must be applied AFTER
+    # Note: _Fix3x3BNFoldShift8 (shift=8→4 for 3×3 two-stage variant) must be applied AFTER
     # graphpack on derive_fn (post-graphpack shape is [O,I,3,3]; pre-graphpack is [N',9]
     # and the checked_type is unreliable at that point). See step7 _fix_3x3_bn_fold_shift_8_derive.
 
