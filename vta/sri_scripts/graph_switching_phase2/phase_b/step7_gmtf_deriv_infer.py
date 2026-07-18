@@ -732,87 +732,6 @@ def _fix_infer_accum_cast(infer_fn, subnet_id="?"):
 
 
 # ============================================================
-# Fused 7→5→3 GMTF op
-# ============================================================
-# WITH-MULTIPLY 3×3 chains (zeros_like output): eliminate both VTA ops by replacing
-# the zeros_like with a compile-time relay.zeros constant.  The GMTF subtree feeding
-# into it becomes dead code that relay.build does not schedule.
-#
-# NO-MULTIPLY 3×3 chains (non-zeros output): the two VTA ops (gmtf_dense_large then
-# gmtf_dense_small) remain as-is.  A true single-op fusion would require a new HLS
-# variant that accepts 2 Ki blocks and produces 1 Ko block (9×25 composed matrix).
-# That is tracked as future work; the zeros_like elimination covers the common case.
-#
-# Composed matrix formula (CPU-side, for reference):
-#   crop_selector = 9×25 binary matrix selecting center 3×3 of 5×5
-#                   (row-major indices 6,7,8,11,12,13,16,17,18)
-#   composed_9x25 = 5to3_float @ crop_selector @ 7to5_float
-# This (9×25) matrix maps the 25-element 5×5 center of the 7×7 base weight directly
-# to the 9-element 3×3 output in one step.
-# ============================================================
-
-class _SkipZerosLikeChains(relay.ExprMutator):
-    """Replace zeros_like(x) → relay.zeros(shape, dtype).
-
-    _fix_with5x5_float_bn_fold introduces zeros_like for every WITH-MULTIPLY 3×3
-    GMTF chain whose final output should be zero.  The VTA gmtf_dense_large and
-    gmtf_dense_small ops that feed into those zeros_like are dead computation —
-    their values are discarded before the output.  Replacing with a compile-time
-    constant lets relay.build omit those VTA ops from the execution schedule.
-
-    Applied after _fix_with5x5_float_bn_fold so zeros_like is present in the IR.
-    Prerequisite: InferType() has been run (checked_type needed for shape/dtype).
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.n_replaced = 0
-
-    def visit_call(self, call):
-        if isinstance(call.op, tvm.ir.Op) and call.op.name == "zeros_like":
-            try:
-                shape = [int(d) for d in call.checked_type.shape]
-                dtype = str(call.checked_type.dtype)
-                self.n_replaced += 1
-                return relay.zeros(shape, dtype)
-            except Exception:
-                pass
-        return super().visit_call(call)
-
-
-def _skip_zeros_like_chains(derive_fn, subnet_id="?"):
-    """Replace zeros_like → compile-time zeros; strip newly-unused free vars.
-
-    WITH-MULTIPLY 3×3 GMTF chains end in zeros_like (from _fix_with5x5_float_bn_fold).
-    After replacement the 7to5_matrix and 5to3_matrix free vars for those chains
-    become unreferenced.  We remove them from the derive fn signature so switch time
-    does not upload/bind them unnecessarily.
-
-    relay.build will not schedule VTA ops that do not contribute to any output,
-    so the gmtf_dense_large + gmtf_dense_small pairs become dead code automatically.
-    """
-    derive_mod = relay.transform.InferType()(tvm.IRModule.from_expr(derive_fn))
-    fn = derive_mod["main"]
-    fixer = _SkipZerosLikeChains()
-    new_body = fixer.visit(fn.body)
-    if fixer.n_replaced == 0:
-        return derive_fn
-    print("  [skip-zeros-like] %s: %d zeros_like chains → compile-time zeros "
-          "(7to5+5to3 VTA ops eliminated)" % (subnet_id, fixer.n_replaced), flush=True)
-
-    used_var_names = {v.name_hint for v in relay.analysis.free_vars(new_body)}
-    new_params = [p for p in fn.params if p.name_hint in used_var_names]
-    n_removed = len(fn.params) - len(new_params)
-    if n_removed > 0:
-        print("  [skip-zeros-like] %s: removed %d unused free vars (7to5/5to3 matrices)"
-              % (subnet_id, n_removed), flush=True)
-
-    new_fn = relay.Function(new_params, new_body, fn.ret_type, fn.type_params, fn.attrs)
-    new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
-    return new_mod["main"]
-
-
-# ============================================================
 # Pre-quantize BN gamma clamp: fix 5x5 GMTF all-zero derive weights
 # ============================================================
 
@@ -942,8 +861,6 @@ def build_deriv_infer_subnet(subnet_id, arch, ofa_net, pool, env, schedule_logs,
     derive_fn = _fix_derive_bn_fold_shift_8(derive_fn)
     print("  [fix-5x5-bn-fold] Applying float32 BN fold for 5×5 WITH-MULTIPLY layers ...", flush=True)
     derive_fn = _fix_with5x5_float_bn_fold(derive_fn, subnet_id=subnet_id)
-    print("  [fuse-gmtf] Eliminating zeros_like GMTF chains (WITH-MULTIPLY 3×3) ...", flush=True)
-    derive_fn = _skip_zeros_like_chains(derive_fn, subnet_id=subnet_id)
     # _fix_derive_no_multiply_7x7_padding: disabled — correct lane alignment for 7×7 direct
     # pool-weight groups causes full saturation (16×49 MAC always hits ±127), making per-class
     # predictions WORSE (0065: 1/10→0/10) compared to the "wrong" alignment that gave less
