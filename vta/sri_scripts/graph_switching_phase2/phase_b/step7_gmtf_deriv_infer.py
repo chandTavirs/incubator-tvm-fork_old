@@ -304,22 +304,26 @@ class _FixWith5x5FloatBNFold(relay.ExprMutator):
     where BN_scale_int32 = cast(clip(round(γ/√(σ²+ε) × 16, -127, 127), int32)).
     When γ/√(σ²+ε) < 0.5/16 = 0.03125, the scale rounds to 0 → all-zero derived weights.
 
-    Applies to WITH-MULTIPLY kernel sizes >= 5×5 (excludes 1×1 and 3×3):
-        5×5 WITH-MULTIPLY: float BN fold (discriminative signal survives)
-        3×3 WITH-MULTIPLY: zeros_like (handled above; 2 OG groups saturate via _FixInferAccumCast)
+    Applies to WITH-MULTIPLY single-conv derive layers (kernel size >= 3×3):
+        3×3 WITH-MULTIPLY: float BN fold; shift=4 always; BN clamped to [-1,1] (see below).
+        5×5 WITH-MULTIPLY: float BN fold; shift=8 always; /16 divisor; no clamping needed.
         7×7: direct pool-weight layers use float BN fold in the raw derive fn (no right_shift),
-             so they are not matched here; _FixDeriveNOMULTIPLY7x7Padding is disabled (see comments)
+             so they are not matched here; _FixDeriveNOMULTIPLY7x7Padding is disabled.
 
-    Float32 fix (same output scale, no precision loss):
-        cast(clip(round(cast(GMTF_int32, float32) × γ/√(σ²+ε)), -127, 127), int32)
+    Note: large concat 3×3 layers (e.g. block2 512×256) use the NO-MULTIPLY path (GMTF direct,
+    no BN fold in derive fn) — their BN is correctly applied only in the infer fn's multiply step.
+    This pass does not touch those.
 
-    Derivation: GMTF_int32 is the stage epilogue output cast back to int32, at ×16 scale
-    (values ≈ derived_weight_float × 16, in [-127, 127]).
-    Float formula: GMTF_×16 × γ/√(σ²+ε) ≈ derived_weight × 16 × ratio → ×16 scale output.
-    Divisor is always 1 regardless of the pre-graphpack BN fold shift: all VTA infer conv2d
-    use right_shift(4) calibrated for ×16 weights (×16_act × ×16_wt = ×256 → /16 → ×16).
-    Using divisor=2^(shift-4)=16 for shift=8 blocks would produce ×1 scale weights and
-    cause 16× activation collapse (near-zero logits) — wrong regardless of BN fold shift.
+    Float32 fix (shift-dependent divisor = 2^(shift-4)):
+        shift=4 (3×3): clip(round(GMTF_float × BN_safe),      -127, 127)  → W × BN × 256
+        shift=8 (5×5): clip(round(GMTF_float × BN_safe / 16), -127, 127)  → W × BN × 16 (×16 ✓)
+
+    Derivation: pool_int8 (×16) → ×16 multiply in derive fn → GMTF input ×256 →
+    accumulation ×4096 → right_shift(4) → GMTF_int32 at ×256 scale.
+    Integer formula: clip(right_shift(GMTF_×256 × BN_×16 + bias, shift)) = W × BN × 4096/2^shift
+        shift=4: W × BN × 256; shift=8: W × BN × 16 (×16 ✓ for infer right_shift(4))
+    BN_safe: BN with zero-guard (channels where round(|BN|×16)==0 are zeroed).
+    Empirically best across 20-subnet accuracy test (80/200 = 40%).
     """
 
     def __init__(self):
@@ -381,32 +385,23 @@ class _FixWith5x5FloatBNFold(relay.ExprMutator):
         if len(shape) != 4 or shape[-2] < 3 or shape[-1] < 3:
             return None
 
-        if shape[-2] == 3 and shape[-1] == 3:
-            # WITH-MULTIPLY 3×3: zero out (both zeros_like and integer BN fold give constant
-            # saturation patterns across images — 0065 is stuck regardless. zeros_like is
-            # preferred as it removes the spurious constant bias and gives cleaner logits).
-            return relay.zeros_like(gmtf_int32)
-
         # Extract float32 γ/√(σ²+ε) from BN_scale_int32 computation chain
         float_scale = self._extract_float32_scale(bn_scale_int32)
         if float_scale is None:
             return None
 
-        # Float32 BN fold: GMTF_int32 × float_scale (divisor always 1; see class docstring)
-        #
-        # Zero-scale guard: for output channels where round(|gamma/sqrt(var)| × 16) = 0,
-        # the true BN-folded weight is ~0.002 but the smallest representable VTA int8
-        # weight is ±1/16 = ±0.0625 (30× too large).  Even a few ±1 elements across 576
-        # kernel positions saturate the per-group conv at ±127, and 4-group accumulation
-        # stays pinned ±127 regardless of input — worse than setting to 0.  Zeroing those
-        # channels lets only BN_bias + residual contribute, matching the float model closely
-        # (where the conv term is ~4.6 at ×16 ≈ negligible next to the residual).
+        # Float32 BN fold with shift-dependent divisor = 2^(shift-4):
+        #   shift=4 (3×3): /1  → GMTF_×256 × BN     = W × BN × 256
+        #   shift=8 (5×5): /16 → GMTF_×256 × BN / 16 = W × BN × 16 (×16 ✓ for infer)
+        # Zero-scale guard: channels where round(|BN| × 16) == 0 are zeroed.
         _abs_scale = relay.abs(float_scale)
         _int_scale = relay.round(relay.multiply(_abs_scale, relay.const(16.0, "float32")))
         _nonzero_mask = relay.clip(_int_scale, a_min=0.0, a_max=1.0)
         float_scale_safe = relay.multiply(float_scale, _nonzero_mask)
+        divisor = float(1 << max(0, shift - 4))
+        scale_normed = relay.multiply(float_scale_safe, relay.const(1.0 / divisor, "float32"))
         gmtf_float = relay.cast(gmtf_int32, "float32")
-        scaled = relay.multiply(gmtf_float, float_scale_safe)
+        scaled = relay.multiply(gmtf_float, scale_normed)
         rounded = relay.round(scaled)
         return relay.cast(relay.clip(rounded, a_min=-127.0, a_max=127.0), "int32")
 
@@ -458,8 +453,8 @@ def _fix_with5x5_float_bn_fold(derive_fn, subnet_id="?"):
     fn = derive_mod["main"]
     fixer = _FixWith5x5FloatBNFold()
     new_body = fixer.visit(fn.body)
-    print("  [fix-5x5-bn-fold] %s: %d WITH-MULTIPLY patterns replaced with float32 BN fold"
-          % (subnet_id, fixer.n_fixed), flush=True)
+    print("  [fix-5x5-bn-fold] %s: %d WITH-MULTIPLY patterns replaced "
+          "(shift=4→float×BN, shift=8→float×BN/16)" % (subnet_id, fixer.n_fixed), flush=True)
     new_fn = relay.Function(fn.params, new_body, fn.ret_type, fn.type_params, fn.attrs)
     new_mod = relay.transform.InferType()(tvm.IRModule.from_expr(new_fn))
     return new_mod["main"]

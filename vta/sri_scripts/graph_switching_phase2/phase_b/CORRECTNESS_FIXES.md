@@ -23,18 +23,32 @@ weights. Removing the shift restores ×16 scale and gives non-zero activations.
 **File**: `step7_gmtf_deriv_infer.py`  
 **Status**: Uncommitted (working directory)
 
-Replaces integer BN fold in post-graphpack WITH-MULTIPLY GMTF layers:
+Replaces integer BN fold in post-graphpack WITH-MULTIPLY GMTF layers with float32 BN fold.
+Applies to **single-conv** layers where graphpack folds BN into the derive fn weight
+(matched by the `multiply(GMTF_int32, BN_scale_int32)` pattern in the derive fn IR).
 
-- **3×3 WITH-MULTIPLY**: replaced with `relay.zeros_like(gmtf_int32)`.
-  Integer BN fold with `_FixInferAccumCast` active causes all OG-group partial
-  sums to saturate at ±127 → constant class prediction regardless of input.
-  Zeroing removes the spurious constant bias and lets the residual path dominate.
+**Root cause of wrong scale**: GMTF_int32 is already at ×16 scale after the VTA GMTF
+epilogue (`right_shift(4)+clip+cast`). Integer BN fold at `shift=8` computes:
+`round(GMTF_int32 × BN_scale_int32) >> 8`, where `BN_scale_int32 = round(BN_scale × 256)`.
+Net: `GMTF_×16 × BN_scale × 256 / 256 = BN_folded_weight × 1` (×16→×1, collapses activations
+by 16×). For channels where `round(|BN_scale| × 256) < 1` (scale < 1/512), the weight is
+identically zero. Float fold gives `round(clip(GMTF_int32 × BN_scale_float, -127, 127))`
+= `BN_folded_weight × 16`, which is the correct ×16 scale for VTA int8 weights.
 
-- **5×5 WITH-MULTIPLY**: replaced with float32 BN fold
-  (`round(clip(GMTF_float × BN_scale_float, -127, 127))`).
-  Integer fold at shift=8 divides ×16 GMTF weights by 16 again → ×1 scale →
-  16× activation collapse in the infer fn. Float fold restores ×16 scale. A
-  zero-scale guard (`max(|BN_scale|, ε)`) prevents noise from near-zero BN channels.
+- **3×3 WITH-MULTIPLY**: float32 BN fold (branch `fix_3x3_withmul_bn_fold`).
+  Applies to small single-conv 3×3 layers (e.g. block1 256×32). The infer fn for
+  these layers has **no BN scale multiply** — only a BN bias add — because BN scale
+  is folded into the derive fn weight. Zeros_like was a workaround; float fold is the
+  real fix (gives non-zero BN-folded weights matching the reference CPU model).
+  Note: large concat 3×3 layers (e.g. block2 512×256) use the NO-MULTIPLY path
+  (GMTF direct, no BN fold in derive fn) and are not touched by this pass.
+
+- **5×5 WITH-MULTIPLY**: float32 BN fold (same logic as 3×3 above).
+  Integer fold at shift=8 → ×1 scale → 16× activation collapse in the infer fn.
+
+- **Zero-scale guard**: for channels where `round(|BN_scale| × 16) = 0`, the derived
+  weight is zeroed (`_nonzero_mask`). A ×1/16 weight would cause OG-group partial sum
+  saturation across all images (constant class prediction) which is worse than zero.
 
 - **1×1 and other sizes**: excluded (integer fold left as-is).
   For 1×1, integer fold gives `round(GMTF×scale/16) ≈ 0` for many channels →
@@ -90,6 +104,8 @@ unboundedly.
 
 ## Accuracy summary (K=20, 10 images/subnet)
 
+**Baseline** (fixes 1–5 applied, 3×3 WITH-MULTIPLY = zeros_like workaround):
+
 | Subnet | Acc  | Switch ms |
 |--------|------|-----------|
 | 0736   | 9/10 | 2448      |
@@ -114,5 +130,9 @@ unboundedly.
 | 0037   | 3/10 | 2372      |
 | 0272   | 1/10 | 1740      |
 | **Total** | **90/200 = 45%** | mean 3637 ms |
+
+**Pending re-run** (branch `fix_3x3_withmul_bn_fold`): 3×3 WITH-MULTIPLY now gets float BN
+fold instead of zeros_like. Expected to improve subnets with single-conv 3×3 layers (e.g.
+0065, 0037, 0185). Re-run needed on ZCU104 to confirm.
 
 Metric: VTA prediction matches reference model prediction (not ground-truth accuracy).
