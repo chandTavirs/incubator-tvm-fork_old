@@ -37,7 +37,7 @@ from __future__ import absolute_import, print_function
 import os
 import sys
 import copy
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 import numpy as np
 import torch
@@ -75,6 +75,44 @@ def _sub_filter_start_end(max_ks: int, target_ks: int) -> Tuple[int, int]:
     return start, end
 
 
+# ---------------------------------------------------------------------------
+# Fused 7→5→3 transform helpers
+# ---------------------------------------------------------------------------
+
+_CROP_SELECTOR_5TO3: Optional[np.ndarray] = None
+
+
+def _get_crop_selector_5to3() -> np.ndarray:
+    """[9,25] binary selector: picks the center 3×3 of a 5×5 grid (row-major)."""
+    global _CROP_SELECTOR_5TO3
+    if _CROP_SELECTOR_5TO3 is None:
+        # center 3×3 of 5×5 in row-major: rows 1-3, cols 1-3 → flat indices
+        indices = [6, 7, 8, 11, 12, 13, 16, 17, 18]
+        sel = np.zeros((9, 25), dtype=np.float32)
+        for row, col in enumerate(indices):
+            sel[row, col] = 1.0
+        _CROP_SELECTOR_5TO3 = sel
+    return _CROP_SELECTOR_5TO3
+
+
+def _fused_7to3_key(key_7to5: str, key_5to3: str) -> str:
+    return "__fused_7to3__" + key_7to5 + "__" + key_5to3
+
+
+def _compute_fused_7to3_matrix(T_7to5: np.ndarray, T_5to3: np.ndarray) -> np.ndarray:
+    """Compose T_7to5 [25,25] and T_5to3 [9,9] into a single [25,25] matrix.
+
+    T_composed [9,25] = T_5to3 @ crop_selector [9,25] @ T_7to5 [25,25]
+    Padded to [25,25] (16 zero rows appended) for gmtf_dense_large compatibility.
+    After one nn.dense with T_padded, slice [:, :9] gives the 3×3 result.
+    """
+    crop_sel = _get_crop_selector_5to3()           # [9, 25]
+    T_composed = T_5to3 @ (crop_sel @ T_7to5)      # [9, 9] @ [9, 25] = [9, 25]
+    T_padded = np.zeros((25, 25), dtype=np.float32)
+    T_padded[:9, :] = T_composed
+    return T_padded
+
+
 def _apply_transform_sequence(
     w: relay.Expr,                          # [out_ch, in_ch, current_ks, current_ks]
     out_ch: int,
@@ -95,6 +133,33 @@ def _apply_transform_sequence(
     decomposed sub-conv just slices from the result — one dense op per layer,
     not one per sub-conv.
     """
+    # Fused 7→5→3: single nn.dense with pre-composed [25,25] matrix.
+    # Halves VTA op count for two-stage 3×3 layers (7→5→3 sequence).
+    if (len(transform_sequence) == 2
+            and transform_sequence[0] == (7, 5)
+            and transform_sequence[1] == (5, 3)):
+        fused_key = _fused_7to3_key(transform_keys[0], transform_keys[1])
+        if fused_key in transform_vars:
+            # crop 7→5 spatial (center 5×5 of 7×7)
+            crop_s, crop_e = _sub_filter_start_end(7, 5)
+            w_curr = relay.strided_slice(
+                w,
+                begin=[0, 0, crop_s, crop_s],
+                end=[out_ch, in_ch, crop_e, crop_e],
+                strides=[1, 1, 1, 1],
+            )
+            # reshape [OC, IC, 5, 5] → [OC*IC, 25]
+            w_flat = relay.reshape(w_curr, newshape=[-1, 25])
+            # single dense: [OC*IC,25] x T_padded[25,25]^T → [OC*IC, 25]
+            # T_padded encodes T_composed = T_5to3 @ crop_sel_5to3 @ T_7to5 in rows [:9]
+            w_flat = relay.nn.dense(w_flat, transform_vars[fused_key])
+            # slice first 9 cols → [OC*IC, 9] (the 3×3 transform result)
+            n_rows = out_ch * in_ch
+            w_flat = relay.strided_slice(
+                w_flat, begin=[0, 0], end=[n_rows, 9], strides=[1, 1],
+            )
+            return relay.reshape(w_flat, newshape=[out_ch, in_ch, 3, 3])
+
     current_ks = max_ks
     w_curr = w
 
@@ -327,6 +392,23 @@ def build_relay_with_ofa_pool_vars(
     needed_base_keys = set(d.base_weight_key for d in derivations)
     needed_tm_keys   = set(key for d in derivations for key in d.transform_keys)
 
+    # Augment transform_matrices with pre-composed fused 7→5→3 matrices.
+    # For each layer with transform_sequence=[(7,5),(5,3)], we compose
+    # T_5to3 @ crop_selector @ T_7to5 into a single [25,25] pool var so
+    # _apply_transform_sequence can use one nn.dense instead of two.
+    _augmented_tm: Dict[str, np.ndarray] = dict(transform_matrices)
+    for d in derivations:
+        if (len(d.transform_sequence) == 2
+                and d.transform_sequence[0] == (7, 5)
+                and d.transform_sequence[1] == (5, 3)):
+            fused_key = _fused_7to3_key(d.transform_keys[0], d.transform_keys[1])
+            if fused_key not in _augmented_tm:
+                T_7to5 = np.asarray(transform_matrices[d.transform_keys[0]], dtype=np.float32)
+                T_5to3 = np.asarray(transform_matrices[d.transform_keys[1]], dtype=np.float32)
+                _augmented_tm[fused_key] = _compute_fused_7to3_matrix(T_7to5, T_5to3)
+            needed_tm_keys.add(fused_key)
+    transform_matrices = _augmented_tm  # augmented local; caller's dict is not mutated
+
     pool_vars: Dict[str, relay.Var] = {}
     pool_params: Dict[str, np.ndarray] = {}
 
@@ -368,8 +450,7 @@ def build_relay_with_ofa_pool_vars(
         if n_subconvs == 1:
             d = next(deriv_iter)
             base_var = pool_vars[d.base_weight_key]
-            tm_vars = {k: pool_vars[k] for k in d.transform_keys}
-            exprs = [_make_derived_weight_expr(base_var, tm_vars, d)]
+            exprs = [_make_derived_weight_expr(base_var, pool_vars, d)]
             return (exprs, [d]) if return_derivs else exprs
 
         sub_derivs = [next(deriv_iter) for _ in range(n_subconvs)]
@@ -378,7 +459,7 @@ def build_relay_with_ofa_pool_vars(
             exprs = [
                 _make_derived_weight_expr(
                     pool_vars[d.base_weight_key],
-                    {k: pool_vars[k] for k in d.transform_keys},
+                    pool_vars,
                     d,
                 )
                 for d in sub_derivs
@@ -397,7 +478,7 @@ def build_relay_with_ofa_pool_vars(
             exprs = [
                 _make_derived_weight_expr(
                     pool_vars[d.base_weight_key],
-                    {k: pool_vars[k] for k in d.transform_keys},
+                    pool_vars,
                     d,
                 )
                 for d in sub_derivs
@@ -410,7 +491,7 @@ def build_relay_with_ofa_pool_vars(
 
         template = sub_derivs[0]
         base_var = pool_vars[base_key]
-        tm_vars = {k: pool_vars[k] for k in template.transform_keys}
+        tm_vars = pool_vars
 
         w_full = _make_full_layer_weight_expr(base_var, tm_vars, template, total_out_ch=total_out)
 
